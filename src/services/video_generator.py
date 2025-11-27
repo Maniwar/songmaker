@@ -68,6 +68,7 @@ class VideoGenerator:
         effect: KenBurnsEffect,
         output_path: Path,
         resolution: Optional[tuple[int, int]] = None,
+        fps: Optional[int] = None,
     ) -> Path:
         """
         Create a video clip from an image with Ken Burns effect.
@@ -78,6 +79,7 @@ class VideoGenerator:
             effect: Ken Burns effect to apply
             output_path: Path for the output video clip
             resolution: Optional (width, height) tuple to override config
+            fps: Optional frames per second to override config
 
         Returns:
             Path to the created video clip
@@ -86,7 +88,7 @@ class VideoGenerator:
             res_str = f"{resolution[0]}x{resolution[1]}"
         else:
             res_str = self.config.video.resolution
-        fps = self.config.video.fps
+        fps = fps or self.config.video.fps
 
         filter_str = self._get_ken_burns_filter(effect, duration, res_str, fps)
 
@@ -414,6 +416,153 @@ class VideoGenerator:
         subprocess.run(cmd, check=True, capture_output=True)
         return output_path
 
+    def create_scene_preview(
+        self,
+        image_path: Path,
+        audio_path: Path,
+        subtitle_path: Optional[Path],
+        start_time: float,
+        duration: float,
+        effect: KenBurnsEffect,
+        output_path: Path,
+        resolution: Optional[tuple[int, int]] = None,
+    ) -> Path:
+        """
+        Create a preview clip for a single scene with audio and optional subtitles.
+
+        Args:
+            image_path: Path to the scene image
+            audio_path: Path to the full audio file
+            subtitle_path: Optional path to ASS subtitle file
+            start_time: Start time in the audio (seconds)
+            duration: Duration of the scene (seconds)
+            effect: Ken Burns effect to apply
+            output_path: Path for the output preview
+            resolution: Optional (width, height) tuple
+
+        Returns:
+            Path to the preview video
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir = Path(temp_dir)
+
+            # Create the scene clip with Ken Burns effect
+            scene_clip = temp_dir / "scene.mp4"
+            self.create_scene_clip(
+                image_path=image_path,
+                duration=duration,
+                effect=effect,
+                output_path=scene_clip,
+                resolution=resolution,
+            )
+
+            # Extract audio segment for this scene
+            audio_segment = temp_dir / "audio_segment.mp3"
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(audio_path),
+                "-ss",
+                str(start_time),
+                "-t",
+                str(duration),
+                "-c:a",
+                "libmp3lame",
+                "-q:a",
+                "2",
+                str(audio_segment),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+
+            # Add audio to scene clip
+            with_audio = temp_dir / "with_audio.mp4"
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(scene_clip),
+                "-i",
+                str(audio_segment),
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                str(with_audio),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+
+            if subtitle_path and subtitle_path.exists():
+                # For preview, we need to shift subtitle timing to start from 0
+                # Create a temporary shifted subtitle file
+                shifted_sub = temp_dir / "shifted.ass"
+                self._shift_subtitles(subtitle_path, shifted_sub, -start_time)
+
+                # Add subtitles
+                self.add_subtitles(with_audio, shifted_sub, output_path, burn_in=True)
+            else:
+                import shutil
+                shutil.copy(with_audio, output_path)
+
+        return output_path
+
+    def _shift_subtitles(
+        self,
+        input_path: Path,
+        output_path: Path,
+        offset_seconds: float,
+    ) -> None:
+        """Shift all subtitle timings by offset_seconds."""
+        with open(input_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        lines = content.split("\n")
+        shifted_lines = []
+
+        for line in lines:
+            if line.startswith("Dialogue:"):
+                # Parse and shift timing
+                parts = line.split(",", 9)
+                if len(parts) >= 10:
+                    start_ts = parts[1]
+                    end_ts = parts[2]
+
+                    new_start = self._shift_ass_time(start_ts, offset_seconds)
+                    new_end = self._shift_ass_time(end_ts, offset_seconds)
+
+                    # Only include if timing is positive
+                    if new_start >= 0 and new_end > 0:
+                        parts[1] = self._format_ass_time(new_start)
+                        parts[2] = self._format_ass_time(new_end)
+                        shifted_lines.append(",".join(parts))
+            else:
+                shifted_lines.append(line)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(shifted_lines))
+
+    def _shift_ass_time(self, timestamp: str, offset: float) -> float:
+        """Parse ASS timestamp and apply offset, return seconds."""
+        # ASS format: H:MM:SS.CC
+        parts = timestamp.strip().split(":")
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+            total = hours * 3600 + minutes * 60 + seconds + offset
+            return max(0, total)
+        return 0
+
+    def _format_ass_time(self, seconds: float) -> str:
+        """Format seconds as ASS timestamp H:MM:SS.CC."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours}:{minutes:02d}:{secs:05.2f}"
+
     def generate_music_video(
         self,
         scenes: list[Scene],
@@ -422,6 +571,7 @@ class VideoGenerator:
         output_path: Path,
         progress_callback: Optional[Callable[[str, float], None]] = None,
         resolution: Optional[tuple[int, int]] = None,
+        fps: Optional[int] = None,
     ) -> Path:
         """
         Generate a complete music video from scenes.
@@ -433,6 +583,7 @@ class VideoGenerator:
             output_path: Path for the final video
             progress_callback: Optional callback for progress updates
             resolution: Optional (width, height) tuple to override config
+            fps: Optional frames per second to override config
 
         Returns:
             Path to the final video
@@ -460,6 +611,7 @@ class VideoGenerator:
                     effect=scene.effect,
                     output_path=clip_path,
                     resolution=resolution,
+                    fps=fps,
                 )
                 clip_paths.append(clip_path)
 
@@ -503,6 +655,7 @@ class VideoGenerator:
         output_path: Path,
         progress_callback: Optional[Callable[[str, float], None]] = None,
         resolution: Optional[tuple[int, int]] = None,
+        fps: Optional[int] = None,
     ) -> Path:
         """
         Generate a slideshow video without audio (demo mode).
@@ -513,6 +666,7 @@ class VideoGenerator:
             output_path: Path for the final video
             progress_callback: Optional callback for progress updates
             resolution: Optional (width, height) tuple to override config
+            fps: Optional frames per second to override config
 
         Returns:
             Path to the final video
@@ -540,6 +694,7 @@ class VideoGenerator:
                     effect=scene.effect,
                     output_path=clip_path,
                     resolution=resolution,
+                    fps=fps,
                 )
                 clip_paths.append(clip_path)
 

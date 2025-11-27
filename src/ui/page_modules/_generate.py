@@ -63,11 +63,96 @@ def _get_audio_clip(audio_path: str, start_time: float, end_time: float) -> byte
         return None
 
 
+def _generate_scene_preview_with_lyrics(state, scene: Scene) -> bytes:
+    """Generate a video preview for a scene with karaoke subtitles."""
+    from tempfile import NamedTemporaryFile
+    import os
+
+    # Generate subtitles for just this scene's words
+    subtitle_gen = SubtitleGenerator()
+    video_gen = VideoGenerator()
+
+    with NamedTemporaryFile(suffix=".ass", delete=False) as sub_file:
+        sub_path = Path(sub_file.name)
+
+    with NamedTemporaryFile(suffix=".mp4", delete=False) as vid_file:
+        vid_path = Path(vid_file.name)
+
+    try:
+        # Generate subtitle file for this scene's words
+        if scene.words:
+            subtitle_gen.generate_karaoke_ass(
+                words=scene.words,
+                output_path=sub_path,
+            )
+        else:
+            sub_path = None
+
+        # Generate preview video
+        video_gen.create_scene_preview(
+            image_path=Path(scene.image_path),
+            audio_path=Path(state.audio_path),
+            subtitle_path=sub_path,
+            start_time=scene.start_time,
+            duration=scene.duration,
+            effect=scene.effect,
+            output_path=vid_path,
+            resolution=(1280, 720),  # Lower res for preview
+        )
+
+        # Read video bytes
+        with open(vid_path, "rb") as f:
+            video_bytes = f.read()
+
+        return video_bytes
+    finally:
+        # Cleanup
+        if sub_path and sub_path.exists():
+            os.unlink(sub_path)
+        if vid_path.exists():
+            os.unlink(vid_path)
+
+
+def _adjust_scene_timing(state, scene_index: int, new_start: float, new_end: float) -> None:
+    """Adjust scene timing and redistribute words accordingly."""
+    scenes = state.scenes
+    scene = scenes[scene_index]
+    old_start = scene.start_time
+    old_end = scene.end_time
+
+    # Update scene timing
+    scene.start_time = new_start
+    scene.end_time = new_end
+
+    # Redistribute words if they exist
+    if scene.words:
+        # Scale word timings proportionally
+        old_duration = old_end - old_start
+        new_duration = new_end - new_start
+        if old_duration > 0:
+            scale = new_duration / old_duration
+            for word in scene.words:
+                # Shift and scale
+                relative_start = word.start - old_start
+                relative_end = word.end - old_start
+                word.start = new_start + (relative_start * scale)
+                word.end = new_start + (relative_end * scale)
+
+    update_state(scenes=scenes)
+
+
 # Resolution configurations
 RESOLUTION_OPTIONS = {
     "1080p": {"width": 1920, "height": 1080, "image_size": "2K"},
     "2K": {"width": 2560, "height": 1440, "image_size": "2K"},
     "4K": {"width": 3840, "height": 2160, "image_size": "4K"},
+}
+
+# FPS configurations
+FPS_OPTIONS = {
+    "24 fps (cinematic)": 24,
+    "30 fps (standard)": 30,
+    "60 fps (smooth)": 60,
 }
 
 
@@ -153,6 +238,15 @@ def render_storyboard_setup(state, is_demo_mode: bool) -> None:
                 key="crossfade",
             )
 
+            # FPS selection
+            fps_selection = st.selectbox(
+                "Frame Rate",
+                options=list(FPS_OPTIONS.keys()),
+                index=1,  # Default to 30 fps
+                help="Higher fps = smoother motion but larger file size",
+                key="video_fps",
+            )
+
         st.text_area(
             "Style override (optional)",
             placeholder="Override the visual style, e.g., 'anime style, vibrant colors'",
@@ -183,9 +277,11 @@ def render_storyboard_setup(state, is_demo_mode: bool) -> None:
     # Generate storyboard button
     if st.button("Generate Scene Prompts", type="primary"):
         # Save new settings to state
+        fps_key = st.session_state.get("video_fps", "30 fps (standard)")
         update_state(
             show_lyrics=st.session_state.get("show_lyrics", True),
             use_sequential_mode=st.session_state.get("use_sequential_mode", False),
+            video_fps=FPS_OPTIONS.get(fps_key, 30),
         )
         generate_scene_prompts(
             state,
@@ -468,6 +564,39 @@ def render_scene_card(state, scene: Scene) -> None:
     with st.expander("Edit Scene", expanded=False):
         st.markdown(f"**Mood:** {scene.mood}")
 
+        # Scene timing adjustment
+        st.markdown("**Scene Timing**")
+        timing_cols = st.columns(2)
+        with timing_cols[0]:
+            new_start_time = st.number_input(
+                "Start (seconds)",
+                min_value=0.0,
+                max_value=scene.end_time - 0.5,
+                value=scene.start_time,
+                step=0.1,
+                key=f"timing_start_{scene.index}",
+                help="Adjust when this scene starts in the song"
+            )
+        with timing_cols[1]:
+            new_end_time = st.number_input(
+                "End (seconds)",
+                min_value=new_start_time + 0.5,
+                max_value=float(state.audio_duration) if hasattr(state, 'audio_duration') else 999.0,
+                value=scene.end_time,
+                step=0.1,
+                key=f"timing_end_{scene.index}",
+                help="Adjust when this scene ends in the song"
+            )
+
+        # Apply timing changes button
+        if new_start_time != scene.start_time or new_end_time != scene.end_time:
+            if st.button("Apply Timing", key=f"apply_timing_{scene.index}", type="secondary"):
+                _adjust_scene_timing(state, scene.index, new_start_time, new_end_time)
+                st.success(f"Timing updated: {new_start_time:.1f}s - {new_end_time:.1f}s")
+                st.rerun()
+
+        st.markdown("---")
+
         # Audio preview with adjustable start point
         if state.audio_path and state.audio_path != "demo_mode":
             st.markdown("**Audio Preview**")
@@ -505,6 +634,19 @@ def render_scene_card(state, scene: Scene) -> None:
             )
             if audio_clip:
                 st.audio(audio_clip, format="audio/mp3")
+
+            # Preview with lyrics button
+            if has_image:
+                if st.button("Preview with Lyrics", key=f"preview_lyrics_{scene.index}"):
+                    with st.spinner("Generating preview..."):
+                        try:
+                            video_bytes = _generate_scene_preview_with_lyrics(state, scene)
+                            if video_bytes:
+                                st.video(video_bytes)
+                        except Exception as e:
+                            st.error(f"Preview failed: {e}")
+
+        st.markdown("---")
 
         # Editable effect
         effect_options = [e.value for e in KenBurnsEffect]
@@ -924,6 +1066,7 @@ def generate_video_from_storyboard(state, crossfade: float, is_demo_mode: bool) 
     resolution = getattr(state, 'video_resolution', '1080p')
     res_info = RESOLUTION_OPTIONS.get(resolution, RESOLUTION_OPTIONS["1080p"])
     show_lyrics = getattr(state, 'show_lyrics', True)
+    fps = getattr(state, 'video_fps', 30)
 
     # Verify we have images
     scenes_with_images = [s for s in scenes if s.image_path and Path(s.image_path).exists()]
@@ -964,7 +1107,10 @@ def generate_video_from_storyboard(state, crossfade: float, is_demo_mode: bool) 
             st.write("   Skipping lyrics overlay (disabled)")
 
         # Step 2: Generate video
-        st.write(f"Assembling video at {resolution} ({res_info['width']}x{res_info['height']})...")
+        st.write(
+            f"Assembling video at {resolution} "
+            f"({res_info['width']}x{res_info['height']}) @ {fps}fps..."
+        )
         video_gen = VideoGenerator()
 
         video_progress = st.progress(0.0, text="Creating video...")
@@ -983,6 +1129,7 @@ def generate_video_from_storyboard(state, crossfade: float, is_demo_mode: bool) 
                 output_path=output_path,
                 progress_callback=video_progress_callback,
                 resolution=(res_info['width'], res_info['height']),
+                fps=fps,
             )
         else:
             # Full mode: generate with audio
@@ -993,6 +1140,7 @@ def generate_video_from_storyboard(state, crossfade: float, is_demo_mode: bool) 
                 output_path=output_path,
                 progress_callback=video_progress_callback,
                 resolution=(res_info['width'], res_info['height']),
+                fps=fps,
             )
 
         update_state(final_video_path=str(output_path))
