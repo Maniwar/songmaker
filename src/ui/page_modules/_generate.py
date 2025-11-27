@@ -45,10 +45,11 @@ def _update_scene_lyrics(scene: Scene, new_lyrics: str) -> None:
             scene.words.append(Word(word=word_text, start=start, end=end))
 
 
-def _get_audio_clip(audio_path: Path, start_time: float, end_time: float) -> bytes:
-    """Extract an audio clip from the full audio file."""
+@st.cache_data(show_spinner=False)
+def _get_audio_clip(audio_path: str, start_time: float, end_time: float) -> bytes:
+    """Extract an audio clip from the full audio file. Cached for performance."""
     try:
-        audio = AudioSegment.from_file(str(audio_path))
+        audio = AudioSegment.from_file(audio_path)
         # Convert to milliseconds
         start_ms = int(start_time * 1000)
         end_ms = int(end_time * 1000)
@@ -253,23 +254,49 @@ def render_prompt_review(state, is_demo_mode: bool) -> None:
                 st.caption(f"Mood: {scene.mood}")
 
             with col2:
-                # Audio preview for this scene
+                # Audio preview with adjustable start point
                 if state.audio_path and state.audio_path != "demo_mode":
-                    audio_clip = _get_audio_clip(
-                        Path(state.audio_path),
-                        scene.start_time,
-                        scene.end_time
-                    )
-                    if audio_clip:
-                        st.audio(audio_clip, format="audio/mp3")
+                    # Show word-level timing if words exist
+                    if scene.words:
+                        word_timing = " | ".join(
+                            f"{w.word} ({w.start:.1f}s)" for w in scene.words[:5]
+                        )
+                        if len(scene.words) > 5:
+                            word_timing += f" ... +{len(scene.words) - 5} more"
+                        st.caption(f"Word timing: {word_timing}")
+
+                    # Slider to pick start point within scene
+                    scene_duration = scene.end_time - scene.start_time
+                    preview_cols = st.columns([2, 3])
+                    with preview_cols[0]:
+                        preview_start_offset = st.slider(
+                            "Start from",
+                            min_value=0.0,
+                            max_value=max(0.1, scene_duration - 0.5),
+                            value=0.0,
+                            step=0.1,
+                            key=f"preview_start_{i}",
+                        )
+                        actual_start = scene.start_time + preview_start_offset
+                        st.caption(f"Song: {actual_start:.1f}s")
+
+                    with preview_cols[1]:
+                        audio_clip = _get_audio_clip(
+                            str(state.audio_path),
+                            actual_start,
+                            scene.end_time
+                        )
+                        if audio_clip:
+                            st.audio(audio_clip, format="audio/mp3")
 
                 # Editable lyrics for this scene (allow adding if none detected)
                 current_lyrics = " ".join(w.word for w in scene.words) if scene.words else ""
-                new_lyrics = st.text_input(
+                new_lyrics = st.text_area(
                     "Lyrics" + (" (none detected)" if not scene.words else ""),
                     value=current_lyrics,
                     key=f"lyrics_{i}",
                     placeholder="Type lyrics for this scene..." if not scene.words else "",
+                    height=80,
                 )
                 # Update using helper function
                 if new_lyrics != current_lyrics and new_lyrics.strip():
@@ -418,8 +445,9 @@ def render_storyboard_grid(state) -> None:
                 render_scene_card(state, scene)
 
 
+@st.fragment
 def render_scene_card(state, scene: Scene) -> None:
-    """Render a single scene card with image and controls."""
+    """Render a single scene card with image and controls. Uses fragment for performance."""
     has_image = scene.image_path and Path(scene.image_path).exists()
 
     # Scene header with status indicator
@@ -440,16 +468,43 @@ def render_scene_card(state, scene: Scene) -> None:
     with st.expander("Edit Scene", expanded=False):
         st.markdown(f"**Mood:** {scene.mood}")
 
-        # Audio preview for this scene's time range
+        # Audio preview with adjustable start point
         if state.audio_path and state.audio_path != "demo_mode":
+            st.markdown("**Audio Preview**")
+
+            # Show word-level timing if words exist
+            if scene.words:
+                word_timing = " | ".join(
+                    f"{w.word} ({w.start:.1f}s)" for w in scene.words[:6]
+                )
+                if len(scene.words) > 6:
+                    word_timing += f" ... +{len(scene.words) - 6} more"
+                st.caption(f"Word timing: {word_timing}")
+
+            # Slider to pick start point within scene
+            scene_duration = scene.end_time - scene.start_time
+            preview_start_offset = st.slider(
+                "Start from (seconds into scene)",
+                min_value=0.0,
+                max_value=max(0.1, scene_duration - 0.5),
+                value=0.0,
+                step=0.1,
+                key=f"audio_start_{scene.index}",
+                help="Adjust to start playback from a specific point"
+            )
+
+            # Show the overall song timestamp
+            actual_start = scene.start_time + preview_start_offset
+            st.caption(f"Playing from **{actual_start:.1f}s** in song (scene ends at {scene.end_time:.1f}s)")
+
+            # Get audio clip from adjusted start point
             audio_clip = _get_audio_clip(
-                Path(state.audio_path),
-                scene.start_time,
+                str(state.audio_path),
+                actual_start,
                 scene.end_time
             )
             if audio_clip:
                 st.audio(audio_clip, format="audio/mp3")
-                st.caption("Listen to this scene's audio to verify lyrics")
 
         # Editable effect
         effect_options = [e.value for e in KenBurnsEffect]
@@ -463,12 +518,13 @@ def render_scene_card(state, scene: Scene) -> None:
 
         # Editable lyrics - fix transcription errors OR add missing lyrics
         current_lyrics = " ".join(w.word for w in scene.words) if scene.words else ""
-        new_lyrics = st.text_input(
+        new_lyrics = st.text_area(
             "Lyrics" + (" (none detected - add them here)" if not scene.words else ""),
             value=current_lyrics,
             key=f"card_lyrics_{scene.index}",
             help="Edit or add lyrics for this scene. If WhisperX missed words, type them here.",
             placeholder="Type lyrics for this scene..." if not scene.words else "",
+            height=80,
         )
 
         # Editable prompt - full prompt visible
