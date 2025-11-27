@@ -1,9 +1,11 @@
 """Video Generation page - Step 4 of the workflow."""
 
+from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 
 import streamlit as st
+from pydub import AudioSegment
 
 from src.config import config
 from src.agents.visual_agent import VisualAgent
@@ -11,7 +13,53 @@ from src.services.image_generator import ImageGenerator
 from src.services.video_generator import VideoGenerator
 from src.services.subtitle_generator import SubtitleGenerator
 from src.ui.components.state import get_state, update_state, advance_step, go_to_step
-from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect
+from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word
+
+
+def _update_scene_lyrics(scene: Scene, new_lyrics: str) -> None:
+    """
+    Update a scene's lyrics, creating Word objects if needed.
+    Distributes timing evenly across words for the scene duration.
+    """
+    new_words_text = new_lyrics.split()
+    if not new_words_text:
+        return
+
+    if scene.words:
+        # Update existing words
+        for i, word_obj in enumerate(scene.words):
+            if i < len(new_words_text):
+                word_obj.word = new_words_text[i]
+        # If user added more words, append to last word
+        if len(new_words_text) > len(scene.words):
+            extra = " ".join(new_words_text[len(scene.words):])
+            scene.words[-1].word += " " + extra
+    else:
+        # Create new Word objects with evenly distributed timing
+        scene_duration = scene.end_time - scene.start_time
+        word_duration = scene_duration / len(new_words_text)
+        scene.words = []
+        for i, word_text in enumerate(new_words_text):
+            start = scene.start_time + (i * word_duration)
+            end = start + word_duration - 0.05  # Small gap between words
+            scene.words.append(Word(word=word_text, start=start, end=end))
+
+
+def _get_audio_clip(audio_path: Path, start_time: float, end_time: float) -> bytes:
+    """Extract an audio clip from the full audio file."""
+    try:
+        audio = AudioSegment.from_file(str(audio_path))
+        # Convert to milliseconds
+        start_ms = int(start_time * 1000)
+        end_ms = int(end_time * 1000)
+        clip = audio[start_ms:end_ms]
+        # Export to bytes
+        buffer = BytesIO()
+        clip.export(buffer, format="mp3")
+        buffer.seek(0)
+        return buffer.read()
+    except Exception:
+        return None
 
 
 # Resolution configurations
@@ -205,23 +253,27 @@ def render_prompt_review(state, is_demo_mode: bool) -> None:
                 st.caption(f"Mood: {scene.mood}")
 
             with col2:
-                # Editable lyrics for this scene
-                if scene.words:
-                    current_lyrics = " ".join(w.word for w in scene.words)
-                    new_lyrics = st.text_input(
-                        "Lyrics (edit to fix transcription errors)",
-                        value=current_lyrics,
-                        key=f"lyrics_{i}",
+                # Audio preview for this scene
+                if state.audio_path and state.audio_path != "demo_mode":
+                    audio_clip = _get_audio_clip(
+                        Path(state.audio_path),
+                        scene.start_time,
+                        scene.end_time
                     )
-                    # Update words if lyrics changed
-                    if new_lyrics != current_lyrics:
-                        new_words = new_lyrics.split()
-                        for j, word_obj in enumerate(modified_scenes[i].words):
-                            if j < len(new_words):
-                                word_obj.word = new_words[j]
-                        if len(new_words) > len(modified_scenes[i].words):
-                            extra = " ".join(new_words[len(modified_scenes[i].words):])
-                            modified_scenes[i].words[-1].word += " " + extra
+                    if audio_clip:
+                        st.audio(audio_clip, format="audio/mp3")
+
+                # Editable lyrics for this scene (allow adding if none detected)
+                current_lyrics = " ".join(w.word for w in scene.words) if scene.words else ""
+                new_lyrics = st.text_input(
+                    "Lyrics" + (" (none detected)" if not scene.words else ""),
+                    value=current_lyrics,
+                    key=f"lyrics_{i}",
+                    placeholder="Type lyrics for this scene..." if not scene.words else "",
+                )
+                # Update using helper function
+                if new_lyrics != current_lyrics and new_lyrics.strip():
+                    _update_scene_lyrics(modified_scenes[i], new_lyrics)
 
                 # Editable prompt
                 new_prompt = st.text_area(
@@ -388,6 +440,17 @@ def render_scene_card(state, scene: Scene) -> None:
     with st.expander("Edit Scene", expanded=False):
         st.markdown(f"**Mood:** {scene.mood}")
 
+        # Audio preview for this scene's time range
+        if state.audio_path and state.audio_path != "demo_mode":
+            audio_clip = _get_audio_clip(
+                Path(state.audio_path),
+                scene.start_time,
+                scene.end_time
+            )
+            if audio_clip:
+                st.audio(audio_clip, format="audio/mp3")
+                st.caption("Listen to this scene's audio to verify lyrics")
+
         # Editable effect
         effect_options = [e.value for e in KenBurnsEffect]
         current_effect_idx = effect_options.index(scene.effect.value)
@@ -398,17 +461,15 @@ def render_scene_card(state, scene: Scene) -> None:
             key=f"card_effect_{scene.index}",
         )
 
-        # Editable lyrics - fix transcription errors
-        if scene.words:
-            current_lyrics = " ".join(w.word for w in scene.words)
-            new_lyrics = st.text_input(
-                "Lyrics (edit to fix transcription)",
-                value=current_lyrics,
-                key=f"card_lyrics_{scene.index}",
-                help="Edit the transcribed lyrics for this scene. Changes will be used in the karaoke subtitles.",
-            )
-        else:
-            new_lyrics = None
+        # Editable lyrics - fix transcription errors OR add missing lyrics
+        current_lyrics = " ".join(w.word for w in scene.words) if scene.words else ""
+        new_lyrics = st.text_input(
+            "Lyrics" + (" (none detected - add them here)" if not scene.words else ""),
+            value=current_lyrics,
+            key=f"card_lyrics_{scene.index}",
+            help="Edit or add lyrics for this scene. If WhisperX missed words, type them here.",
+            placeholder="Type lyrics for this scene..." if not scene.words else "",
+        )
 
         # Editable prompt - full prompt visible
         new_prompt = st.text_area(
@@ -426,17 +487,9 @@ def render_scene_card(state, scene: Scene) -> None:
                 scenes = state.scenes
                 scenes[scene.index].visual_prompt = new_prompt
                 scenes[scene.index].effect = KenBurnsEffect(new_effect)
-                # Update lyrics if changed
-                if new_lyrics and scene.words:
-                    new_words = new_lyrics.split()
-                    # Update word texts, preserving timing
-                    for i, word_obj in enumerate(scenes[scene.index].words):
-                        if i < len(new_words):
-                            word_obj.word = new_words[i]
-                    # If user added more words, append them to the last word
-                    if len(new_words) > len(scenes[scene.index].words):
-                        extra = " ".join(new_words[len(scenes[scene.index].words):])
-                        scenes[scene.index].words[-1].word += " " + extra
+                # Update lyrics
+                if new_lyrics and new_lyrics.strip():
+                    _update_scene_lyrics(scenes[scene.index], new_lyrics)
                 update_state(scenes=scenes)
                 st.success("Saved!")
                 st.rerun()
@@ -447,15 +500,9 @@ def render_scene_card(state, scene: Scene) -> None:
                 scenes = state.scenes
                 scenes[scene.index].visual_prompt = new_prompt
                 scenes[scene.index].effect = KenBurnsEffect(new_effect)
-                # Update lyrics if changed
-                if new_lyrics and scene.words:
-                    new_words = new_lyrics.split()
-                    for i, word_obj in enumerate(scenes[scene.index].words):
-                        if i < len(new_words):
-                            word_obj.word = new_words[i]
-                    if len(new_words) > len(scenes[scene.index].words):
-                        extra = " ".join(new_words[len(scenes[scene.index].words):])
-                        scenes[scene.index].words[-1].word += " " + extra
+                # Update lyrics
+                if new_lyrics and new_lyrics.strip():
+                    _update_scene_lyrics(scenes[scene.index], new_lyrics)
                 update_state(scenes=scenes)
                 regenerate_single_image(state, scene.index)
 
@@ -842,9 +889,18 @@ def generate_video_from_storyboard(state, crossfade: float, is_demo_mode: bool) 
             st.write("Creating karaoke subtitles...")
             subtitle_gen = SubtitleGenerator()
 
+            # Collect all words from scenes (may have been edited by user)
+            all_words = []
+            for scene in scenes:
+                if scene.words:
+                    all_words.extend(scene.words)
+
+            # Sort by start time to ensure proper order
+            all_words.sort(key=lambda w: w.start)
+
             subtitle_path = project_dir / "lyrics.ass"
-            subtitle_gen.generate_from_transcript(
-                transcript=state.transcript,
+            subtitle_gen.generate_karaoke_ass(
+                words=all_words,
                 output_path=subtitle_path,
             )
             st.write("   Subtitles created")

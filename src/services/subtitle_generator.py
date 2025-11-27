@@ -82,30 +82,35 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             line_start = line_words[0].start
             last_word_end = line_words[-1].end
 
-            # Calculate end time: ensure we show at least until last word finishes
-            # Add small buffer, but try not to overlap with next line
-            desired_end = last_word_end + 0.5  # Ideal: half second after last word
+            # Calculate end time - MUST NOT overlap with next line
+            # This prevents "stuck" lyrics where previous line persists
+            desired_end = last_word_end + 0.3  # Small buffer after last word
 
+            # Find when next line starts (if any)
+            next_line_start = None
             if i < len(lines) - 1:
                 next_line = lines[i + 1]
                 if next_line:
                     next_line_start = next_line[0].start
-                    # If next line starts before our desired end, constrain it
-                    # But always show at least until the last word finishes
-                    if next_line_start < desired_end:
-                        # Allow slight overlap (0.1s) rather than cutting off animation
-                        line_end = max(last_word_end + 0.1, next_line_start - 0.05)
-                    else:
-                        line_end = desired_end
-                else:
-                    line_end = desired_end
+
+            if next_line_start is not None:
+                # Strictly end before next line starts (no overlap!)
+                # End 0.05s before next line to ensure clean transition
+                max_end = next_line_start - 0.05
+                line_end = min(desired_end, max_end)
+                # But ensure we at least show until the last word ends
+                line_end = max(line_end, last_word_end)
             else:
                 # Last line gets full buffer
                 line_end = desired_end
 
-            # Ensure minimum duration of 0.5s for readability
-            if line_end - line_start < 0.5:
-                line_end = line_start + 0.5
+            # Ensure minimum duration for readability (but still respect no-overlap)
+            min_duration = 0.3
+            if line_end - line_start < min_duration:
+                line_end = line_start + min_duration
+                # Re-check overlap constraint
+                if next_line_start is not None and line_end >= next_line_start:
+                    line_end = next_line_start - 0.02
 
             # Build karaoke text with \kf (karaoke fill) tags
             # \kf<duration> fills the word over the duration (in centiseconds)
