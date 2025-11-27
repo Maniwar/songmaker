@@ -30,6 +30,7 @@ class ImageGenerator:
         prompt: str,
         style_prefix: Optional[str] = None,
         character_description: Optional[str] = None,
+        visual_world: Optional[str] = None,
         reference_image: Optional[Image.Image] = None,
         aspect_ratio: str = "16:9",
         output_path: Optional[Path] = None,
@@ -42,6 +43,7 @@ class ImageGenerator:
             prompt: The scene description
             style_prefix: Optional style prefix for consistent visual style
             character_description: Optional character description for consistency
+            visual_world: Optional visual world/setting for consistency across scenes
             reference_image: Optional reference image for composition hints
             aspect_ratio: Output aspect ratio (default 16:9 for video)
             output_path: Optional path to save the image
@@ -54,20 +56,26 @@ class ImageGenerator:
 
         client = self._get_client()
 
-        # Build the full prompt
+        # Build the full prompt with cinematography style guidance
         full_prompt_parts = []
 
-        if style_prefix:
-            full_prompt_parts.append(f"Art style: {style_prefix}")
+        # Visual world comes FIRST - anchors everything to the same universe
+        if visual_world:
+            full_prompt_parts.append(f"Setting/World: {visual_world}")
 
+        # Cinematography style - sets the visual language
+        if style_prefix:
+            full_prompt_parts.append(f"Cinematography: {style_prefix}")
+
+        # Character consistency
         if character_description:
             full_prompt_parts.append(f"Character: {character_description}")
 
+        # The actual scene content
         full_prompt_parts.append(f"Scene: {prompt}")
-        full_prompt_parts.append(
-            f"Wide cinematic shot, {aspect_ratio} aspect ratio, "
-            "dramatic lighting, high detail, photorealistic quality."
-        )
+
+        # Technical specs - just aspect ratio, let the style handle the rest
+        full_prompt_parts.append(f"{aspect_ratio} aspect ratio, high detail")
 
         full_prompt = ". ".join(full_prompt_parts)
 
@@ -228,6 +236,7 @@ class ImageGenerator:
         max_retries: int = 2,
         image_size: Optional[str] = None,
         sequential_mode: bool = False,
+        visual_world: Optional[str] = None,
     ) -> list[Path]:
         """
         Generate a series of images for a storyboard.
@@ -241,6 +250,7 @@ class ImageGenerator:
             max_retries: Number of retry attempts for failed generations
             image_size: Image size for Gemini models
             sequential_mode: If True, use previous image as reference for consistency
+            visual_world: Visual world/setting for consistency across all scenes
 
         Returns:
             List of paths to generated images (always same length as scene_prompts)
@@ -272,6 +282,7 @@ class ImageGenerator:
                 prompt=prompt,
                 style_prefix=style_prefix,
                 character_description=character_description,
+                visual_world=visual_world,
                 reference_image=reference_image,
                 output_path=output_path,
                 image_size=image_size,
@@ -301,6 +312,7 @@ class ImageGenerator:
                     prompt=scene_prompts[i],
                     style_prefix=style_prefix,
                     character_description=character_description,
+                    visual_world=visual_world,
                     output_path=output_path,
                     image_size=image_size,
                 )

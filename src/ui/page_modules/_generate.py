@@ -155,6 +155,104 @@ FPS_OPTIONS = {
     "60 fps (smooth)": 60,
 }
 
+# Cinematography style presets with detailed camera/lens/grading descriptions
+CINEMATOGRAPHY_STYLES = {
+    "Cinematic Film": {
+        "description": "Hollywood blockbuster look",
+        "prompt": (
+            "Shot on ARRI Alexa with Cooke S4 anamorphic lenses, 2.39:1 aspect ratio feel, "
+            "teal and orange color grading, shallow depth of field, subtle film grain, "
+            "dramatic three-point lighting, cinematic lens flares, "
+            "professional color science with rich shadows and controlled highlights"
+        ),
+    },
+    "Music Video": {
+        "description": "Dynamic MTV-style visuals",
+        "prompt": (
+            "High-energy music video aesthetic, vibrant saturated colors, high contrast, "
+            "stylized dramatic lighting with colored gels, dynamic compositions, "
+            "bold visual style, punchy color grading, studio lighting setups, "
+            "clean sharp focus, contemporary professional look"
+        ),
+    },
+    "Vintage Film": {
+        "description": "Classic 35mm film look",
+        "prompt": (
+            "Shot on 35mm Kodak Vision3 500T film stock, warm analog color palette, "
+            "visible film grain texture, slightly faded blacks, subtle color shifts, "
+            "natural halation on highlights, vintage lens characteristics with soft edges, "
+            "nostalgic golden hour warmth, organic film imperfections"
+        ),
+    },
+    "Anime/Animation": {
+        "description": "Japanese animation style",
+        "prompt": (
+            "High-quality anime art style, cel-shaded rendering, vibrant saturated colors, "
+            "clean bold linework, dramatic manga-inspired compositions, "
+            "detailed anime backgrounds with atmospheric perspective, "
+            "expressive character art, Studio Ghibli and Makoto Shinkai inspired visuals"
+        ),
+    },
+    "Documentary": {
+        "description": "Natural authentic look",
+        "prompt": (
+            "Documentary cinematography style, natural available lighting, "
+            "shallow depth of field with bokeh, neutral realistic color grading, "
+            "intimate handheld camera feel, authentic candid compositions, "
+            "Sony Venice or Canon C500 look, observational cinema verite aesthetic"
+        ),
+    },
+    "Film Noir": {
+        "description": "Classic noir shadows",
+        "prompt": (
+            "Classic film noir cinematography, high contrast black and white or desaturated, "
+            "dramatic chiaroscuro lighting with deep shadows, venetian blind shadows, "
+            "fog and atmospheric haze, low-key lighting setups, "
+            "1940s Hollywood noir aesthetic, mysterious moody atmosphere"
+        ),
+    },
+    "Ethereal/Dreamy": {
+        "description": "Soft dreamlike quality",
+        "prompt": (
+            "Ethereal dreamy cinematography, soft diffused lighting, "
+            "pastel color palette with lifted shadows, subtle lens flare and bloom, "
+            "shallow focus with creamy bokeh, overexposed highlights, "
+            "hazy atmospheric glow, romantic soft focus effects, magical realism"
+        ),
+    },
+    "Neon Cyberpunk": {
+        "description": "Blade Runner neon aesthetic",
+        "prompt": (
+            "Cyberpunk neon aesthetic, vibrant pink/cyan/purple neon lighting, "
+            "rain-slicked reflective surfaces, atmospheric fog with colored light, "
+            "high contrast dark scenes with neon accents, Blade Runner 2049 inspired, "
+            "futuristic urban nightscapes, Roger Deakins cinematography style"
+        ),
+    },
+    "Golden Hour": {
+        "description": "Warm sunset lighting",
+        "prompt": (
+            "Golden hour magic hour cinematography, warm orange and amber tones, "
+            "long dramatic shadows, lens flare from sun, backlit subjects with rim light, "
+            "Terrence Malick inspired natural beauty, soft warm color grading, "
+            "romantic sunset atmosphere, Emmanuel Lubezki natural lighting"
+        ),
+    },
+    "High Fashion": {
+        "description": "Editorial glamour",
+        "prompt": (
+            "High fashion editorial photography style, controlled studio lighting, "
+            "beauty dish and softbox setups, crisp sharp focus, "
+            "clean minimalist compositions, high-end commercial aesthetic, "
+            "perfect skin tones, luxury brand visual language, Vogue magazine quality"
+        ),
+    },
+    "Custom": {
+        "description": "Define your own style",
+        "prompt": "",  # User provides their own
+    },
+}
+
 
 def render_generate_page() -> None:
     """Render the video generation page."""
@@ -247,13 +345,44 @@ def render_storyboard_setup(state, is_demo_mode: bool) -> None:
                 key="video_fps",
             )
 
-        st.text_area(
-            "Style override (optional)",
-            placeholder="Override the visual style, e.g., 'anime style, vibrant colors'",
-            key="style_override",
-        )
+        # Cinematography style selection
+        st.markdown("---")
+        st.markdown("**Cinematography Style**")
 
-        # New options
+        # Build options with descriptions
+        style_options = [
+            f"{name} - {info['description']}"
+            for name, info in CINEMATOGRAPHY_STYLES.items()
+        ]
+        selected_style_display = st.selectbox(
+            "Visual Style",
+            options=style_options,
+            index=0,  # Default to Cinematic Film
+            help="Choose a cinematography style preset for consistent visuals",
+            key="cinematography_style",
+        )
+        # Extract just the style name from the display string
+        selected_style_name = selected_style_display.split(" - ")[0]
+
+        # Show the style description
+        style_info = CINEMATOGRAPHY_STYLES[selected_style_name]
+        if selected_style_name != "Custom":
+            st.caption(f"*{style_info['prompt'][:100]}...*")
+
+        # Custom style input (only show if Custom is selected)
+        if selected_style_name == "Custom":
+            st.text_area(
+                "Custom Style Description",
+                placeholder=(
+                    "Describe your visual style, e.g.:\n"
+                    "'Shot on RED Komodo, anamorphic flares, "
+                    "moody blue/orange grade, shallow DOF...'"
+                ),
+                key="custom_style",
+                height=100,
+            )
+
+        # Advanced options
         st.markdown("---")
         st.markdown("**Advanced Options**")
 
@@ -276,17 +405,32 @@ def render_storyboard_setup(state, is_demo_mode: bool) -> None:
 
     # Generate storyboard button
     if st.button("Generate Scene Prompts", type="primary"):
+        # Get cinematography style
+        style_display = st.session_state.get(
+            "cinematography_style", "Cinematic Film - Hollywood blockbuster look"
+        )
+        style_name = style_display.split(" - ")[0]
+
+        # Build the style prompt
+        if style_name == "Custom":
+            style_prompt = st.session_state.get("custom_style", "")
+        else:
+            style_prompt = CINEMATOGRAPHY_STYLES.get(style_name, {}).get(
+                "prompt", ""
+            )
+
         # Save new settings to state
         fps_key = st.session_state.get("video_fps", "30 fps (standard)")
         update_state(
             show_lyrics=st.session_state.get("show_lyrics", True),
             use_sequential_mode=st.session_state.get("use_sequential_mode", False),
             video_fps=FPS_OPTIONS.get(fps_key, 30),
+            cinematography_style=style_name,
         )
         generate_scene_prompts(
             state,
             st.session_state.get("scenes_per_minute", 4),
-            st.session_state.get("style_override", ""),
+            style_prompt,
             st.session_state.get("video_resolution", "1080p"),
         )
 
@@ -844,11 +988,12 @@ def generate_images_from_prompts(state, is_demo_mode: bool) -> None:
             else config.image.default_style
         )
         character_desc = state.concept.character_description if state.concept else None
+        visual_world = state.concept.visual_world if state.concept else None
 
         def image_progress(msg: str, prog: float):
             progress_bar.progress(prog, text=msg)
 
-        # Pass resolution and sequential mode to image generator
+        # Pass resolution, sequential mode, and visual_world to image generator
         image_paths = image_gen.generate_storyboard(
             scene_prompts=prompts,
             style_prefix=style_prefix,
@@ -857,6 +1002,7 @@ def generate_images_from_prompts(state, is_demo_mode: bool) -> None:
             progress_callback=image_progress,
             image_size=res_info["image_size"],
             sequential_mode=sequential_mode,
+            visual_world=visual_world,
         )
 
         # Ensure we have the same number of paths as scenes
@@ -912,6 +1058,7 @@ def regenerate_single_image(state, scene_index: int) -> None:
             else config.image.default_style
         )
         character_desc = state.concept.character_description if state.concept else None
+        visual_world = state.concept.visual_world if state.concept else None
 
         output_path = images_dir / f"scene_{scene_index:03d}.png"
 
@@ -919,6 +1066,7 @@ def regenerate_single_image(state, scene_index: int) -> None:
             prompt=scene.visual_prompt,
             style_prefix=style_prefix,
             character_description=character_desc,
+            visual_world=visual_world,
             output_path=output_path,
             image_size=res_info["image_size"],
         )
@@ -964,6 +1112,7 @@ def regenerate_missing_images(state) -> None:
             else config.image.default_style
         )
         character_desc = state.concept.character_description if state.concept else None
+        visual_world = state.concept.visual_world if state.concept else None
 
         progress_bar = st.progress(0.0, text="Generating missing images...")
 
@@ -979,6 +1128,7 @@ def regenerate_missing_images(state) -> None:
                 prompt=scenes[i].visual_prompt,
                 style_prefix=style_prefix,
                 character_description=character_desc,
+                visual_world=visual_world,
                 output_path=output_path,
                 image_size=res_info["image_size"],
             )
@@ -1026,6 +1176,7 @@ def regenerate_all_images(state) -> None:
             else config.image.default_style
         )
         character_desc = state.concept.character_description if state.concept else None
+        visual_world = state.concept.visual_world if state.concept else None
 
         progress_bar = st.progress(0.0, text="Regenerating images...")
 
@@ -1040,6 +1191,7 @@ def regenerate_all_images(state) -> None:
                 prompt=scene.visual_prompt,
                 style_prefix=style_prefix,
                 character_description=character_desc,
+                visual_world=visual_world,
                 output_path=output_path,
                 image_size=res_info["image_size"],
             )

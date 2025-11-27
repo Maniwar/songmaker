@@ -21,15 +21,21 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a creative director for music videos. Your role is to create compelling visual scenes that match the song's lyrics, mood, and narrative arc.
 
+CRITICAL: VISUAL WORLD CONSISTENCY
+- Every scene MUST exist in the SAME visual world/setting
+- If the world is "medieval fantasy", ALL scenes must be medieval fantasy
+- Never mix different time periods, universes, or settings
+- Reference the visual world description in EVERY scene prompt
+
 When planning scenes:
 1. Analyze the lyrics for key imagery, emotions, and story beats
 2. Create visual prompts that translate lyrics into cinematic scenes
-3. Maintain visual consistency through the video
+3. MAINTAIN VISUAL CONSISTENCY - every scene must feel like the same universe
 4. Consider the emotional journey from start to finish
 5. Match scene mood to the musical energy at that point
 
 For each scene, provide:
-- A detailed visual prompt (for image generation)
+- A detailed visual prompt (for image generation) - MUST include visual world context
 - The mood/emotion of the scene
 - A Ken Burns effect - IMPORTANT: Use VARIED effects across scenes for visual interest:
   - zoom_in: For intimate moments, drawing attention inward
@@ -181,6 +187,68 @@ class VisualAgent:
 
         return suggestions[:num_scenes]
 
+    def extract_visual_world(
+        self,
+        lyrics: str,
+        concept: SongConcept,
+    ) -> str:
+        """
+        Extract a consistent visual world/setting from lyrics and concept.
+
+        This defines the persistent universe for ALL scenes - ensuring
+        we don't mix medieval with WW2, cyberpunk with western, etc.
+
+        Args:
+            lyrics: The song lyrics
+            concept: Song concept with themes and mood
+
+        Returns:
+            A description of the visual world/setting
+        """
+        # If concept already has visual_world, use it
+        if concept.visual_world:
+            return concept.visual_world
+
+        client = self._get_client()
+
+        prompt = f"""Analyze these song lyrics and concept to define ONE consistent visual world/setting.
+
+Song Concept:
+- Genre: {concept.genre}
+- Mood: {concept.mood}
+- Themes: {', '.join(concept.themes)}
+
+Lyrics:
+{lyrics[:2000]}
+
+Based on the lyrics and themes, define a SINGLE consistent visual world that ALL scenes must exist in.
+This should be a specific time period, place, and aesthetic - NOT generic.
+
+Examples of good visual worlds:
+- "Medieval fantasy kingdom with stone castles, misty forests, knights in plate armor"
+- "1980s neon-lit Tokyo with rain-slicked streets, Japanese signage, retro technology"
+- "Post-apocalyptic desert wasteland with rusted vehicles, dust storms, survivalist camps"
+- "Victorian steampunk London with brass machinery, fog, gas lamps, industrial architecture"
+
+Respond with ONLY the visual world description (1-2 sentences). Be specific about:
+- Time period/era
+- Location/environment type
+- Key visual elements that should appear consistently"""
+
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-5-20250929",
+                max_tokens=200,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            visual_world = response.content[0].text.strip()
+            logger.info(f"Extracted visual world: {visual_world}")
+            return visual_world
+        except Exception as e:
+            logger.error(f"Failed to extract visual world: {e}")
+            # Fallback based on genre/themes
+            return f"{concept.mood} {concept.genre} setting with {', '.join(concept.themes[:2])} elements"
+
     def generate_scene_prompts(
         self,
         concept: SongConcept,
@@ -215,11 +283,24 @@ class VisualAgent:
         if not full_lyrics or "[Lyrics" in full_lyrics or len(full_lyrics) < 50:
             effective_lyrics = "\n".join(all_scene_lyrics)
 
+        # Extract visual world for consistency across all scenes
+        visual_world = self.extract_visual_world(effective_lyrics, concept)
+        logger.info(f"Using visual world: {visual_world}")
+
+        # Store visual_world in concept for later use by image generator
+        concept.visual_world = visual_world
+
         num_scenes = len(scene_boundaries)
         # Suggest effect distribution for variety
         effect_hints = self._suggest_effect_distribution(num_scenes)
 
-        prompt = f"""Create visual prompts for a music video with these scenes:
+        prompt = f"""Create visual prompts for a music video with these scenes.
+
+*** CRITICAL - VISUAL WORLD (MUST BE REFERENCED IN EVERY SCENE) ***
+{visual_world}
+
+ALL scenes MUST exist in this visual world. Do NOT mix time periods, settings, or aesthetics.
+Every visual prompt you write MUST include elements from this visual world.
 
 Song Concept:
 - Genre: {concept.genre}
@@ -236,6 +317,7 @@ Scenes to create (with suggested camera effects):
 
 For each scene, provide:
 1. A detailed visual prompt (2-3 sentences describing what's shown in the image)
+   - MUST reference the visual world setting (e.g., if medieval fantasy, show castles/knights/forests)
    - The prompt should MATCH the specific lyrics for that scene's timestamp
    - Include visual elements that represent the words being sung
 2. The mood of this specific scene
@@ -246,7 +328,7 @@ Respond in this exact JSON format:
 {{
     "scenes": [
         {{
-            "visual_prompt": "Detailed description for image generation",
+            "visual_prompt": "Detailed description INCLUDING the visual world setting",
             "mood": "emotional tone of this scene",
             "effect": "zoom_in"
         }}
