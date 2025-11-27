@@ -1,0 +1,251 @@
+"""Subtitle generation service for karaoke-style lyrics."""
+
+from pathlib import Path
+from typing import Optional
+
+from src.config import Config, config as default_config
+from src.models.schemas import Word, Transcript
+
+
+def format_ass_time(seconds: float) -> str:
+    """Convert seconds to ASS timestamp format (H:MM:SS.CC)."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    # ASS uses centiseconds
+    return f"{hours}:{minutes:02d}:{secs:05.2f}"
+
+
+class SubtitleGenerator:
+    """Generate ASS subtitle files with karaoke highlighting."""
+
+    def __init__(self, config: Optional[Config] = None):
+        self.config = config or default_config
+
+    def generate_karaoke_ass(
+        self,
+        words: list[Word],
+        output_path: Path,
+        font_name: str = "Arial",
+        font_size: int = 48,
+        primary_color: str = "&H00FFFFFF",
+        highlight_color: str = "&H0000FFFF",
+        outline_color: str = "&H00000000",
+        back_color: str = "&H80000000",
+        max_words_per_line: int = 8,
+    ) -> Path:
+        """
+        Generate ASS subtitle file with word-by-word karaoke highlighting.
+
+        Args:
+            words: List of Word objects with timing information
+            output_path: Path to save the ASS file
+            font_name: Font to use for subtitles
+            font_size: Font size in points
+            primary_color: Primary text color (AABBGGRR format)
+            highlight_color: Color when word is being sung
+            outline_color: Outline color
+            back_color: Background/shadow color
+            max_words_per_line: Maximum words per line for readability
+
+        Returns:
+            Path to the generated ASS file
+        """
+        video_width = self.config.video.width
+        video_height = self.config.video.height
+
+        # For karaoke: PrimaryColour = highlighted (sung) color, SecondaryColour = base (not yet sung)
+        # \kf effect transitions from SecondaryColour to PrimaryColour
+        header = f"""[Script Info]
+Title: Karaoke Lyrics
+ScriptType: v4.00+
+PlayResX: {video_width}
+PlayResY: {video_height}
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{font_name},{font_size},{highlight_color},{primary_color},{outline_color},{back_color},-1,0,0,0,100,100,0,0,1,3,2,2,20,20,50,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+        # Group words into lines
+        lines = self._group_words_into_lines(words, max_words_per_line)
+
+        events = []
+        for i, line_words in enumerate(lines):
+            if not line_words:
+                continue
+
+            line_start = line_words[0].start
+            last_word_end = line_words[-1].end
+
+            # Calculate end time: ensure we show at least until last word finishes
+            # Add small buffer, but try not to overlap with next line
+            desired_end = last_word_end + 0.5  # Ideal: half second after last word
+
+            if i < len(lines) - 1:
+                next_line = lines[i + 1]
+                if next_line:
+                    next_line_start = next_line[0].start
+                    # If next line starts before our desired end, constrain it
+                    # But always show at least until the last word finishes
+                    if next_line_start < desired_end:
+                        # Allow slight overlap (0.1s) rather than cutting off animation
+                        line_end = max(last_word_end + 0.1, next_line_start - 0.05)
+                    else:
+                        line_end = desired_end
+                else:
+                    line_end = desired_end
+            else:
+                # Last line gets full buffer
+                line_end = desired_end
+
+            # Ensure minimum duration of 0.5s for readability
+            if line_end - line_start < 0.5:
+                line_end = line_start + 0.5
+
+            # Build karaoke text with \kf (karaoke fill) tags
+            # \kf<duration> fills the word over the duration (in centiseconds)
+            text_parts = []
+            prev_end = line_start
+
+            for j, word in enumerate(line_words):
+                # Calculate delay before this word starts (in centiseconds)
+                delay_cs = int((word.start - prev_end) * 100)
+                if delay_cs < 0:
+                    delay_cs = 0
+
+                # Duration of the word itself (in centiseconds)
+                word_duration_cs = int((word.end - word.start) * 100)
+                if word_duration_cs < 10:
+                    word_duration_cs = 10  # Minimum 0.1s
+
+                # Add delay (unhighlighted time before word)
+                if delay_cs > 0:
+                    text_parts.append(f"{{\\k{delay_cs}}}")
+
+                # Add the word with karaoke fill effect
+                text_parts.append(f"{{\\kf{word_duration_cs}}}{word.word} ")
+
+                prev_end = word.end
+
+            line_text = "".join(text_parts).strip()
+
+            # Format timestamps
+            start_ts = format_ass_time(line_start)
+            end_ts = format_ass_time(line_end)
+
+            events.append(
+                f"Dialogue: 0,{start_ts},{end_ts},Default,,0,0,0,,{line_text}"
+            )
+
+        # Write file
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(header + "\n".join(events))
+
+        return output_path
+
+    def _group_words_into_lines(
+        self,
+        words: list[Word],
+        max_words: int,
+    ) -> list[list[Word]]:
+        """
+        Group words into lines for subtitle display.
+
+        Tries to break at natural points (punctuation) or at max_words limit.
+        """
+        lines = []
+        current_line = []
+
+        for word in words:
+            current_line.append(word)
+
+            # Check for natural break points
+            is_natural_break = word.word.rstrip().endswith((".", "!", "?", ",", ";"))
+
+            if len(current_line) >= max_words or is_natural_break:
+                lines.append(current_line)
+                current_line = []
+
+        # Add remaining words
+        if current_line:
+            lines.append(current_line)
+
+        return lines
+
+    def generate_from_transcript(
+        self,
+        transcript: Transcript,
+        output_path: Path,
+        **kwargs,
+    ) -> Path:
+        """
+        Generate ASS file from a Transcript object.
+
+        Args:
+            transcript: Transcript with word-level timestamps
+            output_path: Path to save the ASS file
+            **kwargs: Additional arguments passed to generate_karaoke_ass
+
+        Returns:
+            Path to the generated ASS file
+        """
+        all_words = transcript.all_words
+        return self.generate_karaoke_ass(all_words, output_path, **kwargs)
+
+    def generate_simple_srt(
+        self,
+        words: list[Word],
+        output_path: Path,
+        max_words_per_line: int = 8,
+    ) -> Path:
+        """
+        Generate a simple SRT subtitle file (without karaoke effects).
+
+        Args:
+            words: List of Word objects with timing information
+            output_path: Path to save the SRT file
+            max_words_per_line: Maximum words per line
+
+        Returns:
+            Path to the generated SRT file
+        """
+        lines = self._group_words_into_lines(words, max_words_per_line)
+
+        srt_content = []
+        for i, line_words in enumerate(lines, 1):
+            if not line_words:
+                continue
+
+            start = line_words[0].start
+            end = line_words[-1].end + 0.5
+
+            # SRT timestamp format: HH:MM:SS,mmm
+            start_ts = self._format_srt_time(start)
+            end_ts = self._format_srt_time(end)
+
+            text = " ".join(word.word for word in line_words)
+
+            srt_content.append(f"{i}")
+            srt_content.append(f"{start_ts} --> {end_ts}")
+            srt_content.append(text)
+            srt_content.append("")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(srt_content))
+
+        return output_path
+
+    def _format_srt_time(self, seconds: float) -> str:
+        """Convert seconds to SRT timestamp format (HH:MM:SS,mmm)."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millis = int((seconds % 1) * 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
