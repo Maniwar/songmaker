@@ -140,10 +140,11 @@ class TestWorkflowStep:
     def test_workflow_steps_exist(self):
         """Test that all workflow steps are defined."""
         steps = list(WorkflowStep)
-        assert len(steps) == 5
+        assert len(steps) == 6
         assert WorkflowStep.CONCEPT in steps
         assert WorkflowStep.LYRICS in steps
         assert WorkflowStep.UPLOAD in steps
+        assert WorkflowStep.VISUAL in steps
         assert WorkflowStep.GENERATE in steps
         assert WorkflowStep.COMPLETE in steps
 

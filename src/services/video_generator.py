@@ -108,7 +108,7 @@ class VideoGenerator:
         width, height = resolution.split("x")
 
         effects = {
-            KenBurnsEffect.ZOOM_IN: (
+            KenBurnsEffect.ZOOM_IN: (           
                 f"zoompan=z='min(zoom+0.001,1.3)':"
                 f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
                 f"d={frames}:s={resolution}:fps={fps}"
@@ -116,7 +116,7 @@ class VideoGenerator:
             KenBurnsEffect.ZOOM_OUT: (
                 f"zoompan=z='if(lte(zoom,1.0),1.3,max(1.001,zoom-0.001))':"
                 f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-                f"d={frames}:s={resolution}:fps={fps}"
+                                                                 f"d={frames}:s={resolution}:fps={fps}"
             ),
             KenBurnsEffect.PAN_LEFT: (
                 f"zoompan=z='1.15':"
@@ -497,6 +497,108 @@ class VideoGenerator:
         subprocess.run(cmd, check=True, capture_output=True)
         return output_path
 
+    def create_animation_preview(
+        self,
+        video_path: Path,
+        audio_path: Path,
+        subtitle_path: Optional[Path],
+        start_time: float,
+        duration: float,
+        output_path: Path,
+        resolution: Optional[tuple[int, int]] = None,
+    ) -> Path:
+        """
+        Create a preview clip for an animated scene with audio and optional subtitles.
+
+        Args:
+            video_path: Path to the animated video clip
+            audio_path: Path to the full audio file
+            subtitle_path: Optional path to ASS subtitle file (for scene's words only)
+            start_time: Start time in the audio (seconds)
+            duration: Duration of the scene (seconds)
+            output_path: Path for the output preview
+            resolution: Optional (width, height) tuple
+
+        Returns:
+            Path to the preview video
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir = Path(temp_dir)
+
+            # Scale/prepare the animation video
+            if resolution:
+                res_str = f"{resolution[0]}x{resolution[1]}"
+            else:
+                res_str = self.config.video.resolution
+
+            width, height = res_str.split("x")
+
+            scaled_video = temp_dir / "scaled.mp4"
+            encoder_args = self._get_encoder_args(quality="fast")
+
+            # Scale to target resolution
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(video_path),
+                "-vf",
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+                "-t",
+                str(duration),
+            ]
+            cmd.extend(encoder_args)
+            cmd.extend(["-an", str(scaled_video)])
+            subprocess.run(cmd, check=True, capture_output=True)
+
+            # Extract audio segment for this scene
+            audio_segment = temp_dir / "audio_segment.mp3"
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(audio_path),
+                "-ss",
+                str(start_time),
+                "-t",
+                str(duration),
+                "-c:a",
+                "libmp3lame",
+                "-q:a",
+                "2",
+                str(audio_segment),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+
+            # Add audio to video
+            with_audio = temp_dir / "with_audio.mp4"
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(scaled_video),
+                "-i",
+                str(audio_segment),
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                str(with_audio),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+
+            if subtitle_path and subtitle_path.exists():
+                # Add subtitles (already time-shifted for scene start = 0)
+                self.add_subtitles(with_audio, subtitle_path, output_path, burn_in=True)
+            else:
+                import shutil
+                shutil.copy(with_audio, output_path)
+
+        return output_path
+
     def create_scene_preview(
         self,
         image_path: Path,
@@ -644,6 +746,87 @@ class VideoGenerator:
         secs = seconds % 60
         return f"{hours}:{minutes:02d}:{secs:05.2f}"
 
+    def prepare_animated_clip(
+        self,
+        video_path: Path,
+        target_duration: float,
+        output_path: Path,
+        resolution: Optional[tuple[int, int]] = None,
+        fps: Optional[int] = None,
+    ) -> Path:
+        """
+        Prepare an animated clip to match target resolution, fps, and duration.
+
+        Args:
+            video_path: Path to the animated video clip
+            target_duration: Target duration in seconds
+            output_path: Path for the output video
+            resolution: Optional (width, height) tuple
+            fps: Optional frames per second
+
+        Returns:
+            Path to the prepared clip
+        """
+        if resolution:
+            res_str = f"{resolution[0]}x{resolution[1]}"
+        else:
+            res_str = self.config.video.resolution
+        fps = fps or self.config.video.fps
+
+        width, height = res_str.split("x")
+
+        # Get current video duration
+        current_duration = self._get_media_duration(video_path)
+
+        encoder_args = self._get_encoder_args(quality="fast")
+
+        # Build filter string: scale to target resolution and adjust timing
+        filter_str = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}"
+
+        # Speed adjustment if needed
+        if current_duration > 0 and abs(current_duration - target_duration) > 0.1:
+            # Calculate speed factor
+            speed = current_duration / target_duration
+            if speed > 0.5 and speed < 2.0:
+                filter_str = f"[0:v]{filter_str},setpts={1/speed}*PTS[v];[0:a]atempo={speed}[a]"
+            else:
+                # Just trim or extend if speed adjustment is too extreme
+                filter_str = f"[0:v]{filter_str}[v]"
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+        ]
+
+        # Check if we have complex filtergraph (audio adjustment)
+        if "[v]" in filter_str:
+            cmd.extend([
+                "-filter_complex",
+                filter_str,
+                "-map",
+                "[v]",
+            ])
+            if "[a]" in filter_str:
+                cmd.extend(["-map", "[a]"])
+        else:
+            cmd.extend([
+                "-vf",
+                filter_str,
+            ])
+
+        cmd.extend(encoder_args)
+        cmd.extend([
+            "-an",  # Remove audio (we'll add the original audio track later)
+            "-t",
+            str(target_duration),
+            str(output_path),
+        ])
+
+        subprocess.run(cmd, check=True, capture_output=True)
+        return output_path
+
     def generate_music_video(
         self,
         scenes: list[Scene],
@@ -673,27 +856,60 @@ class VideoGenerator:
             temp_dir = Path(temp_dir)
             clip_paths = []
 
+            # Count animated vs static scenes for progress reporting
+            animated_count = sum(
+                1 for s in scenes
+                if getattr(s, 'animated', False)
+                and getattr(s, 'video_path', None)
+                and Path(s.video_path).exists()
+            )
+
             # Generate individual scene clips
             total_scenes = len(scenes)
             for i, scene in enumerate(scenes):
                 if progress_callback:
+                    scene_type = "animated" if (
+                        getattr(scene, 'animated', False)
+                        and getattr(scene, 'video_path', None)
+                        and Path(scene.video_path).exists()
+                    ) else "static"
                     progress_callback(
-                        f"Creating scene {i + 1}/{total_scenes}...",
+                        f"Creating scene {i + 1}/{total_scenes} ({scene_type})...",
                         (i / total_scenes) * 0.5,
                     )
 
-                if scene.image_path is None:
+                clip_path = temp_dir / f"clip_{i:03d}.mp4"
+
+                # Check if this scene has an animation video
+                has_animation = (
+                    getattr(scene, 'animated', False)
+                    and getattr(scene, 'video_path', None)
+                    and Path(scene.video_path).exists()
+                )
+
+                if has_animation:
+                    # Use the pre-generated animated video clip
+                    self.prepare_animated_clip(
+                        video_path=Path(scene.video_path),
+                        target_duration=scene.duration,
+                        output_path=clip_path,
+                        resolution=resolution,
+                        fps=fps,
+                    )
+                elif scene.image_path is not None:
+                    # Create Ken Burns clip from static image
+                    self.create_scene_clip(
+                        image_path=scene.image_path,
+                        duration=scene.duration,
+                        effect=scene.effect,
+                        output_path=clip_path,
+                        resolution=resolution,
+                        fps=fps,
+                    )
+                else:
+                    # No image or animation, skip this scene
                     continue
 
-                clip_path = temp_dir / f"clip_{i:03d}.mp4"
-                self.create_scene_clip(
-                    image_path=scene.image_path,
-                    duration=scene.duration,
-                    effect=scene.effect,
-                    output_path=clip_path,
-                    resolution=resolution,
-                    fps=fps,
-                )
                 clip_paths.append(clip_path)
 
             if progress_callback:
@@ -760,23 +976,48 @@ class VideoGenerator:
             total_scenes = len(scenes)
             for i, scene in enumerate(scenes):
                 if progress_callback:
+                    scene_type = "animated" if (
+                        getattr(scene, 'animated', False)
+                        and getattr(scene, 'video_path', None)
+                        and Path(scene.video_path).exists()
+                    ) else "static"
                     progress_callback(
-                        f"Creating scene {i + 1}/{total_scenes}...",
+                        f"Creating scene {i + 1}/{total_scenes} ({scene_type})...",
                         (i / total_scenes) * 0.7,
                     )
 
-                if scene.image_path is None:
+                clip_path = temp_dir / f"clip_{i:03d}.mp4"
+
+                # Check if this scene has an animation video
+                has_animation = (
+                    getattr(scene, 'animated', False)
+                    and getattr(scene, 'video_path', None)
+                    and Path(scene.video_path).exists()
+                )
+
+                if has_animation:
+                    # Use the pre-generated animated video clip
+                    self.prepare_animated_clip(
+                        video_path=Path(scene.video_path),
+                        target_duration=scene.duration,
+                        output_path=clip_path,
+                        resolution=resolution,
+                        fps=fps,
+                    )
+                elif scene.image_path is not None:
+                    # Create Ken Burns clip from static image
+                    self.create_scene_clip(
+                        image_path=scene.image_path,
+                        duration=scene.duration,
+                        effect=scene.effect,
+                        output_path=clip_path,
+                        resolution=resolution,
+                        fps=fps,
+                    )
+                else:
+                    # No image or animation, skip this scene
                     continue
 
-                clip_path = temp_dir / f"clip_{i:03d}.mp4"
-                self.create_scene_clip(
-                    image_path=scene.image_path,
-                    duration=scene.duration,
-                    effect=scene.effect,
-                    output_path=clip_path,
-                    resolution=resolution,
-                    fps=fps,
-                )
                 clip_paths.append(clip_path)
 
             if progress_callback:

@@ -9,6 +9,7 @@ STEPS = [
     (WorkflowStep.CONCEPT, "Concept", "Develop your song idea"),
     (WorkflowStep.LYRICS, "Lyrics", "Generate lyrics for Suno"),
     (WorkflowStep.UPLOAD, "Upload", "Upload your MP3 from Suno"),
+    (WorkflowStep.VISUAL, "Visual", "Design your visual style"),
     (WorkflowStep.GENERATE, "Generate", "Create your music video"),
     (WorkflowStep.COMPLETE, "Complete", "Download and share"),
 ]
@@ -25,9 +26,15 @@ def render_wizard_progress(current_step: WorkflowStep) -> None:
 
     cols = st.columns(len(STEPS))
 
-    for col, (step, label, _) in zip(cols, STEPS):
+    # Find current step index for proper comparison
+    current_idx = next(
+        (i for i, (step, _, _) in enumerate(STEPS) if step == current_step),
+        0
+    )
+
+    for i, (col, (step, label, _)) in enumerate(zip(cols, STEPS)):
         with col:
-            if current_step.value > step.value:
+            if i < current_idx:
                 # Completed step
                 st.markdown(f"### :white_check_mark: {label}")
             elif current_step == step:

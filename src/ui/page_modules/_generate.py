@@ -13,6 +13,7 @@ from src.services.audio_processor import AudioProcessor
 from src.services.image_generator import ImageGenerator
 from src.services.video_generator import VideoGenerator
 from src.services.subtitle_generator import SubtitleGenerator
+from src.services.lip_sync_animator import LipSyncAnimator, check_lip_sync_available
 from src.ui.components.state import get_state, update_state, advance_step, go_to_step
 from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word
 
@@ -325,7 +326,11 @@ def _get_audio_clip(audio_path: str, start_time: float, end_time: float) -> byte
 
 
 def _generate_scene_preview_with_lyrics(state, scene: Scene) -> bytes:
-    """Generate a video preview for a scene with karaoke subtitles."""
+    """Generate a video preview for a scene with karaoke subtitles.
+
+    For animated scenes, uses the existing animation video with lyrics overlay.
+    For static scenes, creates Ken Burns effect preview.
+    """
     from tempfile import NamedTemporaryFile
     import os
 
@@ -341,25 +346,49 @@ def _generate_scene_preview_with_lyrics(state, scene: Scene) -> bytes:
 
     try:
         # Generate subtitle file for this scene's words
+        # Shift timing so scene starts at 0 (for preview)
         if scene.words:
+            # Create shifted words for preview (start from 0)
+            shifted_words = []
+            for w in scene.words:
+                shifted_words.append(Word(
+                    word=w.word,
+                    start=w.start - scene.start_time,
+                    end=w.end - scene.start_time,
+                ))
             subtitle_gen.generate_karaoke_ass(
-                words=scene.words,
+                words=shifted_words,
                 output_path=sub_path,
             )
         else:
             sub_path = None
 
-        # Generate preview video
-        video_gen.create_scene_preview(
-            image_path=Path(scene.image_path),
-            audio_path=Path(state.audio_path),
-            subtitle_path=sub_path,
-            start_time=scene.start_time,
-            duration=scene.duration,
-            effect=scene.effect,
-            output_path=vid_path,
-            resolution=(1280, 720),  # Lower res for preview
-        )
+        # Check if scene has animation
+        has_animation = scene.has_animation
+
+        if has_animation:
+            # Use animation video with lyrics overlay
+            video_gen.create_animation_preview(
+                video_path=Path(scene.video_path),
+                audio_path=Path(state.audio_path),
+                subtitle_path=sub_path,
+                start_time=scene.start_time,
+                duration=scene.duration,
+                output_path=vid_path,
+                resolution=(1280, 720),  # Lower res for preview
+            )
+        else:
+            # Use Ken Burns effect on static image
+            video_gen.create_scene_preview(
+                image_path=Path(scene.image_path),
+                audio_path=Path(state.audio_path),
+                subtitle_path=sub_path,
+                start_time=scene.start_time,
+                duration=scene.duration,
+                effect=scene.effect,
+                output_path=vid_path,
+                resolution=(1280, 720),  # Lower res for preview
+            )
 
         # Read video bytes
         with open(vid_path, "rb") as f:
@@ -906,7 +935,17 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
     scenes_with_images = sum(1 for s in state.scenes if s.image_path and Path(s.image_path).exists())
     missing_count = total_scenes - scenes_with_images
 
-    col1, col2, col3 = st.columns(3)
+    # Animation stats
+    scenes_marked_for_animation = sum(1 for s in state.scenes if getattr(s, 'animated', False))
+    scenes_with_animation = sum(
+        1 for s in state.scenes
+        if getattr(s, 'animated', False)
+        and getattr(s, 'video_path', None)
+        and Path(s.video_path).exists()
+    )
+    pending_animations = scenes_marked_for_animation - scenes_with_animation
+
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Total Scenes", total_scenes)
     with col2:
@@ -915,6 +954,14 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
         else:
             st.metric("Images Ready", scenes_with_images)
     with col3:
+        if scenes_marked_for_animation > 0:
+            if pending_animations > 0:
+                st.metric("Animated", f"{scenes_with_animation}/{scenes_marked_for_animation}", delta=f"{pending_animations} pending")
+            else:
+                st.metric("Animated", f"{scenes_with_animation}/{scenes_marked_for_animation}", delta="✓ Ready")
+        else:
+            st.metric("Animated", "0")
+    with col4:
         st.metric("Duration", f"{state.audio_duration:.1f}s")
 
     if missing_count > 0:
@@ -929,6 +976,44 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
     render_storyboard_grid(state)
 
     st.markdown("---")
+
+    # Animation controls (if any scenes are marked for animation)
+    if scenes_marked_for_animation > 0:
+        st.subheader("🎬 Lip Sync Animation")
+        if not check_lip_sync_available():
+            st.warning("Lip sync animation requires `gradio_client`. Install with: `pip install gradio_client`")
+        else:
+            st.info(
+                f"**{scenes_marked_for_animation} scene(s)** marked for animation using Wan2.2-S2V. "
+                "This cloud-based service is FREE and works on all platforms."
+            )
+            anim_col1, anim_col2, anim_col3 = st.columns([2, 1, 1])
+            with anim_col1:
+                resolution = st.selectbox(
+                    "Animation Resolution",
+                    options=["480P", "720P"],
+                    index=0,
+                    help="Higher resolution takes longer to generate",
+                    key="animation_resolution",
+                )
+            with anim_col2:
+                if pending_animations > 0:
+                    if st.button("🎬 Generate Animations", type="primary"):
+                        generate_animations(state, resolution, is_demo_mode)
+                else:
+                    st.success("All animations ready!")
+            with anim_col3:
+                if scenes_with_animation > 0:
+                    if st.button("🔄 Regenerate All Animations"):
+                        # Clear existing animations
+                        scenes = state.scenes
+                        for s in scenes:
+                            if getattr(s, 'animated', False):
+                                s.video_path = None
+                        update_state(scenes=scenes)
+                        generate_animations(state, resolution, is_demo_mode)
+
+        st.markdown("---")
 
     # Action buttons
     if missing_count > 0:
@@ -1020,20 +1105,45 @@ def render_storyboard_grid(state) -> None:
 def render_scene_card(state, scene: Scene) -> None:
     """Render a single scene card with image and controls. Uses fragment for performance."""
     has_image = scene.image_path and Path(scene.image_path).exists()
+    has_animation = getattr(scene, 'video_path', None) and Path(scene.video_path).exists()
 
     # Scene header with status indicator
-    if has_image:
-        st.markdown(f"**Scene {scene.index + 1}**")
-    else:
-        st.markdown(f"**Scene {scene.index + 1}** :warning:")
+    status_icons = ""
+    if not has_image:
+        status_icons = " :warning:"
+    elif getattr(scene, 'animated', False):
+        if has_animation:
+            status_icons = " :movie_camera:"  # Has animation
+        else:
+            status_icons = " :hourglass:"  # Pending animation
 
+    st.markdown(f"**Scene {scene.index + 1}**{status_icons}")
     st.caption(f"{scene.start_time:.1f}s - {scene.end_time:.1f}s ({scene.duration:.1f}s)")
 
-    # Image
-    if has_image:
+    # Image or animation preview
+    if has_animation:
+        st.video(str(scene.video_path))
+    elif has_image:
         st.image(str(scene.image_path), use_container_width=True)
     else:
         st.error("Missing image - click Regenerate")
+
+    # Animation toggle (only show if image exists)
+    if has_image:
+        animate_checked = st.checkbox(
+            "Animate character (lip-sync)",
+            value=getattr(scene, 'animated', False),
+            key=f"animate_{scene.index}",
+            help="Enable to animate this scene with full-body lip-sync singing using Wan2.2-S2V"
+        )
+        if animate_checked != getattr(scene, 'animated', False):
+            scenes = state.scenes
+            scenes[scene.index].animated = animate_checked
+            if not animate_checked:
+                # Clear video path when disabling animation
+                scenes[scene.index].video_path = None
+            update_state(scenes=scenes)
+            st.rerun()
 
     # Scene details in expander - editable prompt and lyrics
     with st.expander("Edit Scene", expanded=False):
@@ -1511,6 +1621,100 @@ def regenerate_missing_images(state) -> None:
             )
         else:
             status.update(label="All missing images generated!", state="complete")
+
+    st.rerun()
+
+
+def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = False) -> None:
+    """Generate lip-sync animations for scenes marked for animation."""
+    if is_demo_mode:
+        st.warning("Animation generation is not available in demo mode. Please upload real audio.")
+        return
+
+    project_dir = getattr(state, 'project_dir', None)
+    if not project_dir:
+        st.error("No project directory found. Please start over.")
+        return
+
+    audio_path = getattr(state, 'audio_path', None)
+    if not audio_path or audio_path == "demo_mode":
+        st.error("No audio file found. Please upload audio first.")
+        return
+
+    animations_dir = Path(project_dir) / "animations"
+    animations_dir.mkdir(parents=True, exist_ok=True)
+
+    scenes = state.scenes
+
+    # Find scenes that need animation
+    pending_scenes = [
+        s for s in scenes
+        if getattr(s, 'animated', False)
+        and s.image_path
+        and Path(s.image_path).exists()
+        and (not getattr(s, 'video_path', None) or not Path(s.video_path).exists())
+    ]
+
+    if not pending_scenes:
+        st.info("No scenes need animation!")
+        return
+
+    with st.status(f"Generating {len(pending_scenes)} lip-sync animations...", expanded=True) as status:
+        st.write("Using Wan2.2-S2V via Hugging Face Spaces (FREE, cloud-based)")
+        st.write(f"Resolution: {resolution}")
+
+        animator = LipSyncAnimator()
+        progress_bar = st.progress(0.0, text="Connecting to Wan2.2-S2V...")
+
+        success_count = 0
+        for idx, scene in enumerate(pending_scenes):
+            progress_bar.progress(
+                idx / len(pending_scenes),
+                text=f"Animating scene {scene.index + 1} ({idx + 1}/{len(pending_scenes)})..."
+            )
+
+            output_path = animations_dir / f"animated_scene_{scene.index:03d}.mp4"
+
+            try:
+                result = animator.animate_scene(
+                    image_path=Path(scene.image_path),
+                    audio_path=Path(audio_path),
+                    start_time=scene.start_time,
+                    duration=scene.duration,
+                    output_path=output_path,
+                    resolution=resolution,
+                    progress_callback=lambda msg, prog: st.write(f"  {msg}"),
+                )
+
+                if result and result.exists():
+                    # Update scene with video path
+                    scenes[scene.index].video_path = result
+                    success_count += 1
+                    st.write(f"✅ Scene {scene.index + 1} animated successfully")
+                else:
+                    st.write(f"❌ Scene {scene.index + 1} animation failed")
+
+            except Exception as e:
+                st.write(f"❌ Scene {scene.index + 1} error: {e}")
+
+        progress_bar.progress(1.0, text="Done!")
+        update_state(scenes=scenes)
+
+        if success_count == len(pending_scenes):
+            status.update(
+                label=f"All {success_count} animations generated!",
+                state="complete"
+            )
+        elif success_count > 0:
+            status.update(
+                label=f"{success_count}/{len(pending_scenes)} animations generated",
+                state="error"
+            )
+        else:
+            status.update(
+                label="Animation generation failed",
+                state="error"
+            )
 
     st.rerun()
 

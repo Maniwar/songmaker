@@ -13,6 +13,7 @@ from src.ui.components.wizard import render_wizard_progress
 from src.ui.page_modules._concept import render_concept_page
 from src.ui.page_modules._lyrics import render_lyrics_page
 from src.ui.page_modules._upload import render_upload_page
+from src.ui.page_modules._visual import render_visual_page
 from src.ui.page_modules._generate import render_generate_page
 from src.ui.page_modules._complete import render_complete_page
 
@@ -59,6 +60,8 @@ def main():
         render_lyrics_page()
     elif state.current_step == WorkflowStep.UPLOAD:
         render_upload_page()
+    elif state.current_step == WorkflowStep.VISUAL:
+        render_visual_page()
     elif state.current_step == WorkflowStep.GENERATE:
         render_generate_page()
     elif state.current_step == WorkflowStep.COMPLETE:
