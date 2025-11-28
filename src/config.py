@@ -74,8 +74,16 @@ class Config:
     google_api_key: str = field(
         default_factory=lambda: os.getenv("GOOGLE_API_KEY", "")
     )
+    assemblyai_api_key: str = field(
+        default_factory=lambda: os.getenv("ASSEMBLYAI_API_KEY", "")
+    )
     hf_token: Optional[str] = field(
         default_factory=lambda: os.getenv("HF_TOKEN")
+    )
+
+    # Transcription backend: "whisperx" or "assemblyai"
+    transcription_backend: str = field(
+        default_factory=lambda: os.getenv("TRANSCRIPTION_BACKEND", "whisperx")
     )
 
     # Sub-configurations

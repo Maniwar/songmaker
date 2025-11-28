@@ -6,7 +6,7 @@ from pathlib import Path
 import streamlit as st
 
 from src.config import config
-from src.services.audio_processor import AudioProcessor
+from src.services.audio_processor import AudioProcessor, get_available_backends
 from src.ui.components.state import get_state, update_state, advance_step, go_to_step
 from src.models.schemas import WorkflowStep
 
@@ -105,9 +105,21 @@ def render_upload_page() -> None:
         # Audio player
         st.audio(uploaded_file)
 
+        # Transcription backend selector
+        available_backends = get_available_backends()
+        backend_options = {label: value for value, label in available_backends}
+
+        selected_label = st.selectbox(
+            "Transcription Engine",
+            options=list(backend_options.keys()),
+            index=0,
+            help="Choose the transcription backend. WhisperX runs locally, AssemblyAI uses cloud API (requires API key).",
+        )
+        selected_backend = backend_options[selected_label]
+
         # Process audio button
         if st.button("Process Audio", type="primary"):
-            processor = AudioProcessor()
+            processor = AudioProcessor(backend=selected_backend)
 
             # Progress display
             progress_bar = st.progress(0.0)

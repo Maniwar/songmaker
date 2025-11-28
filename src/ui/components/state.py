@@ -1,6 +1,8 @@
 """Session state management for Streamlit."""
 
 import json
+import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -12,6 +14,84 @@ from src.models.schemas import AppState, WorkflowStep
 
 # Default projects directory
 PROJECTS_DIR = Path("projects")
+
+
+def _sanitize_path_component(name: str) -> str:
+    """Sanitize a single path component (directory or file name)."""
+    # Replace spaces with underscores
+    sanitized = name.replace(" ", "_")
+    # Remove problematic characters: / \ : * ? " < > |
+    sanitized = re.sub(r'[/\\:*?"<>|]', '_', sanitized)
+    # Remove consecutive underscores
+    sanitized = re.sub(r'_+', '_', sanitized)
+    return sanitized
+
+
+def fix_malformed_project_path(state: AppState) -> bool:
+    """
+    Fix malformed project paths that contain special characters.
+
+    Some older projects may have been created with slashes or other
+    special characters in the project name, creating nested directories.
+    This function detects and fixes such paths.
+
+    Args:
+        state: The app state to check and fix
+
+    Returns:
+        True if path was fixed, False if no fix needed
+    """
+    if not state.project_dir:
+        return False
+
+    project_path = Path(state.project_dir)
+
+    # Check if the path exists as-is
+    if project_path.exists():
+        return False
+
+    # The path doesn't exist - could be malformed or just missing
+    # Try to find if it was split into nested directories
+    # e.g., "output/epic_power_metal_/_d_..." should be "output/epic_power_metal_d_..."
+
+    parent = project_path.parent
+    if not parent.exists():
+        return False
+
+    # Look for directories that might match the expected pattern
+    project_name = project_path.name
+    sanitized_name = _sanitize_path_component(project_name)
+
+    # Check if a sanitized version exists
+    sanitized_path = parent / sanitized_name
+    if sanitized_path.exists():
+        state.project_dir = str(sanitized_path)
+        return True
+
+    # Check for nested directory structure caused by slashes in name
+    # e.g., looking for "output/epic_power_metal_/_d_timestamp" where
+    # "epic_power_metal_" and "_d_timestamp" are separate directories
+    for subdir in parent.iterdir():
+        if subdir.is_dir():
+            # Look for nested directories that together match the pattern
+            for nested in subdir.iterdir():
+                if nested.is_dir():
+                    # Reconstruct what the combined name would be
+                    combined = f"{subdir.name}{nested.name}"
+                    if combined.startswith(sanitized_name[:10]):
+                        # Found a match - rename it
+                        new_path = parent / _sanitize_path_component(combined)
+                        try:
+                            shutil.move(str(nested), str(new_path))
+                            # Try to remove the now-empty parent
+                            if not list(subdir.iterdir()):
+                                subdir.rmdir()
+                            state.project_dir = str(new_path)
+                            return True
+                        except Exception:
+                            pass
+
+    return False
 
 
 def init_session_state() -> None:
@@ -133,6 +213,11 @@ def load_state(filepath: Path) -> bool:
 
         # Create new AppState from loaded data
         loaded_state = AppState.model_validate(state_dict)
+
+        # Fix any malformed project paths from older projects
+        if fix_malformed_project_path(loaded_state):
+            st.info("Project path was fixed automatically.")
+
         st.session_state.app_state = loaded_state
         return True
     except Exception as e:

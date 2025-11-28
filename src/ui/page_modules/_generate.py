@@ -17,6 +17,23 @@ from src.ui.components.state import get_state, update_state, advance_step, go_to
 from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word
 
 
+def _sanitize_filename(name: str, max_length: int = 20) -> str:
+    """
+    Sanitize a string for use in file/directory names.
+
+    Removes or replaces characters that are problematic in file paths.
+    """
+    import re
+    # Replace spaces with underscores
+    sanitized = name.replace(" ", "_")
+    # Remove or replace problematic characters: / \ : * ? " < > |
+    sanitized = re.sub(r'[/\\:*?"<>|]', '_', sanitized)
+    # Remove any other non-alphanumeric characters except underscore and hyphen
+    sanitized = re.sub(r'[^\w\-]', '', sanitized)
+    # Convert to lowercase and truncate
+    return sanitized.lower()[:max_length]
+
+
 def _update_scene_lyrics(scene: Scene, new_lyrics: str) -> None:
     """
     Update a scene's lyrics, creating Word objects with proper timing.
@@ -1241,7 +1258,7 @@ def generate_scene_prompts(state, scenes_per_minute: int, style_override: str, r
     # Create unique output directory for this project
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     project_name = (
-        state.lyrics.title.replace(" ", "_").lower()[:20]
+        _sanitize_filename(state.lyrics.title)
         if state.lyrics
         else "untitled"
     )
@@ -1530,12 +1547,25 @@ def regenerate_all_images(state) -> None:
 
 def generate_video_from_storyboard(state, crossfade: float, is_demo_mode: bool) -> None:
     """Generate the final video from the approved storyboard."""
+    from src.ui.components.state import fix_malformed_project_path
+
     project_dir = getattr(state, 'project_dir', None)
     if not project_dir:
         st.error("No project directory found. Please start over.")
         return
 
     project_dir = Path(project_dir)
+
+    # Check if project directory exists, try to fix if not
+    if not project_dir.exists():
+        # Try to fix malformed path
+        if fix_malformed_project_path(state):
+            project_dir = Path(state.project_dir)
+            update_state(project_dir=str(project_dir))
+            st.info("Project directory path was fixed.")
+        else:
+            st.error(f"Project directory not found: {project_dir}. Please start over.")
+            return
     scenes = state.scenes
     resolution = getattr(state, 'video_resolution', '1080p')
     res_info = RESOLUTION_OPTIONS.get(resolution, RESOLUTION_OPTIONS["1080p"])
@@ -1549,7 +1579,7 @@ def generate_video_from_storyboard(state, crossfade: float, is_demo_mode: bool) 
         return
 
     project_name = (
-        state.lyrics.title.replace(" ", "_").lower()[:20]
+        _sanitize_filename(state.lyrics.title)
         if state.lyrics
         else "untitled"
     )
