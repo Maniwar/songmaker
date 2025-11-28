@@ -9,6 +9,7 @@ from pydub import AudioSegment
 
 from src.config import config
 from src.agents.visual_agent import VisualAgent
+from src.services.audio_processor import AudioProcessor
 from src.services.image_generator import ImageGenerator
 from src.services.video_generator import VideoGenerator
 from src.services.subtitle_generator import SubtitleGenerator
@@ -18,31 +19,274 @@ from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word
 
 def _update_scene_lyrics(scene: Scene, new_lyrics: str) -> None:
     """
-    Update a scene's lyrics, creating Word objects if needed.
-    Distributes timing evenly across words for the scene duration.
+    Update a scene's lyrics, creating Word objects with proper timing.
+
+    Always creates properly distributed Word objects for all words.
+    This ensures each word has its own timing slot for karaoke display.
     """
     new_words_text = new_lyrics.split()
     if not new_words_text:
+        scene.words = []
         return
 
-    if scene.words:
-        # Update existing words
-        for i, word_obj in enumerate(scene.words):
-            if i < len(new_words_text):
-                word_obj.word = new_words_text[i]
-        # If user added more words, append to last word
-        if len(new_words_text) > len(scene.words):
-            extra = " ".join(new_words_text[len(scene.words):])
-            scene.words[-1].word += " " + extra
-    else:
-        # Create new Word objects with evenly distributed timing
-        scene_duration = scene.end_time - scene.start_time
-        word_duration = scene_duration / len(new_words_text)
-        scene.words = []
-        for i, word_text in enumerate(new_words_text):
-            start = scene.start_time + (i * word_duration)
-            end = start + word_duration - 0.05  # Small gap between words
-            scene.words.append(Word(word=word_text, start=start, end=end))
+    scene_duration = scene.end_time - scene.start_time
+
+    # Calculate timing for new words
+    # Leave small buffer at start and end for readability
+    buffer = min(0.1, scene_duration * 0.05)
+    usable_duration = scene_duration - (buffer * 2)
+    word_duration = usable_duration / len(new_words_text)
+
+    # Ensure minimum word duration for readability
+    min_word_duration = 0.15
+    if word_duration < min_word_duration:
+        word_duration = min_word_duration
+        # Adjust buffer if we need more time
+        total_word_time = word_duration * len(new_words_text)
+        if total_word_time > scene_duration:
+            # Too many words - just distribute evenly
+            word_duration = scene_duration / len(new_words_text)
+            buffer = 0
+
+    # Create new Word objects with proper timing for each word
+    new_word_objects = []
+    for i, word_text in enumerate(new_words_text):
+        start = scene.start_time + buffer + (i * word_duration)
+        # Leave small gap between words (5% of word duration)
+        gap = word_duration * 0.05
+        end = start + word_duration - gap
+        # Ensure end doesn't exceed scene end
+        end = min(end, scene.end_time - 0.01)
+        new_word_objects.append(Word(word=word_text, start=start, end=end))
+
+    scene.words = new_word_objects
+
+
+def _resync_single_scene_lyrics(state, scene_index: int) -> None:
+    """
+    Re-sync lyrics for a single scene from the original transcript.
+
+    Args:
+        state: App state with transcript and scenes
+        scene_index: Index of the scene to re-sync
+    """
+    if not state.transcript or not state.scenes:
+        return
+
+    if scene_index >= len(state.scenes):
+        return
+
+    all_words = state.transcript.all_words
+    scene = state.scenes[scene_index]
+
+    # Find all words that fall within this scene's time range
+    scene_words = [
+        Word(word=w.word, start=w.start, end=w.end)
+        for w in all_words
+        if w.start >= scene.start_time and w.end <= scene.end_time
+    ]
+
+    # Also include words that overlap significantly with the scene
+    for w in all_words:
+        # Word starts before scene but ends within it
+        if w.start < scene.start_time and w.end > scene.start_time:
+            overlap = min(w.end, scene.end_time) - scene.start_time
+            word_duration = w.end - w.start
+            if overlap > word_duration * 0.5:  # >50% overlap
+                if not any(sw.word == w.word and abs(sw.start - w.start) < 0.1 for sw in scene_words):
+                    scene_words.insert(0, Word(word=w.word, start=max(w.start, scene.start_time), end=w.end))
+
+        # Word starts within scene but ends after it
+        if w.start >= scene.start_time and w.start < scene.end_time and w.end > scene.end_time:
+            overlap = scene.end_time - w.start
+            word_duration = w.end - w.start
+            if overlap > word_duration * 0.5:  # >50% overlap
+                if not any(sw.word == w.word and abs(sw.start - w.start) < 0.1 for sw in scene_words):
+                    scene_words.append(Word(word=w.word, start=w.start, end=min(w.end, scene.end_time)))
+
+    # Sort by start time
+    scene_words.sort(key=lambda w: w.start)
+    state.scenes[scene_index].words = scene_words
+    update_state(scenes=state.scenes)
+
+    # Clear cached lyrics text area values so they refresh with new words
+    lyrics_keys_to_clear = [
+        f"lyrics_{scene_index}",           # prompt review
+        f"card_lyrics_{scene_index}",      # storyboard card
+    ]
+    for key in lyrics_keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+def _resync_lyrics_to_scenes(state) -> None:
+    """
+    Re-sync lyrics from the original transcript to scene boundaries.
+
+    This reassigns words from the transcript to scenes based on their
+    timing, which is useful after scene boundaries have been adjusted
+    or if the initial assignment was incorrect.
+    """
+    if not state.transcript or not state.scenes:
+        return
+
+    # Re-sync each scene individually
+    for i in range(len(state.scenes)):
+        _resync_single_scene_lyrics(state, i)
+
+
+def _redo_transcription(state) -> bool:
+    """
+    Re-run WhisperX transcription on the audio file.
+
+    Returns:
+        True if transcription succeeded, False otherwise
+    """
+    if not state.audio_path or state.audio_path == "demo_mode":
+        st.error("Cannot redo transcription in demo mode. Please upload a real audio file.")
+        return False
+
+    audio_path = Path(state.audio_path)
+    if not audio_path.exists():
+        st.error(f"Audio file not found: {audio_path}")
+        return False
+
+    processor = AudioProcessor()
+
+    progress_bar = st.progress(0.0)
+    status_text = st.empty()
+
+    def progress_callback(message: str, progress: float):
+        status_text.text(message)
+        progress_bar.progress(progress)
+
+    try:
+        transcript = processor.transcribe(
+            audio_path,
+            progress_callback=progress_callback,
+        )
+
+        # Update state with new transcript
+        update_state(
+            transcript=transcript,
+            audio_duration=transcript.duration,
+        )
+
+        # Re-sync lyrics to scenes if scenes exist
+        if state.scenes:
+            # Get fresh state after update
+            new_state = get_state()
+            _resync_lyrics_to_scenes(new_state)
+
+        return True
+
+    except Exception as e:
+        st.error(f"Transcription failed: {e}")
+        return False
+
+    finally:
+        processor.cleanup()
+
+
+def _redo_scene_transcription(state, scene_index: int) -> bool:
+    """
+    Re-run WhisperX transcription on just a single scene's audio clip.
+
+    This extracts the audio for the scene's time range, transcribes it,
+    and updates the scene's words with properly offset timestamps.
+
+    Args:
+        state: App state with audio path and scenes
+        scene_index: Index of the scene to re-transcribe
+
+    Returns:
+        True if transcription succeeded, False otherwise
+    """
+    import tempfile
+
+    if not state.audio_path or state.audio_path == "demo_mode":
+        st.error("Cannot redo transcription in demo mode.")
+        return False
+
+    if not state.scenes or scene_index >= len(state.scenes):
+        st.error("Invalid scene index.")
+        return False
+
+    audio_path = Path(state.audio_path)
+    if not audio_path.exists():
+        st.error(f"Audio file not found: {audio_path}")
+        return False
+
+    scene = state.scenes[scene_index]
+
+    # Extract the audio clip for this scene
+    try:
+        audio = AudioSegment.from_file(str(audio_path))
+        start_ms = int(scene.start_time * 1000)
+        end_ms = int(scene.end_time * 1000)
+        clip = audio[start_ms:end_ms]
+
+        # Save to temp file for transcription
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            clip.export(tmp.name, format="wav")
+            tmp_path = Path(tmp.name)
+
+        processor = AudioProcessor()
+
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+
+        def progress_callback(message: str, progress: float):
+            status_text.text(message)
+            progress_bar.progress(progress)
+
+        try:
+            # Transcribe the clip
+            transcript = processor.transcribe(
+                tmp_path,
+                progress_callback=progress_callback,
+            )
+
+            # Offset all word timestamps by the scene's start time
+            scene_words = []
+            for word in transcript.all_words:
+                scene_words.append(
+                    Word(
+                        word=word.word,
+                        start=word.start + scene.start_time,
+                        end=word.end + scene.start_time,
+                    )
+                )
+
+            # Update the scene's words
+            state.scenes[scene_index].words = scene_words
+            update_state(scenes=state.scenes)
+
+            # Clear cached lyrics text area values so they refresh with new words
+            # These keys match the text_area keys in render_prompt_review and render_scene_card
+            lyrics_keys_to_clear = [
+                f"lyrics_{scene_index}",           # prompt review
+                f"card_lyrics_{scene_index}",      # storyboard card
+            ]
+            for key in lyrics_keys_to_clear:
+                if key in st.session_state:
+                    del st.session_state[key]
+
+            return True
+
+        except Exception as e:
+            st.error(f"Scene transcription failed: {e}")
+            return False
+
+        finally:
+            processor.cleanup()
+            # Clean up temp file
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+    except Exception as e:
+        st.error(f"Failed to extract audio clip: {e}")
+        return False
 
 
 @st.cache_data(show_spinner=False)
@@ -498,22 +742,43 @@ def render_prompt_review(state, is_demo_mode: bool) -> None:
                 if state.audio_path and state.audio_path != "demo_mode":
                     # Show word-level timing if words exist
                     if scene.words:
-                        word_timing = " | ".join(
-                            f"{w.word} ({w.start:.1f}s)" for w in scene.words[:5]
-                        )
-                        if len(scene.words) > 5:
-                            word_timing += f" ... +{len(scene.words) - 5} more"
-                        st.caption(f"Word timing: {word_timing}")
+                        with st.expander(f"Word timing ({len(scene.words)} words)", expanded=False):
+                            # Show all words in a formatted table-like view
+                            timing_lines = []
+                            for w in scene.words:
+                                timing_lines.append(f"**{w.word}** ({w.start:.2f}s - {w.end:.2f}s)")
+                            st.markdown(" | ".join(timing_lines))
+
+                    # Per-scene transcription controls
+                    trans_col1, trans_col2 = st.columns(2)
+                    with trans_col1:
+                        if st.button("Redo Transcription", key=f"preview_redo_trans_{i}", type="secondary", help="Re-transcribe just this scene's audio clip"):
+                            with st.spinner("Transcribing scene audio..."):
+                                if _redo_scene_transcription(state, i):
+                                    st.success("Scene transcribed!")
+                                    st.rerun()
+                    with trans_col2:
+                        if st.button("Re-sync Lyrics", key=f"preview_resync_{i}", type="secondary", help="Re-sync from existing transcript"):
+                            _resync_single_scene_lyrics(state, i)
+                            st.success("Lyrics re-synced!")
+                            st.rerun()
 
                     # Slider to pick start point within scene
                     scene_duration = scene.end_time - scene.start_time
+
+                    # Default to where first word starts (relative to scene start)
+                    default_offset = 0.0
+                    if scene.words:
+                        first_word_offset = scene.words[0].start - scene.start_time
+                        default_offset = max(0.0, min(first_word_offset, scene_duration - 0.5))
+
                     preview_cols = st.columns([2, 3])
                     with preview_cols[0]:
                         preview_start_offset = st.slider(
                             "Start from",
                             min_value=0.0,
                             max_value=max(0.1, scene_duration - 0.5),
-                            value=0.0,
+                            value=default_offset,
                             step=0.1,
                             key=f"preview_start_{i}",
                         )
@@ -556,10 +821,23 @@ def render_prompt_review(state, is_demo_mode: bool) -> None:
         st.markdown("---")
 
     # Action buttons
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
-        if st.button("Regenerate All Prompts", type="secondary"):
+        if st.button("Redo Transcription", type="secondary", help="Re-run WhisperX to get new word timestamps"):
+            with st.spinner("Re-transcribing audio..."):
+                if _redo_transcription(state):
+                    st.success("Transcription updated! Lyrics re-synced.")
+                    st.rerun()
+
+    with col2:
+        if st.button("Re-sync Lyrics", type="secondary", help="Re-assign lyrics from transcript to scene boundaries"):
+            _resync_lyrics_to_scenes(state)
+            st.success("Lyrics re-synced from transcript!")
+            st.rerun()
+
+    with col3:
+        if st.button("Regenerate Prompts", type="secondary"):
             # Reset and regenerate
             update_state(
                 scenes=[],
@@ -567,14 +845,14 @@ def render_prompt_review(state, is_demo_mode: bool) -> None:
             )
             st.rerun()
 
-    with col2:
+    with col4:
         if st.button("Save Changes", type="secondary"):
             # Save any modified prompts/effects
             update_state(scenes=modified_scenes)
             st.success("Changes saved!")
             st.rerun()
 
-    with col3:
+    with col5:
         if st.button("Generate Images", type="primary"):
             # Save modifications first
             update_state(scenes=modified_scenes)
@@ -623,7 +901,7 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
 
     # Action buttons
     if missing_count > 0:
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         with col1:
             if st.button("Generate Missing", type="primary"):
                 regenerate_missing_images(state)
@@ -631,23 +909,45 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
             if st.button("Regenerate All", type="secondary"):
                 regenerate_all_images(state)
         with col3:
+            if st.button("Redo Transcription", type="secondary", help="Re-run WhisperX"):
+                with st.spinner("Re-transcribing audio..."):
+                    if _redo_transcription(state):
+                        st.success("Transcription updated!")
+                        st.rerun()
+        with col4:
+            if st.button("Re-sync Lyrics", type="secondary", help="Re-assign lyrics from transcript"):
+                _resync_lyrics_to_scenes(state)
+                st.success("Lyrics re-synced!")
+                st.rerun()
+        with col5:
             if st.button("Edit Prompts", type="secondary"):
                 update_state(storyboard_ready=False)
                 st.rerun()
-        with col4:
+        with col6:
             if st.button("Create Video Anyway"):
                 crossfade = st.session_state.get("crossfade", 0.3)
                 generate_video_from_storyboard(state, crossfade, is_demo_mode)
     else:
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         with col1:
-            if st.button("Regenerate All Images", type="secondary"):
+            if st.button("Regenerate All", type="secondary"):
                 regenerate_all_images(state)
         with col2:
+            if st.button("Redo Transcription", type="secondary", help="Re-run WhisperX"):
+                with st.spinner("Re-transcribing audio..."):
+                    if _redo_transcription(state):
+                        st.success("Transcription updated!")
+                        st.rerun()
+        with col3:
+            if st.button("Re-sync Lyrics", type="secondary", help="Re-assign lyrics from transcript"):
+                _resync_lyrics_to_scenes(state)
+                st.success("Lyrics re-synced!")
+                st.rerun()
+        with col4:
             if st.button("Edit Prompts", type="secondary"):
                 update_state(storyboard_ready=False)
                 st.rerun()
-        with col3:
+        with col5:
             if st.button("Start Over", type="secondary"):
                 update_state(
                     scenes=[],
@@ -657,7 +957,7 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                     project_dir=None,
                 )
                 st.rerun()
-        with col4:
+        with col6:
             if st.button("Create Video", type="primary"):
                 crossfade = st.session_state.get("crossfade", 0.3)
                 generate_video_from_storyboard(state, crossfade, is_demo_mode)
@@ -747,20 +1047,27 @@ def render_scene_card(state, scene: Scene) -> None:
 
             # Show word-level timing if words exist
             if scene.words:
-                word_timing = " | ".join(
-                    f"{w.word} ({w.start:.1f}s)" for w in scene.words[:6]
-                )
-                if len(scene.words) > 6:
-                    word_timing += f" ... +{len(scene.words) - 6} more"
-                st.caption(f"Word timing: {word_timing}")
+                st.markdown(f"**Word timing ({len(scene.words)} words):**")
+                # Show all words in a formatted view
+                timing_lines = []
+                for w in scene.words:
+                    timing_lines.append(f"{w.word} ({w.start:.2f}s - {w.end:.2f}s)")
+                st.caption(" | ".join(timing_lines))
 
             # Slider to pick start point within scene
             scene_duration = scene.end_time - scene.start_time
+
+            # Default to where first word starts (relative to scene start)
+            default_offset = 0.0
+            if scene.words:
+                first_word_offset = scene.words[0].start - scene.start_time
+                default_offset = max(0.0, min(first_word_offset, scene_duration - 0.5))
+
             preview_start_offset = st.slider(
                 "Start from (seconds into scene)",
                 min_value=0.0,
                 max_value=max(0.1, scene_duration - 0.5),
-                value=0.0,
+                value=default_offset,
                 step=0.1,
                 key=f"audio_start_{scene.index}",
                 help="Adjust to start playback from a specific point"
@@ -804,6 +1111,21 @@ def render_scene_card(state, scene: Scene) -> None:
 
         # Editable lyrics - fix transcription errors OR add missing lyrics
         current_lyrics = " ".join(w.word for w in scene.words) if scene.words else ""
+
+        # Transcription buttons for this scene
+        trans_col1, trans_col2 = st.columns(2)
+        with trans_col1:
+            if st.button("Redo Transcription", key=f"redo_trans_{scene.index}", type="secondary", help="Re-transcribe just this scene's audio"):
+                with st.spinner("Transcribing scene audio..."):
+                    if _redo_scene_transcription(state, scene.index):
+                        st.success("Scene transcribed!")
+                        st.rerun()
+        with trans_col2:
+            if st.button("Re-sync Lyrics", key=f"resync_{scene.index}", type="secondary", help="Re-sync from existing transcript"):
+                _resync_single_scene_lyrics(state, scene.index)
+                st.success("Lyrics re-synced!")
+                st.rerun()
+
         new_lyrics = st.text_area(
             "Lyrics" + (" (none detected - add them here)" if not scene.words else ""),
             value=current_lyrics,

@@ -1,5 +1,6 @@
 """Video generation service using FFmpeg with Ken Burns effects."""
 
+import platform
 import subprocess
 import tempfile
 from pathlib import Path
@@ -9,11 +10,91 @@ from src.config import Config, config as default_config
 from src.models.schemas import Scene, KenBurnsEffect
 
 
+def _escape_ffmpeg_path(path: Path) -> str:
+    r"""
+    Escape a path for use in FFmpeg filter arguments.
+
+    FFmpeg filter syntax requires escaping of special characters:
+    - Backslashes must be escaped as \\
+    - Colons must be escaped as \:
+    - Single quotes must be escaped as \'
+    """
+    path_str = str(path)
+    # Escape backslashes first
+    path_str = path_str.replace("\\", "\\\\")
+    # Escape colons
+    path_str = path_str.replace(":", "\\:")
+    # Escape single quotes
+    path_str = path_str.replace("'", "\\'")
+    return path_str
+
+
 class VideoGenerator:
     """Generate videos with Ken Burns effects using FFmpeg."""
 
     def __init__(self, config: Optional[Config] = None):
         self.config = config or default_config
+        self._hw_encoder = self._detect_hw_encoder()
+
+    def _detect_hw_encoder(self) -> Optional[str]:
+        """Detect available hardware encoder."""
+        system = platform.system()
+
+        # macOS - VideoToolbox
+        if system == "Darwin":
+            try:
+                result = subprocess.run(
+                    ["ffmpeg", "-encoders"],
+                    capture_output=True,
+                    text=True,
+                )
+                if "h264_videotoolbox" in result.stdout:
+                    return "h264_videotoolbox"
+            except Exception:
+                pass
+
+        # Linux/Windows - NVIDIA NVENC
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-encoders"],
+                capture_output=True,
+                text=True,
+            )
+            if "h264_nvenc" in result.stdout:
+                return "h264_nvenc"
+        except Exception:
+            pass
+
+        return None
+
+    def _get_encoder_args(self, quality: str = "medium") -> list[str]:
+        """
+        Get encoder arguments based on available hardware and desired quality.
+
+        Args:
+            quality: "fast" for intermediate files, "medium" for final output
+        """
+        if self._hw_encoder == "h264_videotoolbox":
+            # macOS VideoToolbox - much faster than software encoding
+            if quality == "fast":
+                return ["-c:v", "h264_videotoolbox", "-q:v", "65"]
+            else:
+                return ["-c:v", "h264_videotoolbox", "-q:v", "50"]
+
+        elif self._hw_encoder == "h264_nvenc":
+            # NVIDIA NVENC
+            if quality == "fast":
+                return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "28"]
+            else:
+                return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "23"]
+
+        else:
+            # Software encoding with libx264
+            if quality == "fast":
+                # Use ultrafast for intermediate files
+                return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23"]
+            else:
+                return ["-c:v", "libx264", "-preset", "medium", "-crf", "23"]
 
     def _get_ken_burns_filter(
         self,
@@ -92,6 +173,9 @@ class VideoGenerator:
 
         filter_str = self._get_ken_burns_filter(effect, duration, res_str, fps)
 
+        # Use fast encoding for intermediate scene clips
+        encoder_args = self._get_encoder_args(quality="fast")
+
         cmd = [
             "ffmpeg",
             "-y",
@@ -105,14 +189,9 @@ class VideoGenerator:
             str(duration),
             "-pix_fmt",
             "yuv420p",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "23",
-            str(output_path),
         ]
+        cmd.extend(encoder_args)
+        cmd.append(str(output_path))
 
         subprocess.run(cmd, check=True, capture_output=True)
         return output_path
@@ -231,6 +310,9 @@ class VideoGenerator:
         # Combine all filters
         filter_complex = ";".join(filter_parts)
 
+        # Use fast encoding for intermediate concatenation
+        encoder_args = self._get_encoder_args(quality="fast")
+
         cmd = [
             "ffmpeg",
             "-y",
@@ -242,15 +324,10 @@ class VideoGenerator:
                 filter_complex,
                 "-map",
                 "[outv]",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "23",
-                str(output_path),
             ]
         )
+        cmd.extend(encoder_args)
+        cmd.append(str(output_path))
 
         try:
             subprocess.run(cmd, check=True, capture_output=True)
@@ -303,6 +380,10 @@ class VideoGenerator:
             # Use tpad filter to extend the last frame instead of looping
             # This prevents the jarring "reset" effect when the video restarts
             pad_duration = audio_duration - video_duration
+
+            # Use fast encoding for this intermediate step
+            encoder_args = self._get_encoder_args(quality="fast")
+
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -312,12 +393,9 @@ class VideoGenerator:
                 str(audio_path),
                 "-vf",
                 f"tpad=stop_mode=clone:stop_duration={pad_duration}",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "23",
+            ]
+            cmd.extend(encoder_args)
+            cmd.extend([
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -329,7 +407,7 @@ class VideoGenerator:
                 "-map",
                 "1:a",
                 str(output_path),
-            ]
+            ])
         else:
             # Normal merge - video is long enough
             cmd = [
@@ -378,23 +456,26 @@ class VideoGenerator:
         """
         if burn_in:
             # Burn subtitles into video using ASS filter
+            # Use medium quality since this is often the final output
+            encoder_args = self._get_encoder_args(quality="medium")
+
+            # Escape the subtitle path for FFmpeg filter syntax
+            escaped_path = _escape_ffmpeg_path(subtitle_path)
+
             cmd = [
                 "ffmpeg",
                 "-y",
                 "-i",
                 str(video_path),
                 "-vf",
-                f"ass='{subtitle_path}'",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "23",
+                f"ass={escaped_path}",
+            ]
+            cmd.extend(encoder_args)
+            cmd.extend([
                 "-c:a",
                 "copy",
                 str(output_path),
-            ]
+            ])
         else:
             # Add as subtitle track
             cmd = [

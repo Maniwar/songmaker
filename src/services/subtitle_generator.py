@@ -74,48 +74,62 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # Group words into lines
         lines = self._group_words_into_lines(words, max_words_per_line)
 
+        # Configuration for better readability
+        lead_time = 0.3  # Show line before first word starts
+        min_line_duration = 0.8  # Minimum time a line should be visible
+        line_gap = 0.05  # Gap between consecutive lines
+
         events = []
         for i, line_words in enumerate(lines):
             if not line_words:
                 continue
 
-            line_start = line_words[0].start
+            first_word_start = line_words[0].start
             last_word_end = line_words[-1].end
 
-            # Calculate end time - MUST NOT overlap with next line
-            # This prevents "stuck" lyrics where previous line persists
-            desired_end = last_word_end + 0.3  # Small buffer after last word
+            # Line appears BEFORE first word starts (lead time)
+            line_start = max(0, first_word_start - lead_time)
 
-            # Find when next line starts (if any)
-            next_line_start = None
+            # Calculate end time with buffer after last word
+            desired_end = last_word_end + 0.3
+
+            # Find when next line's first word starts (if any)
+            next_line_first_word = None
             if i < len(lines) - 1:
                 next_line = lines[i + 1]
                 if next_line:
-                    next_line_start = next_line[0].start
+                    next_line_first_word = next_line[0].start
 
-            if next_line_start is not None:
-                # Strictly end before next line starts (no overlap!)
-                # End 0.05s before next line to ensure clean transition
-                max_end = next_line_start - 0.05
+            if next_line_first_word is not None:
+                # End before next line needs to appear (accounting for its lead time)
+                max_end = next_line_first_word - lead_time - line_gap
                 line_end = min(desired_end, max_end)
                 # But ensure we at least show until the last word ends
-                line_end = max(line_end, last_word_end)
+                line_end = max(line_end, last_word_end + 0.05)
             else:
                 # Last line gets full buffer
                 line_end = desired_end
 
-            # Ensure minimum duration for readability (but still respect no-overlap)
-            min_duration = 0.3
-            if line_end - line_start < min_duration:
-                line_end = line_start + min_duration
+            # Ensure minimum duration for readability
+            if line_end - line_start < min_line_duration:
+                line_end = line_start + min_line_duration
                 # Re-check overlap constraint
-                if next_line_start is not None and line_end >= next_line_start:
-                    line_end = next_line_start - 0.02
+                if next_line_first_word is not None:
+                    max_allowed = next_line_first_word - lead_time - line_gap
+                    if line_end > max_allowed:
+                        line_end = max_allowed
 
             # Build karaoke text with \kf (karaoke fill) tags
             # \kf<duration> fills the word over the duration (in centiseconds)
             text_parts = []
-            prev_end = line_start
+
+            # Add lead time as unhighlighted pause at start
+            # This gives viewers time to see the line before singing starts
+            lead_cs = int((first_word_start - line_start) * 100)
+            if lead_cs > 0:
+                text_parts.append(f"{{\\k{lead_cs}}}")
+
+            prev_end = first_word_start
 
             for j, word in enumerate(line_words):
                 # Calculate delay before this word starts (in centiseconds)
