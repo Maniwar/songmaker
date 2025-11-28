@@ -664,6 +664,19 @@ def render_storyboard_setup(state, is_demo_mode: bool) -> None:
                 key="use_sequential_mode",
             )
 
+        # Parallel workers (only when not in sequential mode)
+        if not st.session_state.get("use_sequential_mode", False):
+            parallel_workers = st.slider(
+                "Parallel image workers",
+                min_value=1,
+                max_value=8,
+                value=4,
+                help="Number of images to generate simultaneously. Higher = faster but uses more API quota.",
+                key="parallel_workers",
+            )
+        else:
+            st.caption("Parallel processing disabled in sequential mode")
+
     # Generate storyboard button
     if st.button("Generate Scene Prompts", type="primary"):
         # Get cinematography style
@@ -685,6 +698,7 @@ def render_storyboard_setup(state, is_demo_mode: bool) -> None:
         update_state(
             show_lyrics=st.session_state.get("show_lyrics", True),
             use_sequential_mode=st.session_state.get("use_sequential_mode", False),
+            parallel_workers=st.session_state.get("parallel_workers", 4),
             video_fps=FPS_OPTIONS.get(fps_key, 30),
             cinematography_style=style_name,
         )
@@ -1309,9 +1323,15 @@ def generate_images_from_prompts(state, is_demo_mode: bool) -> None:
     resolution = getattr(state, 'video_resolution', '1080p')
     res_info = RESOLUTION_OPTIONS.get(resolution, RESOLUTION_OPTIONS["1080p"])
     sequential_mode = getattr(state, 'use_sequential_mode', False)
+    parallel_workers = getattr(state, 'parallel_workers', 4) if not sequential_mode else 1
 
     with st.status("Generating scene images...", expanded=True) as status:
-        mode_str = " with sequential consistency" if sequential_mode else ""
+        if sequential_mode:
+            mode_str = " with sequential consistency"
+        elif parallel_workers > 1:
+            mode_str = f" in parallel ({parallel_workers} workers)"
+        else:
+            mode_str = ""
         st.write(f"Generating {len(scenes)} images at {resolution} resolution{mode_str}...")
         image_gen = ImageGenerator()
 
@@ -1332,7 +1352,7 @@ def generate_images_from_prompts(state, is_demo_mode: bool) -> None:
         def image_progress(msg: str, prog: float):
             progress_bar.progress(prog, text=msg)
 
-        # Pass resolution, sequential mode, and visual_world to image generator
+        # Pass resolution, sequential mode, parallel workers and visual_world to image generator
         image_paths = image_gen.generate_storyboard(
             scene_prompts=prompts,
             style_prefix=style_prefix,
@@ -1342,6 +1362,7 @@ def generate_images_from_prompts(state, is_demo_mode: bool) -> None:
             image_size=res_info["image_size"],
             sequential_mode=sequential_mode,
             visual_world=visual_world,
+            max_workers=parallel_workers,
         )
 
         # Ensure we have the same number of paths as scenes

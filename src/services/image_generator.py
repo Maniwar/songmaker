@@ -1,6 +1,7 @@
 """Image generation service using Google Imagen."""
 
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 from typing import Callable, Optional
@@ -237,6 +238,7 @@ class ImageGenerator:
         image_size: Optional[str] = None,
         sequential_mode: bool = False,
         visual_world: Optional[str] = None,
+        max_workers: int = 4,
     ) -> list[Path]:
         """
         Generate a series of images for a storyboard.
@@ -251,6 +253,7 @@ class ImageGenerator:
             image_size: Image size for Gemini models
             sequential_mode: If True, use previous image as reference for consistency
             visual_world: Visual world/setting for consistency across all scenes
+            max_workers: Maximum number of parallel image generations (ignored if sequential_mode=True)
 
         Returns:
             List of paths to generated images (always same length as scene_prompts)
@@ -262,39 +265,91 @@ class ImageGenerator:
 
         total_scenes = len(scene_prompts)
 
-        # First pass: try to generate all images
-        for i, prompt in enumerate(scene_prompts):
-            if progress_callback:
-                mode_str = " (sequential)" if sequential_mode else ""
-                progress_callback(
-                    f"Generating scene {i + 1}/{total_scenes}{mode_str}...",
-                    (i / total_scenes) * 0.8,
+        if sequential_mode or max_workers <= 1:
+            # Sequential mode: generate one at a time, using previous image as reference
+            for i, prompt in enumerate(scene_prompts):
+                if progress_callback:
+                    mode_str = " (sequential)" if sequential_mode else ""
+                    progress_callback(
+                        f"Generating scene {i + 1}/{total_scenes}{mode_str}...",
+                        (i / total_scenes) * 0.8,
+                    )
+
+                output_path = output_dir / f"scene_{i:03d}.png"
+
+                # Get reference image from previous scene if in sequential mode
+                reference_image = None
+                if sequential_mode and i > 0 and generated_images[i - 1] is not None:
+                    reference_image = generated_images[i - 1]
+
+                image = self.generate_scene_image(
+                    prompt=prompt,
+                    style_prefix=style_prefix,
+                    character_description=character_description,
+                    visual_world=visual_world,
+                    reference_image=reference_image,
+                    output_path=output_path,
+                    image_size=image_size,
                 )
 
-            output_path = output_dir / f"scene_{i:03d}.png"
+                if image and output_path.exists():
+                    generated_paths[i] = output_path
+                    generated_images[i] = image
+                else:
+                    failed_indices.append(i)
+        else:
+            # Parallel mode: generate multiple images concurrently
+            if progress_callback:
+                progress_callback(
+                    f"Generating {total_scenes} images in parallel ({max_workers} workers)...",
+                    0.05,
+                )
 
-            # Get reference image from previous scene if in sequential mode
-            reference_image = None
-            if sequential_mode and i > 0 and generated_images[i - 1] is not None:
-                reference_image = generated_images[i - 1]
+            def generate_single_image(index: int, prompt: str) -> tuple[int, Optional[Image.Image], Optional[Path]]:
+                """Generate a single image and return (index, image, path)."""
+                output_path = output_dir / f"scene_{index:03d}.png"
 
-            image = self.generate_scene_image(
-                prompt=prompt,
-                style_prefix=style_prefix,
-                character_description=character_description,
-                visual_world=visual_world,
-                reference_image=reference_image,
-                output_path=output_path,
-                image_size=image_size,
-            )
+                image = self.generate_scene_image(
+                    prompt=prompt,
+                    style_prefix=style_prefix,
+                    character_description=character_description,
+                    visual_world=visual_world,
+                    reference_image=None,  # No reference in parallel mode
+                    output_path=output_path,
+                    image_size=image_size,
+                )
 
-            if image and output_path.exists():
-                generated_paths[i] = output_path
-                generated_images[i] = image  # Store for sequential mode
-            else:
-                failed_indices.append(i)
+                if image and output_path.exists():
+                    return (index, image, output_path)
+                return (index, None, None)
 
-        # Retry failed images
+            # Submit all tasks to thread pool
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(generate_single_image, i, prompt): i
+                    for i, prompt in enumerate(scene_prompts)
+                }
+
+                # Collect results as they complete and update progress from main thread
+                completed_count = 0
+                for future in as_completed(futures):
+                    idx, image, path = future.result()
+                    completed_count += 1
+
+                    # Update progress from main thread (safe for Streamlit)
+                    if progress_callback:
+                        progress_callback(
+                            f"Generated {completed_count}/{total_scenes} images...",
+                            (completed_count / total_scenes) * 0.8,
+                        )
+
+                    if path:
+                        generated_paths[idx] = path
+                        generated_images[idx] = image
+                    else:
+                        failed_indices.append(idx)
+
+        # Retry failed images (always sequential for retries)
         for retry in range(max_retries):
             if not failed_indices:
                 break
