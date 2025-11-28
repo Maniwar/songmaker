@@ -1,5 +1,6 @@
 """Visual Style Agent for collaborative visual style and scene prompt development."""
 
+import logging
 from typing import Optional
 
 import anthropic
@@ -14,38 +15,44 @@ from src.models.schemas import (
     KenBurnsEffect,
 )
 
+logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a visual creative director for music videos. You're working with a user to develop the visual style for their song's music video.
 
-Context you have:
-- Song concept: genre, mood, themes
-- Complete lyrics
-- Transcript showing word-level timing
+def _build_system_prompt(num_scenes: int, scene_info: str) -> str:
+    """Build system prompt with scene count context."""
+    return f"""You are a visual creative director for music videos. You're working with a user to develop the visual style for their song's music video.
 
-Your goal is to collaboratively develop:
-1. A consistent VISUAL WORLD - the unified setting/universe for all scenes
+## CRITICAL: Scene Count
+This song requires EXACTLY {num_scenes} scenes. You MUST create prompts for all {num_scenes} scenes.
+
+{scene_info}
+
+## Your Goal
+Collaboratively develop:
+1. A consistent VISUAL WORLD - the unified setting/universe for all {num_scenes} scenes
 2. CHARACTER DESCRIPTION - how the main character(s) should look
 3. CINEMATOGRAPHY STYLE - lighting, camera work, color palette
-4. SCENE-BY-SCENE PROMPTS - specific visuals for each scene segment
+4. SCENE-BY-SCENE PROMPTS - specific visuals for EACH of the {num_scenes} scenes
 
 ## Conversation Flow
 
 Start by:
-1. Analyzing the lyrics and themes
-2. Proposing 2-3 distinct visual world options (e.g., "cyberpunk city", "pastoral countryside", "abstract dreamscape")
-3. Asking which direction resonates with the user
+1. Acknowledging you'll be creating {num_scenes} scenes for this song
+2. Analyzing the lyrics and themes
+3. Proposing 2-3 distinct visual world options (e.g., "cyberpunk city", "pastoral countryside", "abstract dreamscape")
+4. Asking which direction resonates with the user
 
 Then:
 1. Develop character descriptions based on their choice
 2. Discuss cinematography and color palette
-3. Create scene-by-scene visual prompts
+3. Create scene-by-scene visual prompts for ALL {num_scenes} scenes
 
 ## Important Guidelines
 
 - Keep responses conversational but efficient
 - After 3-4 exchanges, proactively offer to finalize the visual plan
 - Each scene prompt should:
-  - Match the specific lyrics/words being sung
+  - Match the specific lyrics/words being sung in that time segment
   - Maintain visual world consistency
   - Include mood and suggested camera movement
   - Be detailed enough for AI image generation
@@ -66,10 +73,11 @@ When the user says they're ready, or after sufficient discussion, provide a COMP
 **COLOR PALETTE**
 [Specific colors and tones]
 
-**SCENE PROMPTS**
-Scene 1 (0:00-0:08): "[Detailed visual prompt for scene 1]"
-Scene 2 (0:08-0:16): "[Detailed visual prompt for scene 2]"
+**SCENE PROMPTS** (MUST include all {num_scenes} scenes!)
+Scene 1 (0:00-X:XX): "[Detailed visual prompt for scene 1]"
+Scene 2 (X:XX-Y:YY): "[Detailed visual prompt for scene 2]"
 ...
+Scene {num_scenes} (Z:ZZ-end): "[Detailed visual prompt for scene {num_scenes}]"
 
 Always end by asking if they want to refine anything or proceed to generate images."""
 
@@ -99,15 +107,123 @@ class VisualStyleAgent:
         self._client = None
         self.conversation_history: list[dict] = []
 
+        # Pre-calculate scene info
+        self._num_scenes = 4  # Default
+        self._scene_segments: list[dict] = []
+        self._scene_info_text = ""
+        if transcript and transcript.segments:
+            self._calculate_scene_info()
+
+    def _calculate_scene_info(self) -> None:
+        """Calculate scene boundaries and store for use throughout conversation."""
+        if not self.transcript:
+            return
+
+        total_duration = self.transcript.duration
+        self._num_scenes = max(4, int(total_duration / 15))  # ~4 scenes per minute
+        scene_duration = total_duration / self._num_scenes
+
+        self._scene_segments = []
+        scene_lines = []
+
+        for i in range(self._num_scenes):
+            start_time = i * scene_duration
+            end_time = (i + 1) * scene_duration
+
+            # Get words in this time range
+            words = [
+                w for w in self.transcript.all_words
+                if w.start >= start_time and w.end <= end_time
+            ]
+            lyrics_segment = " ".join(w.word for w in words) if words else ""
+
+            self._scene_segments.append({
+                "index": i,
+                "start_time": round(start_time, 2),
+                "end_time": round(end_time, 2),
+                "lyrics_segment": lyrics_segment,
+            })
+
+            # Format for display
+            scene_lines.append(
+                f"Scene {i+1} ({start_time:.1f}s - {end_time:.1f}s): \"{lyrics_segment[:60]}{'...' if len(lyrics_segment) > 60 else ''}\""
+            )
+
+        self._scene_info_text = f"""## Scene Breakdown ({self._num_scenes} scenes total)
+Song duration: {total_duration:.1f} seconds
+Each scene: ~{scene_duration:.1f} seconds
+
+""" + "\n".join(scene_lines)
+
+    @property
+    def num_scenes(self) -> int:
+        """Return the number of scenes required for this song."""
+        return self._num_scenes
+
+    @property
+    def scene_segments(self) -> list[dict]:
+        """Return the pre-calculated scene segments."""
+        return self._scene_segments
+
     def _get_client(self) -> anthropic.Anthropic:
         """Lazy load Anthropic client."""
         if self._client is None:
             self._client = anthropic.Anthropic(api_key=self.config.anthropic_api_key)
         return self._client
 
+    def set_num_scenes(self, num_scenes: int) -> None:
+        """
+        Update the number of scenes (e.g., from user slider).
+        Recalculates scene segments accordingly.
+        """
+        if not self.transcript:
+            self._num_scenes = num_scenes
+            return
+
+        total_duration = self.transcript.duration
+        self._num_scenes = num_scenes
+        scene_duration = total_duration / num_scenes
+
+        self._scene_segments = []
+        scene_lines = []
+
+        for i in range(num_scenes):
+            start_time = i * scene_duration
+            end_time = (i + 1) * scene_duration
+
+            words = [
+                w for w in self.transcript.all_words
+                if w.start >= start_time and w.end <= end_time
+            ]
+            lyrics_segment = " ".join(w.word for w in words) if words else ""
+
+            self._scene_segments.append({
+                "index": i,
+                "start_time": round(start_time, 2),
+                "end_time": round(end_time, 2),
+                "lyrics_segment": lyrics_segment,
+            })
+
+            scene_lines.append(
+                f"Scene {i+1} ({start_time:.1f}s - {end_time:.1f}s): \"{lyrics_segment[:60]}{'...' if len(lyrics_segment) > 60 else ''}\""
+            )
+
+        self._scene_info_text = f"""## Scene Breakdown ({self._num_scenes} scenes total)
+Song duration: {total_duration:.1f} seconds
+Each scene: ~{scene_duration:.1f} seconds
+
+""" + "\n".join(scene_lines)
+
+    def _get_system_prompt(self) -> str:
+        """Get the system prompt with current scene info."""
+        return _build_system_prompt(self._num_scenes, self._scene_info_text)
+
     def _build_context(self) -> str:
         """Build context string from concept, lyrics, and transcript."""
         context_parts = []
+
+        # Always include scene count prominently
+        context_parts.append(f"## IMPORTANT: This song requires {self._num_scenes} scenes\n")
 
         if self.concept:
             context_parts.append(f"""## Song Concept
@@ -128,32 +244,9 @@ Title: {self.lyrics.title}
 {self.lyrics.lyrics}
 """)
 
-        if self.transcript and self.transcript.segments:
-            # Calculate scene boundaries for context
-            total_duration = self.transcript.duration
-            num_scenes = max(4, int(total_duration / 15))  # Roughly 4 scenes per minute
-            scene_duration = total_duration / num_scenes
-
-            segments_text = []
-            for i in range(num_scenes):
-                start_time = i * scene_duration
-                end_time = (i + 1) * scene_duration
-
-                # Get words in this time range
-                words = [
-                    w for w in self.transcript.all_words
-                    if w.start >= start_time and w.end <= end_time
-                ]
-                if words:
-                    lyrics_segment = " ".join(w.word for w in words)
-                    segments_text.append(
-                        f"Scene {i+1} ({start_time:.1f}s - {end_time:.1f}s): \"{lyrics_segment}\""
-                    )
-
-            if segments_text:
-                context_parts.append(f"""## Scene Segments
-{chr(10).join(segments_text)}
-""")
+        # Include pre-calculated scene info
+        if self._scene_info_text:
+            context_parts.append(self._scene_info_text)
 
         return "\n".join(context_parts)
 
@@ -183,11 +276,11 @@ User's message: {user_message}"""
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": full_user_message})
 
-        # Send to Claude
+        # Send to Claude with dynamic system prompt
         response = client.messages.create(
             model="claude-sonnet-4-5-20250929",
             max_tokens=2048,
-            system=SYSTEM_PROMPT,
+            system=self._get_system_prompt(),
             messages=self.conversation_history,
         )
 
@@ -283,35 +376,17 @@ User's message: {user_message}"""
 
         client = self._get_client()
 
-        # Build scene info for extraction
-        scene_info = ""
-        if self.transcript and self.transcript.segments:
-            total_duration = self.transcript.duration
-            num_scenes = max(4, int(total_duration / 15))
-            scene_duration = total_duration / num_scenes
-
-            scene_segments = []
-            for i in range(num_scenes):
-                start_time = i * scene_duration
-                end_time = (i + 1) * scene_duration
-                words = [
-                    w for w in self.transcript.all_words
-                    if w.start >= start_time and w.end <= end_time
-                ]
-                lyrics_segment = " ".join(w.word for w in words) if words else ""
-                scene_segments.append({
-                    "index": i,
-                    "start_time": round(start_time, 2),
-                    "end_time": round(end_time, 2),
-                    "lyrics_segment": lyrics_segment,
-                })
-
-            scene_info = f"\nScene timing for {num_scenes} scenes:\n" + json.dumps(scene_segments, indent=2)
+        # Use pre-calculated scene segments
+        scene_info = json.dumps(self._scene_segments, indent=2) if self._scene_segments else "[]"
 
         extraction_prompt = f"""Based on our entire conversation, extract the finalized visual plan as JSON.
+
+CRITICAL: You MUST create EXACTLY {self._num_scenes} scene prompts. No more, no less.
+
+Here are the EXACT scene timings you must use:
 {scene_info}
 
-Return ONLY valid JSON with these REQUIRED fields:
+Return ONLY valid JSON (no markdown, no explanation) with this EXACT structure:
 {{
   "visual_world": "description of the consistent visual universe",
   "character_description": "detailed character appearance description",
@@ -320,43 +395,50 @@ Return ONLY valid JSON with these REQUIRED fields:
   "scene_prompts": [
     {{
       "index": 0,
-      "start_time": 0.0,
-      "end_time": 8.0,
-      "lyrics_segment": "the lyrics for this scene",
-      "visual_prompt": "detailed visual prompt for AI image generation",
+      "start_time": <use exact value from scene timing above>,
+      "end_time": <use exact value from scene timing above>,
+      "lyrics_segment": "<use exact lyrics from scene timing above>",
+      "visual_prompt": "detailed visual prompt for AI image generation - be specific!",
       "mood": "emotional tone of the scene",
-      "effect": "zoom_in"  // one of: zoom_in, zoom_out, pan_left, pan_right, pan_up, pan_down
-    }},
-    // ... more scenes
+      "effect": "zoom_in"
+    }}
   ]
 }}
 
-IMPORTANT:
-- visual_world, character_description, and cinematography_style are REQUIRED
-- Include ALL scene prompts discussed
-- Each scene_prompt should have detailed visual_prompt text
-- effect should be one of: zoom_in, zoom_out, pan_left, pan_right, pan_up, pan_down"""
+REQUIREMENTS:
+1. visual_world, character_description, and cinematography_style are REQUIRED - use what we discussed
+2. scene_prompts array MUST have EXACTLY {self._num_scenes} entries (one for each scene above)
+3. Each scene_prompt MUST use the EXACT start_time, end_time, and lyrics_segment from the scene timings
+4. Each visual_prompt should be detailed enough for AI image generation (at least 2-3 sentences)
+5. effect must be one of: zoom_in, zoom_out, pan_left, pan_right, pan_up, pan_down
+6. Return ONLY the JSON object - no markdown code blocks, no explanation text"""
 
         messages = self.conversation_history.copy()
         messages.append({"role": "user", "content": extraction_prompt})
 
+        logger.info(f"Extracting visual plan for {self._num_scenes} scenes...")
+
         response = client.messages.create(
             model="claude-sonnet-4-5-20250929",
-            max_tokens=4096,
+            max_tokens=8192,  # Increased for larger scene counts
             system="You are a JSON extraction assistant. Return only valid JSON, no markdown formatting, no explanation text.",
             messages=messages,
         )
 
         response_text = response.content[0].text.strip()
+        logger.debug(f"Extraction response (first 500 chars): {response_text[:500]}")
 
         def try_parse_plan(data: dict) -> Optional[VisualPlan]:
             """Try to create VisualPlan with fallbacks for missing fields."""
             # Ensure required fields have values
             if "visual_world" not in data or not data["visual_world"]:
+                logger.warning("Missing visual_world, using default")
                 data["visual_world"] = "Cinematic visual style"
             if "character_description" not in data or not data["character_description"]:
+                logger.warning("Missing character_description, using default")
                 data["character_description"] = "Main character"
             if "cinematography_style" not in data or not data["cinematography_style"]:
+                logger.warning("Missing cinematography_style, using default")
                 data["cinematography_style"] = "Cinematic film style"
 
             # Parse scene prompts
@@ -386,8 +468,10 @@ IMPORTANT:
                         user_notes=sp_data.get("user_notes"),
                     ))
                 except Exception as e:
-                    print(f"Error parsing scene prompt: {e}")
+                    logger.error(f"Error parsing scene prompt {sp_data}: {e}")
                     continue
+
+            logger.info(f"Parsed {len(scene_prompts)} scene prompts (expected {self._num_scenes})")
 
             try:
                 return VisualPlan(
@@ -398,41 +482,49 @@ IMPORTANT:
                     scene_prompts=scene_prompts,
                 )
             except Exception as e:
-                print(f"VisualPlan validation error: {e}")
+                logger.error(f"VisualPlan validation error: {e}")
                 return None
 
         # Try to extract JSON from various formats
         try:
             # First, try direct parse
             plan_data = json.loads(response_text)
+            logger.info("Successfully parsed JSON directly")
             result = try_parse_plan(plan_data)
             if result:
+                logger.info("Visual plan extraction successful")
                 return result
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            logger.debug(f"Direct JSON parse failed: {e}")
 
         # Try to find JSON in markdown code block
         json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
         if json_match:
             try:
                 plan_data = json.loads(json_match.group(1))
+                logger.info("Successfully parsed JSON from markdown code block")
                 result = try_parse_plan(plan_data)
                 if result:
+                    logger.info("Visual plan extraction successful")
                     return result
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                logger.debug(f"Markdown JSON parse failed: {e}")
 
         # Try to find JSON object in text
         json_match = re.search(r'\{[\s\S]*\}', response_text)
         if json_match:
             try:
                 plan_data = json.loads(json_match.group(0))
+                logger.info("Successfully parsed JSON from text extraction")
                 result = try_parse_plan(plan_data)
                 if result:
+                    logger.info("Visual plan extraction successful")
                     return result
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                logger.debug(f"Text extraction JSON parse failed: {e}")
 
+        # All parsing attempts failed
+        logger.error(f"Failed to extract visual plan. Response text: {response_text[:1000]}")
         return None
 
     def reset(self) -> None:

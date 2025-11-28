@@ -40,22 +40,51 @@ class AudioProcessor:
         self._model = None
         self._align_model = None
         self._align_metadata = None
+        self._current_asr_options = None  # Track current model options
 
-    def _load_whisperx_models(self) -> None:
-        """Lazy load WhisperX models."""
-        if self._model is not None:
-            return
+    def _load_whisperx_models(
+        self,
+        initial_prompt: Optional[str] = None,
+        language: Optional[str] = None,
+    ) -> None:
+        """Lazy load WhisperX models.
 
+        Args:
+            initial_prompt: Optional prompt to improve transcription (e.g., known lyrics)
+            language: Optional language code to use for transcription
+        """
         import whisperx
 
         whisper_config = self.config.whisper
 
-        # Load transcription model
-        self._model = whisperx.load_model(
-            whisper_config.model,
-            whisper_config.device,
-            compute_type=whisper_config.compute_type,
-        )
+        # Build asr_options
+        asr_options = {}
+        if initial_prompt:
+            asr_options["initial_prompt"] = initial_prompt
+
+        # Check if we need to reload the model (different options)
+        if self._model is not None:
+            if asr_options == self._current_asr_options:
+                return  # Model already loaded with same options
+            else:
+                # Need to reload with new options
+                self._model = None
+
+        # Load transcription model with asr_options
+        load_kwargs = {
+            "whisper_arch": whisper_config.model,
+            "device": whisper_config.device,
+            "compute_type": whisper_config.compute_type,
+        }
+
+        if asr_options:
+            load_kwargs["asr_options"] = asr_options
+
+        if language:
+            load_kwargs["language"] = language
+
+        self._model = whisperx.load_model(**load_kwargs)
+        self._current_asr_options = asr_options
 
     def _load_align_model(self, language_code: str) -> None:
         """Load alignment model for the specified language."""
@@ -79,6 +108,8 @@ class AudioProcessor:
         audio_path: Path,
         progress_callback: Optional[Callable[[str, float], None]] = None,
         backend: Optional[TranscriptionBackend] = None,
+        lyrics_hint: Optional[str] = None,
+        language: Optional[str] = None,
     ) -> Transcript:
         """
         Transcribe audio file with word-level timestamps.
@@ -87,6 +118,10 @@ class AudioProcessor:
             audio_path: Path to the audio file (MP3, WAV, etc.)
             progress_callback: Optional callback for progress updates (message, progress 0-1)
             backend: Override the default backend for this transcription
+            lyrics_hint: Optional known lyrics to improve transcription accuracy.
+                         For music, this dramatically improves recognition.
+            language: Optional language code (e.g., 'en' for English).
+                      If not provided, will be auto-detected.
 
         Returns:
             Transcript with word-level timestamps
@@ -96,20 +131,44 @@ class AudioProcessor:
         if use_backend == "assemblyai":
             return self._transcribe_assemblyai(audio_path, progress_callback)
         else:
-            return self._transcribe_whisperx(audio_path, progress_callback)
+            return self._transcribe_whisperx(
+                audio_path, progress_callback, lyrics_hint, language
+            )
 
     def _transcribe_whisperx(
         self,
         audio_path: Path,
         progress_callback: Optional[Callable[[str, float], None]] = None,
+        lyrics_hint: Optional[str] = None,
+        language: Optional[str] = None,
     ) -> Transcript:
-        """Transcribe using WhisperX (local processing)."""
+        """Transcribe using WhisperX (local processing).
+
+        Args:
+            audio_path: Path to audio file
+            progress_callback: Optional progress callback
+            lyrics_hint: Known lyrics to improve transcription accuracy.
+                        Passed to WhisperX via asr_options when loading the model.
+            language: Language code (e.g., 'en'). If None, auto-detected.
+        """
+        import re
         import whisperx
 
         if progress_callback:
-            progress_callback("Loading WhisperX models...", 0.1)
+            if lyrics_hint:
+                progress_callback("Loading WhisperX with lyrics hint...", 0.1)
+            else:
+                progress_callback("Loading WhisperX models...", 0.1)
 
-        self._load_whisperx_models()
+        # Clean up lyrics for use as initial prompt
+        clean_lyrics = None
+        if lyrics_hint:
+            # Remove section markers like [Verse], [Chorus], etc.
+            clean_lyrics = re.sub(r'\[.*?\]', '', lyrics_hint)
+            clean_lyrics = ' '.join(clean_lyrics.split())  # Normalize whitespace
+
+        # Load model with lyrics hint (passed via asr_options)
+        self._load_whisperx_models(initial_prompt=clean_lyrics, language=language)
 
         if progress_callback:
             progress_callback("Loading audio file...", 0.2)
@@ -119,21 +178,26 @@ class AudioProcessor:
         duration = self.get_audio_duration(audio_path)
 
         if progress_callback:
-            progress_callback("Transcribing audio...", 0.3)
+            if lyrics_hint:
+                progress_callback("Transcribing audio with lyrics hint...", 0.3)
+            else:
+                progress_callback("Transcribing audio...", 0.3)
+
+        # Build transcribe options (language passed at model load time)
+        transcribe_options = {
+            "batch_size": self.config.whisper.batch_size,
+        }
 
         # Transcribe
-        result = self._model.transcribe(
-            audio,
-            batch_size=self.config.whisper.batch_size,
-        )
+        result = self._model.transcribe(audio, **transcribe_options)
 
-        language = result.get("language", "en")
+        detected_language = language or result.get("language", "en")
 
         if progress_callback:
             progress_callback("Loading alignment model...", 0.5)
 
         # Load alignment model
-        self._load_align_model(language)
+        self._load_align_model(detected_language)
 
         if progress_callback:
             progress_callback("Aligning words to audio...", 0.7)
@@ -181,7 +245,7 @@ class AudioProcessor:
 
         return Transcript(
             segments=segments,
-            language=language,
+            language=detected_language,
             duration=duration,
         )
 
@@ -221,6 +285,8 @@ def transcribe_audio(
     config: Optional[Config] = None,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     backend: Optional[TranscriptionBackend] = None,
+    lyrics_hint: Optional[str] = None,
+    language: Optional[str] = None,
 ) -> Transcript:
     """
     Convenience function to transcribe audio.
@@ -230,13 +296,21 @@ def transcribe_audio(
         config: Optional configuration
         progress_callback: Optional callback for progress updates
         backend: Transcription backend to use (whisperx or assemblyai)
+        lyrics_hint: Known lyrics to improve transcription accuracy.
+                    Dramatically helps with music where vocals are mixed with instruments.
+        language: Language code (e.g., 'en'). If None, auto-detected.
 
     Returns:
         Transcript with word-level timestamps
     """
     processor = AudioProcessor(config, backend=backend)
     try:
-        return processor.transcribe(audio_path, progress_callback)
+        return processor.transcribe(
+            audio_path,
+            progress_callback,
+            lyrics_hint=lyrics_hint,
+            language=language,
+        )
     finally:
         processor.cleanup()
 

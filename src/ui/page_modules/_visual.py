@@ -44,6 +44,15 @@ def render_visual_page() -> None:
         """
     )
 
+    # Calculate default scene count based on song duration
+    total_duration = state.transcript.duration
+    default_num_scenes = max(4, int(total_duration / 15))  # ~4 scenes per minute
+    min_scenes = max(4, int(total_duration / 30))  # Minimum ~2 per minute
+    max_scenes = min(30, int(total_duration / 5))  # Maximum ~12 per minute
+
+    # Get visual messages from state or initialize
+    visual_messages = getattr(state, 'visual_messages', [])
+
     # Initialize visual style agent in session state
     if "visual_agent" not in st.session_state:
         st.session_state.visual_agent = VisualStyleAgent(
@@ -51,11 +60,14 @@ def render_visual_page() -> None:
             lyrics=state.lyrics,
             transcript=state.transcript,
         )
+        # Restore conversation history if loading a project with existing messages
+        if visual_messages:
+            st.session_state.visual_agent.conversation_history = [
+                {"role": msg["role"], "content": msg["content"]}
+                for msg in visual_messages
+            ]
 
     agent = st.session_state.visual_agent
-
-    # Get visual messages from state or initialize
-    visual_messages = getattr(state, 'visual_messages', [])
 
     # Show getting started help if no messages yet
     if not visual_messages:
@@ -63,7 +75,8 @@ def render_visual_page() -> None:
             """
             **How to get started:**
 
-            The AI will analyze your lyrics and propose visual style options.
+            First, configure how many scenes you want in your video.
+            Then the AI will analyze your lyrics and propose visual style options.
             You can:
             - Discuss your preferred visual world (cyberpunk, fantasy, realistic, etc.)
             - Describe how you want the main character to look
@@ -73,6 +86,35 @@ def render_visual_page() -> None:
             **Tip:** Look at the sidebar to track what sections are ready!
             """
         )
+
+        # Scene count configuration
+        st.subheader("Scene Configuration")
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            num_scenes = st.slider(
+                "Number of Scenes",
+                min_value=min_scenes,
+                max_value=max_scenes,
+                value=default_num_scenes,
+                help=f"Your song is {total_duration:.0f}s long. More scenes = more variety, fewer scenes = longer each scene."
+            )
+        with col2:
+            scene_duration = total_duration / num_scenes
+            st.metric("Avg Scene Length", f"{scene_duration:.1f}s")
+
+        # Update agent with selected scene count
+        if num_scenes != agent.num_scenes:
+            agent.set_num_scenes(num_scenes)
+
+        # Show preview of scene breakdown
+        with st.expander("Preview Scene Breakdown", expanded=True):
+            for i, seg in enumerate(agent.scene_segments[:8]):  # Show first 8
+                lyrics_preview = seg["lyrics_segment"][:50] + "..." if len(seg["lyrics_segment"]) > 50 else seg["lyrics_segment"]
+                st.caption(f"**Scene {i+1}** ({seg['start_time']:.1f}s - {seg['end_time']:.1f}s): \"{lyrics_preview}\"")
+            if num_scenes > 8:
+                st.caption(f"... and {num_scenes - 8} more scenes")
+
+        st.markdown("---")
 
         # Auto-start the conversation
         if st.button("Start Visual Workshop", type="primary"):
@@ -138,6 +180,7 @@ def render_visual_page() -> None:
                         update_state(
                             visual_plan=visual_plan,
                             visual_approved=True,
+                            prompts_ready=True,  # Scenes from workshop have prompts ready
                             scenes=scenes,
                             concept=state.concept,
                         )
@@ -168,6 +211,7 @@ def render_visual_page() -> None:
                         update_state(
                             visual_plan=visual_plan,
                             visual_approved=True,
+                            prompts_ready=True,  # Scenes from workshop have prompts ready
                             scenes=scenes,
                             concept=state.concept,
                         )

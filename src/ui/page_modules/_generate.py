@@ -757,16 +757,107 @@ def render_prompt_review(state, is_demo_mode: bool) -> None:
 
     # Summary stats
     total_scenes = len(state.scenes)
-    resolution = getattr(state, 'video_resolution', '1080p')
-    res_info = RESOLUTION_OPTIONS.get(resolution, RESOLUTION_OPTIONS["1080p"])
 
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Total Scenes", total_scenes)
     with col2:
-        st.metric("Resolution", resolution)
-    with col3:
         st.metric("Duration", f"{state.audio_duration:.1f}s")
+    with col3:
+        resolution = getattr(state, 'video_resolution', '1080p')
+        st.metric("Resolution", resolution)
+
+    # Video settings expander
+    with st.expander("Video Settings", expanded=True):
+        settings_col1, settings_col2 = st.columns(2)
+
+        with settings_col1:
+            # Resolution selection
+            current_resolution = getattr(state, 'video_resolution', '1080p')
+            resolution_idx = list(RESOLUTION_OPTIONS.keys()).index(current_resolution) if current_resolution in RESOLUTION_OPTIONS else 0
+            new_resolution = st.selectbox(
+                "Video Resolution",
+                options=list(RESOLUTION_OPTIONS.keys()),
+                index=resolution_idx,
+                help="Higher resolution = better quality but slower generation",
+                key="video_resolution_prompt_review",
+            )
+            if new_resolution != current_resolution:
+                update_state(video_resolution=new_resolution)
+
+            # FPS selection
+            current_fps = getattr(state, 'video_fps', 30)
+            fps_idx = list(FPS_OPTIONS.values()).index(current_fps) if current_fps in FPS_OPTIONS.values() else 1
+            fps_selection = st.selectbox(
+                "Frame Rate",
+                options=list(FPS_OPTIONS.keys()),
+                index=fps_idx,
+                help="Higher fps = smoother motion but larger file size",
+                key="video_fps_prompt_review",
+            )
+            new_fps = FPS_OPTIONS[fps_selection]
+            if new_fps != current_fps:
+                update_state(video_fps=new_fps)
+
+        with settings_col2:
+            # Crossfade duration
+            current_crossfade = getattr(state, 'crossfade', 0.3)
+            new_crossfade = st.slider(
+                "Crossfade duration (s)",
+                min_value=0.0,
+                max_value=1.0,
+                value=current_crossfade,
+                step=0.1,
+                key="crossfade_prompt_review",
+            )
+            if new_crossfade != current_crossfade:
+                update_state(crossfade=new_crossfade)
+
+            # Show lyrics toggle
+            current_show_lyrics = getattr(state, 'show_lyrics', True)
+            new_show_lyrics = st.checkbox(
+                "Show lyrics overlay",
+                value=current_show_lyrics,
+                help="Display karaoke-style lyrics on the video",
+                key="show_lyrics_prompt_review",
+            )
+            if new_show_lyrics != current_show_lyrics:
+                update_state(show_lyrics=new_show_lyrics)
+
+        # Image Generation Settings (full width)
+        st.markdown("---")
+        st.markdown("**Image Generation Settings**")
+        gen_col1, gen_col2 = st.columns(2)
+
+        with gen_col1:
+            # Sequential mode (character consistency)
+            current_sequential = getattr(state, 'use_sequential_mode', False)
+            new_sequential = st.checkbox(
+                "Sequential mode (character consistency)",
+                value=current_sequential,
+                help="Use each generated image as reference for the next scene. "
+                     "This helps maintain character and style consistency but is slower.",
+                key="sequential_mode_prompt_review",
+            )
+            if new_sequential != current_sequential:
+                update_state(use_sequential_mode=new_sequential)
+
+        with gen_col2:
+            # Parallel workers (only when not in sequential mode)
+            if not new_sequential:
+                current_workers = getattr(state, 'parallel_workers', 4)
+                new_workers = st.slider(
+                    "Parallel image workers",
+                    min_value=1,
+                    max_value=8,
+                    value=current_workers,
+                    help="Number of images to generate simultaneously. Higher = faster but uses more API quota.",
+                    key="parallel_workers_prompt_review",
+                )
+                if new_workers != current_workers:
+                    update_state(parallel_workers=new_workers)
+            else:
+                st.caption("Parallel processing disabled in sequential mode")
 
     st.markdown("---")
 
@@ -1424,9 +1515,19 @@ def generate_scene_prompts(state, scenes_per_minute: int, style_override: str, r
 def generate_images_from_prompts(state, is_demo_mode: bool) -> None:
     """Generate images from the approved prompts."""
     project_dir = getattr(state, 'project_dir', None)
+
+    # Create project directory if it doesn't exist (e.g., when coming from Visual Workshop)
     if not project_dir:
-        st.error("No project directory found. Please start over.")
-        return
+        config.ensure_directories()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        project_name = (
+            _sanitize_filename(state.lyrics.title)
+            if state.lyrics
+            else "untitled"
+        )
+        project_dir = config.output_dir / f"{project_name}_{timestamp}"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        update_state(project_dir=str(project_dir))
 
     project_dir = Path(project_dir)
     scenes = state.scenes

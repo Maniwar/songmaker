@@ -105,6 +105,41 @@ def render_upload_page() -> None:
         # Audio player
         st.audio(uploaded_file)
 
+        # Lyrics hint section - for improving transcription accuracy
+        st.subheader("🎵 Lyrics (Optional but Recommended)")
+
+        # Check if we already have lyrics from the workflow
+        existing_lyrics = ""
+        if state.lyrics and state.lyrics.lyrics:
+            existing_lyrics = state.lyrics.lyrics
+            st.success("Lyrics detected from previous step - will use them to improve transcription!")
+            with st.expander("View/Edit Lyrics", expanded=False):
+                manual_lyrics = st.text_area(
+                    "Edit lyrics if needed:",
+                    value=existing_lyrics,
+                    height=200,
+                    key="lyrics_hint_edit",
+                    help="These lyrics help WhisperX accurately identify words in your song",
+                )
+        else:
+            st.info(
+                "**Tip:** Paste your song lyrics below to dramatically improve transcription accuracy. "
+                "This is especially helpful for music where vocals are mixed with instruments."
+            )
+            manual_lyrics = st.text_area(
+                "Paste your lyrics here:",
+                value="",
+                height=200,
+                key="lyrics_hint_paste",
+                placeholder="[Verse 1]\nYour lyrics here...\n\n[Chorus]\nChorus lyrics...",
+                help="Copy lyrics from Suno or your original lyrics. Section markers like [Verse] are automatically removed.",
+            )
+
+        # Store the lyrics to use
+        lyrics_for_transcription = manual_lyrics if manual_lyrics else existing_lyrics
+
+        st.markdown("---")
+
         # Transcription backend selector
         available_backends = get_available_backends()
         backend_options = {label: value for value, label in available_backends}
@@ -130,10 +165,16 @@ def render_upload_page() -> None:
                 progress_bar.progress(progress)
 
             try:
+                # Show info about lyrics usage
+                if lyrics_for_transcription:
+                    st.info("Using your lyrics to improve transcription accuracy...")
+
                 with st.spinner("Processing audio..."):
                     transcript = processor.transcribe(
                         temp_path,
                         progress_callback=progress_callback,
+                        lyrics_hint=lyrics_for_transcription if lyrics_for_transcription else None,
+                        language="en",  # Most Suno songs are English
                     )
 
                 # Update state
