@@ -102,11 +102,13 @@ class Wan2S2VAnimator:
                     progress_callback("Generating lip-sync animation...", 0.3)
 
                 # Call the Wan2.2-S2V API
-                # API expects: ref_img, audio, resolution
+                # API expects: ref_img, audio, resolution, style
+                # style="singing" is optimized for music/singing (vs "speech" for talking)
                 result = client.predict(
                     ref_img=handle_file(str(image_path)),
                     audio=handle_file(str(audio_clip_path)),
                     resolution=resolution,
+                    style="singing",  # Use singing mode for better music lip sync
                     api_name="/predict"
                 )
 
