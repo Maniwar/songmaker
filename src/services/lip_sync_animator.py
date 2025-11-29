@@ -56,7 +56,7 @@ class Wan2S2VAnimator:
         start_time: float,
         duration: float,
         output_path: Path,
-        resolution: str = "480P",
+        resolution: str = "720P",
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> Optional[Path]:
         """
@@ -73,6 +73,10 @@ class Wan2S2VAnimator:
 
         Returns:
             Path to the generated video, or None if generation failed
+
+        Note:
+            Wan2.2-S2V is optimized for singing/music content. The API only
+            accepts ref_img, audio, and resolution parameters.
         """
         from gradio_client import handle_file
 
@@ -102,13 +106,12 @@ class Wan2S2VAnimator:
                     progress_callback("Generating lip-sync animation...", 0.3)
 
                 # Call the Wan2.2-S2V API
-                # API expects: ref_img, audio, resolution, style
-                # style="singing" is optimized for music/singing (vs "speech" for talking)
+                # API expects: ref_img, audio, resolution
+                # The model is optimized for singing/music content
                 result = client.predict(
                     ref_img=handle_file(str(image_path)),
                     audio=handle_file(str(audio_clip_path)),
                     resolution=resolution,
-                    style="singing",  # Use singing mode for better music lip sync
                     api_name="/predict"
                 )
 

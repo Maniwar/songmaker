@@ -1057,7 +1057,7 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
 
     # Check if any scene needs re-animation (set from fragment)
     reanimate_scene_idx = st.session_state.get("reanimate_scene_idx", None)
-    reanimate_resolution = st.session_state.get("reanimate_resolution", "480P")
+    reanimate_resolution = st.session_state.get("reanimate_resolution", "720P")
     if reanimate_scene_idx is not None:
         # Clear the flags first
         del st.session_state["reanimate_scene_idx"]
@@ -1085,7 +1085,7 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
             with anim_col1:
                 resolution = st.selectbox(
                     "Animation Resolution",
-                    options=["480P", "720P"],
+                    options=["720P", "480P"],
                     index=0,
                     help="Higher resolution takes longer to generate",
                     key="animation_resolution",
@@ -1222,7 +1222,7 @@ def render_scene_card(state, scene: Scene) -> None:
         with reanimate_col1:
             reanimate_resolution = st.selectbox(
                 "Resolution",
-                options=["480P", "720P"],
+                options=["720P", "480P"],
                 index=0,
                 key=f"reanimate_res_{scene.index}",
                 label_visibility="collapsed",
@@ -1745,7 +1745,7 @@ def regenerate_missing_images(state) -> None:
     st.rerun()
 
 
-def generate_single_animation(state, scene_index: int, resolution: str = "480P") -> None:
+def generate_single_animation(state, scene_index: int, resolution: str = "720P") -> None:
     """Re-animate a single scene."""
     project_dir = getattr(state, 'project_dir', None)
     if not project_dir:
@@ -1769,6 +1769,14 @@ def generate_single_animation(state, scene_index: int, resolution: str = "480P")
 
     animations_dir = Path(project_dir) / "animations"
     animations_dir.mkdir(parents=True, exist_ok=True)
+
+    # Delete existing animation file if it exists (for re-animation)
+    output_path = animations_dir / f"animated_scene_{scene_index:03d}.mp4"
+    if output_path.exists():
+        output_path.unlink()
+        # Also clear the video_path in state so we don't think it's already done
+        scenes[scene_index].video_path = None
+        update_state(scenes=scenes)
 
     with st.status(f"Re-animating scene {scene_index + 1} at {resolution}...", expanded=True) as status:
         st.write("Connecting to Wan2.2-S2V...")
