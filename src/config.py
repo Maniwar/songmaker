@@ -77,8 +77,16 @@ class Config:
     assemblyai_api_key: str = field(
         default_factory=lambda: os.getenv("ASSEMBLYAI_API_KEY", "")
     )
+    fal_api_key: str = field(
+        default_factory=lambda: os.getenv("FAL_KEY", "")
+    )
     hf_token: Optional[str] = field(
         default_factory=lambda: os.getenv("HF_TOKEN")
+    )
+
+    # Lip sync backend: "wan2s2v" (free, slow) or "kling" (paid, fast)
+    lip_sync_backend: str = field(
+        default_factory=lambda: os.getenv("LIP_SYNC_BACKEND", "wan2s2v")
     )
 
     # Transcription backend: "whisperx" or "assemblyai"

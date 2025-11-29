@@ -1,14 +1,24 @@
-"""Lip sync animation service using Wan2.2-S2V via Hugging Face Spaces."""
+"""Lip sync animation service with multiple backend support.
+
+Backends:
+- wan2s2v: Free Wan2.2-S2V via Hugging Face Spaces (slow, ~10 min/scene)
+- kling: Paid Kling AI via fal.ai (fast, ~1-2 min/scene, ~$0.10/5s)
+"""
 
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 from pydub import AudioSegment
 
+from src.config import Config, config as default_config
 
-class LipSyncAnimator:
+# Type for lip sync backend
+LipSyncBackend = Literal["wan2s2v", "kling"]
+
+
+class Wan2S2VAnimator:
     """Generate lip-synced singing animations from images using Wan2.2-S2V.
 
     This service uses the free Wan2.2-S2V model hosted on Hugging Face Spaces
@@ -19,6 +29,10 @@ class LipSyncAnimator:
     - Supports singing (not just speaking)
     - Works with custom images
     - Free and cross-platform (cloud-based)
+
+    Limitations:
+    - Slow (~10 minutes per scene)
+    - Queue times on busy days
     """
 
     # Hugging Face Space URL for Wan2.2-S2V
@@ -198,10 +212,69 @@ class LipSyncAnimator:
         return results
 
 
-def check_lip_sync_available() -> bool:
-    """Check if lip sync animation is available (requires gradio_client)."""
-    try:
-        from gradio_client import Client  # noqa: F401
-        return True
-    except ImportError:
-        return False
+# Keep LipSyncAnimator as an alias for backward compatibility
+LipSyncAnimator = Wan2S2VAnimator
+
+
+def get_lip_sync_animator(
+    backend: Optional[LipSyncBackend] = None,
+    config: Optional[Config] = None,
+):
+    """
+    Factory function to get the appropriate lip sync animator.
+
+    Args:
+        backend: Lip sync backend to use ("wan2s2v" or "kling").
+                 If None, uses config default.
+        config: Optional configuration object
+
+    Returns:
+        Animator instance (Wan2S2VAnimator or KlingAnimator)
+    """
+    cfg = config or default_config
+    use_backend = backend or cfg.lip_sync_backend
+
+    if use_backend == "kling":
+        from src.services.kling_animator import KlingAnimator
+        return KlingAnimator(config=cfg)
+    else:
+        return Wan2S2VAnimator()
+
+
+def check_lip_sync_available(backend: Optional[LipSyncBackend] = None) -> bool:
+    """Check if lip sync animation is available for the specified backend."""
+    if backend == "kling":
+        from src.services.kling_animator import check_kling_available
+        return check_kling_available()
+    else:
+        # Check for Wan2S2V (requires gradio_client)
+        try:
+            from gradio_client import Client  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+
+def get_available_lip_sync_backends(
+    config: Optional[Config] = None
+) -> list[tuple[str, str]]:
+    """
+    Get list of available lip sync backends.
+
+    Args:
+        config: Optional configuration
+
+    Returns:
+        List of (value, label) tuples for use in dropdown menus
+    """
+    backends = []
+
+    # Wan2S2V is always available if gradio_client is installed
+    if check_lip_sync_available("wan2s2v"):
+        backends.append(("wan2s2v", "Wan2.2-S2V (Free, Slow)"))
+
+    # Kling requires fal_client and API key
+    if check_lip_sync_available("kling"):
+        backends.append(("kling", "Kling AI (Paid, Fast)"))
+
+    return backends

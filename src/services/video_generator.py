@@ -757,6 +757,10 @@ class VideoGenerator:
         """
         Prepare an animated clip to match target resolution, fps, and duration.
 
+        IMPORTANT: For lip-synced animations, we NEVER adjust playback speed
+        because the lip movements are baked in to match the original audio timing.
+        We only scale resolution and trim/pad to fit the target duration.
+
         Args:
             video_path: Path to the animated video clip
             target_duration: Target duration in seconds
@@ -780,41 +784,25 @@ class VideoGenerator:
 
         encoder_args = self._get_encoder_args(quality="fast")
 
-        # Build filter string: scale to target resolution and adjust timing
+        # Build filter string: scale to target resolution
+        # IMPORTANT: Do NOT adjust playback speed - this would break lip sync!
+        # The animated video's timing is synced to the audio it was generated with.
         filter_str = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}"
 
-        # Speed adjustment if needed
-        if current_duration > 0 and abs(current_duration - target_duration) > 0.1:
-            # Calculate speed factor
-            speed = current_duration / target_duration
-            if speed > 0.5 and speed < 2.0:
-                filter_str = f"[0:v]{filter_str},setpts={1/speed}*PTS[v];[0:a]atempo={speed}[a]"
-            else:
-                # Just trim or extend if speed adjustment is too extreme
-                filter_str = f"[0:v]{filter_str}[v]"
+        # If video is shorter than target, pad with last frame (tpad)
+        # If video is longer, it will be trimmed by -t parameter
+        if current_duration > 0 and current_duration < target_duration - 0.1:
+            pad_duration = target_duration - current_duration
+            filter_str = f"{filter_str},tpad=stop_mode=clone:stop_duration={pad_duration}"
 
         cmd = [
             "ffmpeg",
             "-y",
             "-i",
             str(video_path),
+            "-vf",
+            filter_str,
         ]
-
-        # Check if we have complex filtergraph (audio adjustment)
-        if "[v]" in filter_str:
-            cmd.extend([
-                "-filter_complex",
-                filter_str,
-                "-map",
-                "[v]",
-            ])
-            if "[a]" in filter_str:
-                cmd.extend(["-map", "[a]"])
-        else:
-            cmd.extend([
-                "-vf",
-                filter_str,
-            ])
 
         cmd.extend(encoder_args)
         cmd.extend([

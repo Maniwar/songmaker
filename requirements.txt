@@ -12,8 +12,9 @@ assemblyai>=0.35.0
 # Video/Image Processing
 Pillow>=10.4.0
 
-# Lip Sync Animation (via Hugging Face Spaces)
-gradio_client>=1.4.0
+# Lip Sync Animation
+gradio_client>=1.4.0  # Wan2.2-S2V via Hugging Face Spaces (free, slow)
+fal-client>=0.5.0  # Kling AI via fal.ai (paid, fast)
 
 # UI
 streamlit>=1.40.0
