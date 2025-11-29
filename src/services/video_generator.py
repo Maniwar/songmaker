@@ -754,6 +754,7 @@ class VideoGenerator:
         resolution: Optional[tuple[int, int]] = None,
         fps: Optional[int] = None,
         crossfade_pad: float = 0.0,
+        strict_duration: bool = True,
     ) -> Path:
         """
         Prepare an animated clip to match target resolution, fps, and duration.
@@ -769,6 +770,8 @@ class VideoGenerator:
             resolution: Optional (width, height) tuple
             fps: Optional frames per second
             crossfade_pad: Duration to pad at START with first frame (for crossfade sync)
+            strict_duration: If True (lip sync), pad even small gaps to maintain audio sync.
+                           If False (prompt/veo), only pad large gaps (>0.5s).
 
         Returns:
             Path to the prepared clip
