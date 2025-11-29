@@ -978,6 +978,9 @@ class VideoGenerator:
             temp_dir = Path(temp_dir)
             clip_paths = []
 
+            # Crossfade duration - animated clips after the first need padding
+            crossfade_duration = 0.3
+
             # Generate individual scene clips
             total_scenes = len(scenes)
             for i, scene in enumerate(scenes):
@@ -1002,6 +1005,10 @@ class VideoGenerator:
                 )
 
                 if has_animation:
+                    # For animated clips after the first scene, add crossfade padding
+                    # This ensures lip sync starts AFTER the crossfade completes
+                    crossfade_pad = crossfade_duration if i > 0 else 0.0
+
                     # Use the pre-generated animated video clip
                     self.prepare_animated_clip(
                         video_path=Path(scene.video_path),
@@ -1009,6 +1016,7 @@ class VideoGenerator:
                         output_path=clip_path,
                         resolution=resolution,
                         fps=fps,
+                        crossfade_pad=crossfade_pad,
                     )
                 elif scene.image_path is not None:
                     # Create Ken Burns clip from static image
@@ -1029,9 +1037,9 @@ class VideoGenerator:
             if progress_callback:
                 progress_callback("Concatenating scenes...", 0.8)
 
-            # Concatenate clips
+            # Concatenate clips with crossfade transitions
             video_no_subs = temp_dir / "video_no_subs.mp4"
-            self.concatenate_clips(clip_paths, video_no_subs, crossfade_duration=0.3)
+            self.concatenate_clips(clip_paths, video_no_subs, crossfade_duration=crossfade_duration)
 
             if subtitle_path:
                 if progress_callback:
