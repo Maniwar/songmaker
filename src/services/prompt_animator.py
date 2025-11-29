@@ -180,9 +180,25 @@ class PromptAnimator:
                     progress_callback("No video generated", 0.0)
 
         except Exception as e:
+            error_str = str(e)
             logger.error(f"Prompt animation failed: {e}", exc_info=True)
+
+            # Provide user-friendly error messages for common issues
+            if "GPU quota" in error_str or "exceeded" in error_str.lower():
+                # Extract time remaining if available
+                import re
+                time_match = re.search(r"Try again in (\d+:\d+:\d+)", error_str)
+                wait_time = time_match.group(1) if time_match else "~24 hours"
+                user_msg = f"HuggingFace GPU quota exceeded. Try again in {wait_time}. (Free tier has daily limits)"
+            elif "queue" in error_str.lower():
+                user_msg = "HuggingFace server is busy. Please try again in a few minutes."
+            elif "timeout" in error_str.lower():
+                user_msg = "Request timed out. The server may be overloaded. Please try again."
+            else:
+                user_msg = f"Animation failed: {error_str[:100]}"
+
             if progress_callback:
-                progress_callback(f"Animation failed: {e}", 0.0)
+                progress_callback(user_msg, 0.0)
             return None
 
         return None
