@@ -874,8 +874,11 @@ class VideoGenerator:
                 and Path(s.video_path).exists()
             )
 
-            # Crossfade duration - animated clips after the first need padding
-            crossfade_duration = 0.3
+            # IMPORTANT: If there are ANY animated clips, disable crossfade entirely.
+            # Crossfade creates timing overlaps that break lip sync. Hard cuts
+            # guarantee that animated clips stay perfectly synced with their audio.
+            # Only use crossfade for videos with all static scenes.
+            crossfade_duration = 0.0 if animated_count > 0 else 0.3
 
             # Generate individual scene clips
             total_scenes = len(scenes)
@@ -901,19 +904,14 @@ class VideoGenerator:
                 )
 
                 if has_animation:
-                    # For animated clips after the first clip, add crossfade padding
-                    # This ensures lip sync starts AFTER the crossfade completes
-                    # Use len(clip_paths) > 0 instead of i > 0 to handle skipped scenes
-                    crossfade_pad = crossfade_duration if len(clip_paths) > 0 else 0.0
-
                     # Use the pre-generated animated video clip
+                    # No crossfade padding needed since we disable crossfade for animated videos
                     self.prepare_animated_clip(
                         video_path=Path(scene.video_path),
                         target_duration=scene.duration,
                         output_path=clip_path,
                         resolution=resolution,
                         fps=fps,
-                        crossfade_pad=crossfade_pad,
                     )
                 elif scene.image_path is not None:
                     # Create Ken Burns clip from static image
@@ -991,8 +989,18 @@ class VideoGenerator:
             temp_dir = Path(temp_dir)
             clip_paths = []
 
-            # Crossfade duration - animated clips after the first need padding
-            crossfade_duration = 0.3
+            # Count animated scenes
+            animated_count = sum(
+                1 for s in scenes
+                if getattr(s, 'animated', False)
+                and getattr(s, 'video_path', None)
+                and Path(s.video_path).exists()
+            )
+
+            # IMPORTANT: If there are ANY animated clips, disable crossfade entirely.
+            # Crossfade creates timing overlaps that break lip sync. Hard cuts
+            # guarantee that animated clips stay perfectly synced with their audio.
+            crossfade_duration = 0.0 if animated_count > 0 else 0.3
 
             # Generate individual scene clips
             total_scenes = len(scenes)
@@ -1018,19 +1026,14 @@ class VideoGenerator:
                 )
 
                 if has_animation:
-                    # For animated clips after the first clip, add crossfade padding
-                    # This ensures lip sync starts AFTER the crossfade completes
-                    # Use len(clip_paths) > 0 instead of i > 0 to handle skipped scenes
-                    crossfade_pad = crossfade_duration if len(clip_paths) > 0 else 0.0
-
                     # Use the pre-generated animated video clip
+                    # No crossfade padding needed since we disable crossfade for animated videos
                     self.prepare_animated_clip(
                         video_path=Path(scene.video_path),
                         target_duration=scene.duration,
                         output_path=clip_path,
                         resolution=resolution,
                         fps=fps,
-                        crossfade_pad=crossfade_pad,
                     )
                 elif scene.image_path is not None:
                     # Create Ken Burns clip from static image
