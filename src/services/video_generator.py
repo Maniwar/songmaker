@@ -1,10 +1,13 @@
 """Video generation service using FFmpeg with Ken Burns effects."""
 
+import logging
 import platform
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 from src.config import Config, config as default_config
 from src.models.schemas import Scene, KenBurnsEffect
