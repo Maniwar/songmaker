@@ -807,12 +807,15 @@ class VideoGenerator:
         # Normalize fps (AFTER tpad to preserve timing)
         filter_parts.append(f"fps={fps}")
 
-        # If video is shorter than target, pad with last frame
+        # If video is shorter than target, pad with last frame (fallback only)
         # If video is longer, it will be trimmed by -t parameter
         # Account for crossfade pad in the total duration
+        # NOTE: We request duration+1s from APIs, so padding should be rare.
+        # Only pad if video is significantly short (>0.5s) - small gaps are fine
         effective_target = target_duration + crossfade_pad
-        if current_duration > 0 and current_duration < target_duration - 0.1:
+        if current_duration > 0 and current_duration < target_duration - 0.5:
             pad_duration = target_duration - current_duration
+            logger.warning(f"Video {pad_duration:.1f}s short, padding with freeze frame")
             filter_parts.append(f"tpad=stop_duration={pad_duration}:stop_mode=clone")
 
         filter_str = ",".join(filter_parts)
