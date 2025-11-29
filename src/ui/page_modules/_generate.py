@@ -1055,17 +1055,6 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
 
     st.markdown("---")
 
-    # Check if any scene needs re-animation (set from fragment)
-    reanimate_scene_idx = st.session_state.get("reanimate_scene_idx", None)
-    reanimate_resolution = st.session_state.get("reanimate_resolution", "720P")
-    if reanimate_scene_idx is not None:
-        # Clear the flags first
-        del st.session_state["reanimate_scene_idx"]
-        if "reanimate_resolution" in st.session_state:
-            del st.session_state["reanimate_resolution"]
-        # Run the animation
-        generate_single_animation(state, reanimate_scene_idx, reanimate_resolution)
-
     # Display storyboard grid
     render_storyboard_grid(state)
 
@@ -1195,6 +1184,77 @@ def render_storyboard_grid(state) -> None:
                 render_scene_card(state, scene)
 
 
+def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> None:
+    """Run animation for a scene inline within the fragment."""
+    project_dir = getattr(state, 'project_dir', None)
+    if not project_dir:
+        st.error("No project directory found.")
+        return
+
+    audio_path = getattr(state, 'audio_path', None)
+    if not audio_path or audio_path == "demo_mode":
+        st.error("No audio file found.")
+        return
+
+    scenes = state.scenes
+    if scene_index >= len(scenes):
+        st.error("Invalid scene index.")
+        return
+
+    scene = scenes[scene_index]
+    if not scene.image_path or not Path(scene.image_path).exists():
+        st.error("Scene has no image to animate.")
+        return
+
+    animations_dir = Path(project_dir) / "animations"
+    animations_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = animations_dir / f"animated_scene_{scene_index:03d}.mp4"
+
+    # Delete existing animation file if it exists
+    if output_path.exists():
+        output_path.unlink()
+        scenes[scene_index].video_path = None
+        update_state(scenes=scenes)
+
+    # Show inline progress within the fragment
+    progress_placeholder = st.empty()
+    status_placeholder = st.empty()
+
+    status_placeholder.info(f"Re-animating at {resolution}...")
+    progress_bar = progress_placeholder.progress(0.0)
+
+    animator = LipSyncAnimator()
+
+    def progress_callback(msg: str, prog: float):
+        progress_bar.progress(prog)
+        status_placeholder.info(msg)
+
+    try:
+        result = animator.animate_scene(
+            image_path=Path(scene.image_path),
+            audio_path=Path(audio_path),
+            start_time=scene.start_time,
+            duration=scene.duration,
+            output_path=output_path,
+            resolution=resolution,
+            progress_callback=progress_callback,
+        )
+
+        if result and result.exists():
+            scenes[scene_index].video_path = result
+            update_state(scenes=scenes)
+            status_placeholder.success("Animation complete!")
+        else:
+            status_placeholder.error("Animation failed")
+
+    except Exception as e:
+        status_placeholder.error(f"Animation error: {e}")
+
+    # Clear progress bar after completion
+    progress_placeholder.empty()
+
+
 @st.fragment
 def render_scene_card(state, scene: Scene) -> None:
     """Render a single scene card with image and controls. Uses fragment for performance."""
@@ -1229,10 +1289,8 @@ def render_scene_card(state, scene: Scene) -> None:
             )
         with reanimate_col2:
             if st.button("Re-animate", key=f"reanimate_{scene.index}", help="Regenerate lip-sync animation"):
-                # Set flags for parent to handle (fragments can't run long operations)
-                st.session_state["reanimate_scene_idx"] = scene.index
-                st.session_state["reanimate_resolution"] = reanimate_resolution
-                st.rerun()
+                # Run animation directly in fragment
+                _run_scene_animation_inline(state, scene.index, reanimate_resolution)
     elif has_image:
         st.image(str(scene.image_path), use_container_width=True)
     else:
