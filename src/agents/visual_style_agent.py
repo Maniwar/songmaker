@@ -279,7 +279,7 @@ User's message: {user_message}"""
         # Send to Claude with dynamic system prompt
         response = client.messages.create(
             model="claude-sonnet-4-5-20250929",
-            max_tokens=2048,
+            max_tokens=8192,  # Increased to handle 20+ scene descriptions
             system=self._get_system_prompt(),
             messages=self.conversation_history,
         )
@@ -379,39 +379,28 @@ User's message: {user_message}"""
         # Use pre-calculated scene segments
         scene_info = json.dumps(self._scene_segments, indent=2) if self._scene_segments else "[]"
 
-        extraction_prompt = f"""Based on our entire conversation, extract the finalized visual plan as JSON.
+        extraction_prompt = f"""Based on our conversation, extract the visual plan as JSON.
 
-CRITICAL: You MUST create EXACTLY {self._num_scenes} scene prompts. No more, no less.
-
-Here are the EXACT scene timings you must use:
+CRITICAL: Create EXACTLY {self._num_scenes} scene prompts using these timings:
 {scene_info}
 
-Return ONLY valid JSON (no markdown, no explanation) with this EXACT structure:
+Return ONLY valid JSON:
 {{
-  "visual_world": "description of the consistent visual universe",
-  "character_description": "detailed character appearance description",
-  "cinematography_style": "camera, lighting, and style description",
-  "color_palette": "color direction (can be null)",
+  "visual_world": "setting description",
+  "character_description": "character appearance",
+  "cinematography_style": "style description",
+  "color_palette": "colors or null",
   "scene_prompts": [
-    {{
-      "index": 0,
-      "start_time": <use exact value from scene timing above>,
-      "end_time": <use exact value from scene timing above>,
-      "lyrics_segment": "<use exact lyrics from scene timing above>",
-      "visual_prompt": "detailed visual prompt for AI image generation - be specific!",
-      "mood": "emotional tone of the scene",
-      "effect": "zoom_in"
-    }}
+    {{"index": 0, "start_time": X, "end_time": Y, "lyrics_segment": "...", "visual_prompt": "concise but specific image prompt (1-2 sentences)", "mood": "mood", "effect": "zoom_in"}}
   ]
 }}
 
-REQUIREMENTS:
-1. visual_world, character_description, and cinematography_style are REQUIRED - use what we discussed
-2. scene_prompts array MUST have EXACTLY {self._num_scenes} entries (one for each scene above)
-3. Each scene_prompt MUST use the EXACT start_time, end_time, and lyrics_segment from the scene timings
-4. Each visual_prompt should be detailed enough for AI image generation (at least 2-3 sentences)
-5. effect must be one of: zoom_in, zoom_out, pan_left, pan_right, pan_up, pan_down
-6. Return ONLY the JSON object - no markdown code blocks, no explanation text"""
+RULES:
+1. EXACTLY {self._num_scenes} scene_prompts - no more, no less
+2. Use EXACT start_time/end_time from timings above
+3. visual_prompt: concise (1-2 sentences) but specific for AI image generation
+4. effect: zoom_in, zoom_out, pan_left, pan_right, pan_up, or pan_down
+5. NO markdown, NO explanation - ONLY the JSON object"""
 
         messages = self.conversation_history.copy()
         messages.append({"role": "user", "content": extraction_prompt})
@@ -420,8 +409,8 @@ REQUIREMENTS:
 
         response = client.messages.create(
             model="claude-sonnet-4-5-20250929",
-            max_tokens=8192,  # Increased for larger scene counts
-            system="You are a JSON extraction assistant. Return only valid JSON, no markdown formatting, no explanation text.",
+            max_tokens=16384,  # Increased for many scenes (20+ scenes)
+            system="You are a JSON extraction assistant. Return only valid JSON, no markdown formatting, no explanation text. Be concise with visual_prompt (1-2 sentences each).",
             messages=messages,
         )
 

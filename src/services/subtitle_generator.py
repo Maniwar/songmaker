@@ -71,16 +71,17 @@ Style: Default,{font_name},{font_size},{highlight_color},{primary_color},{outlin
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
-        # Group words into lines
+        # Group words into lines (returns tuples of (words, followed_by_gap))
         lines = self._group_words_into_lines(words, max_words_per_line)
 
         # Configuration for better readability
         lead_time = 0.3  # Show line before first word starts
         min_line_duration = 0.8  # Minimum time a line should be visible
         line_gap = 0.05  # Gap between consecutive lines
+        gap_buffer = 0.5  # How long to show line after last word when followed by gap
 
         events = []
-        for i, line_words in enumerate(lines):
+        for i, (line_words, followed_by_gap) in enumerate(lines):
             if not line_words:
                 continue
 
@@ -90,34 +91,42 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             # Line appears BEFORE first word starts (lead time)
             line_start = max(0, first_word_start - lead_time)
 
-            # Calculate end time with buffer after last word
-            desired_end = last_word_end + 0.3
-
-            # Find when next line's first word starts (if any)
-            next_line_first_word = None
-            if i < len(lines) - 1:
-                next_line = lines[i + 1]
-                if next_line:
-                    next_line_first_word = next_line[0].start
-
-            if next_line_first_word is not None:
-                # End before next line needs to appear (accounting for its lead time)
-                max_end = next_line_first_word - lead_time - line_gap
-                line_end = min(desired_end, max_end)
-                # But ensure we at least show until the last word ends
-                line_end = max(line_end, last_word_end + 0.05)
+            # Calculate end time based on whether there's a gap after this line
+            if followed_by_gap:
+                # Line is followed by instrumental/silence - disappear shortly after last word
+                line_end = last_word_end + gap_buffer
             else:
-                # Last line gets full buffer
-                line_end = desired_end
+                # Normal case - calculate based on next line timing
+                desired_end = last_word_end + 0.3
 
-            # Ensure minimum duration for readability
-            if line_end - line_start < min_line_duration:
+                # Find when next line's first word starts (if any)
+                next_line_first_word = None
+                if i < len(lines) - 1:
+                    next_line_words, _ = lines[i + 1]
+                    if next_line_words:
+                        next_line_first_word = next_line_words[0].start
+
+                if next_line_first_word is not None:
+                    # End before next line needs to appear (accounting for its lead time)
+                    max_end = next_line_first_word - lead_time - line_gap
+                    line_end = min(desired_end, max_end)
+                    # But ensure we at least show until the last word ends
+                    line_end = max(line_end, last_word_end + 0.05)
+                else:
+                    # Last line gets full buffer
+                    line_end = desired_end
+
+            # Ensure minimum duration for readability (but not if followed by gap)
+            if not followed_by_gap and line_end - line_start < min_line_duration:
                 line_end = line_start + min_line_duration
                 # Re-check overlap constraint
-                if next_line_first_word is not None:
-                    max_allowed = next_line_first_word - lead_time - line_gap
-                    if line_end > max_allowed:
-                        line_end = max_allowed
+                if i < len(lines) - 1:
+                    next_line_words, _ = lines[i + 1]
+                    if next_line_words:
+                        next_line_first_word = next_line_words[0].start
+                        max_allowed = next_line_first_word - lead_time - line_gap
+                        if line_end > max_allowed:
+                            line_end = max_allowed
 
             # Build karaoke text with \kf (karaoke fill) tags
             # \kf<duration> fills the word over the duration (in centiseconds)
@@ -172,28 +181,52 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         self,
         words: list[Word],
         max_words: int,
-    ) -> list[list[Word]]:
+        gap_threshold: float = 1.5,
+    ) -> list[tuple[list[Word], bool]]:
         """
         Group words into lines for subtitle display.
 
-        Tries to break at natural points (punctuation) or at max_words limit.
+        Tries to break at natural points (punctuation), max_words limit,
+        or when there's a significant time gap between words.
+
+        Args:
+            words: List of Word objects with timing
+            max_words: Maximum words per line
+            gap_threshold: Time gap (seconds) that triggers a line break.
+                          Lines followed by gaps will disappear instead of
+                          staying on screen until the next line.
+
+        Returns:
+            List of (line_words, followed_by_gap) tuples.
+            followed_by_gap=True means there's an instrumental/silence after this line.
         """
+        if not words:
+            return []
+
         lines = []
         current_line = []
 
-        for word in words:
+        for i, word in enumerate(words):
             current_line.append(word)
 
             # Check for natural break points
             is_natural_break = word.word.rstrip().endswith((".", "!", "?", ",", ";"))
 
-            if len(current_line) >= max_words or is_natural_break:
-                lines.append(current_line)
+            # Check if there's a time gap before the next word
+            has_gap_after = False
+            if i < len(words) - 1:
+                next_word = words[i + 1]
+                gap = next_word.start - word.end
+                has_gap_after = gap >= gap_threshold
+
+            # Break line if max words reached, natural break, or gap detected
+            if len(current_line) >= max_words or is_natural_break or has_gap_after:
+                lines.append((current_line, has_gap_after))
                 current_line = []
 
-        # Add remaining words
+        # Add remaining words (no gap after the last line)
         if current_line:
-            lines.append(current_line)
+            lines.append((current_line, False))
 
         return lines
 
@@ -237,12 +270,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         lines = self._group_words_into_lines(words, max_words_per_line)
 
         srt_content = []
-        for i, line_words in enumerate(lines, 1):
+        for i, (line_words, followed_by_gap) in enumerate(lines, 1):
             if not line_words:
                 continue
 
             start = line_words[0].start
-            end = line_words[-1].end + 0.5
+            # If followed by gap, end sooner; otherwise add buffer
+            end = line_words[-1].end + (0.3 if followed_by_gap else 0.5)
 
             # SRT timestamp format: HH:MM:SS,mmm
             start_ts = self._format_srt_time(start)

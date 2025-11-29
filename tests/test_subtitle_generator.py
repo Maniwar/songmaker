@@ -56,10 +56,12 @@ class TestSubtitleGenerator:
     def test_group_words_into_lines(self, generator, sample_words):
         lines = generator._group_words_into_lines(sample_words, max_words=3)
 
-        # Should create multiple lines
+        # Should create multiple lines (each line is a tuple of (words, followed_by_gap))
         assert len(lines) >= 2
-        # First line should have <= 3 words
-        assert len(lines[0]) <= 3
+        # First line's word list should have <= 3 words
+        line_words, followed_by_gap = lines[0]
+        assert len(line_words) <= 3
+        assert isinstance(followed_by_gap, bool)
 
     def test_group_words_breaks_at_punctuation(self, generator):
         words = [
@@ -69,9 +71,29 @@ class TestSubtitleGenerator:
 
         lines = generator._group_words_into_lines(words, max_words=8)
 
-        # Should break after punctuation
+        # Should break after punctuation (each line is a tuple of (words, followed_by_gap))
         assert len(lines) == 2
-        assert lines[0][0].word == "Hello."
+        first_line_words, _ = lines[0]
+        assert first_line_words[0].word == "Hello."
+
+    def test_group_words_detects_gaps(self, generator):
+        """Test that large time gaps between words are detected."""
+        words = [
+            Word(word="First", start=0.0, end=0.5),
+            Word(word="line", start=0.6, end=1.0),
+            # 2 second gap (instrumental break)
+            Word(word="Second", start=3.0, end=3.5),
+            Word(word="line", start=3.6, end=4.0),
+        ]
+
+        lines = generator._group_words_into_lines(words, max_words=8, gap_threshold=1.5)
+
+        # Should create 2 lines, first one followed by a gap
+        assert len(lines) == 2
+        first_line_words, followed_by_gap = lines[0]
+        assert followed_by_gap is True  # There's a gap after first line
+        second_line_words, followed_by_gap2 = lines[1]
+        assert followed_by_gap2 is False  # No gap after last line
 
     def test_generate_karaoke_ass(self, generator, sample_words):
         with tempfile.TemporaryDirectory() as temp_dir:

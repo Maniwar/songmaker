@@ -88,27 +88,38 @@ class LipSyncAnimator:
                     progress_callback("Generating lip-sync animation...", 0.3)
 
                 # Call the Wan2.2-S2V API
-                # The API typically expects: image, audio, resolution
+                # API expects: ref_img, audio, resolution
                 result = client.predict(
-                    image=handle_file(str(image_path)),
+                    ref_img=handle_file(str(image_path)),
                     audio=handle_file(str(audio_clip_path)),
                     resolution=resolution,
-                    api_name="/generate"
+                    api_name="/predict"
                 )
 
                 if progress_callback:
                     progress_callback("Processing result...", 0.9)
 
-                # Result is typically a file path to the generated video
-                if result and Path(result).exists():
+                # Result is a dict with 'video' and 'subtitles' keys
+                # The video value is a filepath string
+                video_path = None
+                if isinstance(result, dict):
+                    video_path = result.get('video')
+                elif isinstance(result, str):
+                    video_path = result
+
+                if video_path and Path(video_path).exists():
                     # Copy to output path
                     output_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy(result, output_path)
+                    shutil.copy(video_path, output_path)
 
                     if progress_callback:
                         progress_callback("Animation complete!", 1.0)
 
                     return output_path
+                else:
+                    print(f"Lip sync result: {result}")
+                    if progress_callback:
+                        progress_callback("No video generated", 0.0)
 
             except Exception as e:
                 print(f"Lip sync animation failed: {e}")

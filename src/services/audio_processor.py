@@ -79,12 +79,16 @@ class AudioProcessor:
 
         if asr_options:
             load_kwargs["asr_options"] = asr_options
+            print(f"[WhisperX] Loading model with asr_options: {list(asr_options.keys())}")
 
         if language:
             load_kwargs["language"] = language
+            print(f"[WhisperX] Language set to: {language}")
 
+        print(f"[WhisperX] Load kwargs: {list(load_kwargs.keys())}")
         self._model = whisperx.load_model(**load_kwargs)
         self._current_asr_options = asr_options
+        print("[WhisperX] Model loaded successfully")
 
     def _load_align_model(self, language_code: str) -> None:
         """Load alignment model for the specified language."""
@@ -166,6 +170,8 @@ class AudioProcessor:
             # Remove section markers like [Verse], [Chorus], etc.
             clean_lyrics = re.sub(r'\[.*?\]', '', lyrics_hint)
             clean_lyrics = ' '.join(clean_lyrics.split())  # Normalize whitespace
+            # Log that we're using lyrics hint
+            print(f"[WhisperX] Using lyrics hint ({len(clean_lyrics)} chars): {clean_lyrics[:100]}...")
 
         # Load model with lyrics hint (passed via asr_options)
         self._load_whisperx_models(initial_prompt=clean_lyrics, language=language)

@@ -346,18 +346,10 @@ def _generate_scene_preview_with_lyrics(state, scene: Scene) -> bytes:
 
     try:
         # Generate subtitle file for this scene's words
-        # Shift timing so scene starts at 0 (for preview)
+        # Note: create_scene_preview will handle time shifting via _shift_subtitles
         if scene.words:
-            # Create shifted words for preview (start from 0)
-            shifted_words = []
-            for w in scene.words:
-                shifted_words.append(Word(
-                    word=w.word,
-                    start=w.start - scene.start_time,
-                    end=w.end - scene.start_time,
-                ))
             subtitle_gen.generate_karaoke_ass(
-                words=shifted_words,
+                words=scene.words,
                 output_path=sub_path,
             )
         else:
