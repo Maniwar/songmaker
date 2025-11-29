@@ -15,6 +15,7 @@ from src.services.video_generator import VideoGenerator
 from src.services.subtitle_generator import SubtitleGenerator
 from src.services.lip_sync_animator import LipSyncAnimator, check_lip_sync_available
 from src.services.prompt_animator import PromptAnimator, check_prompt_animator_available
+from src.services.veo_animator import VeoAnimator, check_veo_available
 from src.ui.components.state import get_state, update_state, advance_step, go_to_step
 from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word, AnimationType
 
@@ -1257,6 +1258,13 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
             st.error("No motion prompt found for prompt animation.")
             return
 
+    # For Veo animation, we need a motion prompt
+    if animation_type == AnimationType.VEO:
+        motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+        if not motion_prompt:
+            st.error("No motion prompt found for Veo animation.")
+            return
+
     animations_dir = Path(project_dir) / "animations"
     animations_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1272,13 +1280,26 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
     progress_placeholder = st.empty()
     status_placeholder = st.empty()
 
-    anim_type_label = "lip sync" if animation_type == AnimationType.LIP_SYNC else "prompt"
+    anim_type_labels = {
+        AnimationType.LIP_SYNC: "lip sync",
+        AnimationType.PROMPT: "prompt",
+        AnimationType.VEO: "Veo 3.1 (PAID)",
+    }
+    anim_type_label = anim_type_labels.get(animation_type, "animation")
     status_placeholder.info(f"Animating ({anim_type_label}) at {resolution}...")
     progress_bar = progress_placeholder.progress(0.0)
+
+    # Track error messages from the animator
+    error_msg_holder = {"msg": None}
 
     def progress_callback(msg: str, prog: float):
         progress_bar.progress(prog)
         status_placeholder.info(msg)
+        # Capture error messages (progress 0.0 with error keywords indicates failure)
+        if prog == 0.0 and ("failed" in msg.lower() or "error" in msg.lower() or
+                           "exceeded" in msg.lower() or "quota" in msg.lower() or
+                           "timeout" in msg.lower() or "invalid" in msg.lower()):
+            error_msg_holder["msg"] = msg
 
     try:
         result = None
@@ -1306,6 +1327,18 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
                 duration_seconds=min(scene.duration, 5.0),  # TI2V-5B supports 2-5 seconds
                 progress_callback=progress_callback,
             )
+        elif animation_type == AnimationType.VEO:
+            # Use VeoAnimator for high-quality Veo 3.1 animation (PAID)
+            animator = VeoAnimator()
+            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=scene.duration,  # Veo supports 4, 6, or 8 seconds
+                resolution="720p",  # Can be 720p or 1080p
+                progress_callback=progress_callback,
+            )
 
         if result and result.exists():
             scenes[scene_index].video_path = result
@@ -1313,10 +1346,31 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
             update_state(scenes=scenes)
             status_placeholder.success("Animation complete!")
         else:
-            status_placeholder.error("Animation failed")
+            # Use captured error message if available, otherwise generic message
+            if error_msg_holder["msg"]:
+                status_placeholder.error(error_msg_holder["msg"])
+            else:
+                status_placeholder.error("Animation failed - check the logs for details")
 
     except Exception as e:
-        status_placeholder.error(f"Animation error: {e}")
+        error_str = str(e)
+        # Provide user-friendly error messages for common issues
+        if "GPU quota" in error_str or "exceeded" in error_str.lower():
+            import re
+            time_match = re.search(r"Try again in (\d+:\d+:\d+)", error_str)
+            wait_time = time_match.group(1) if time_match else "~24 hours"
+            user_msg = f"HuggingFace GPU quota exceeded. Try again in {wait_time}."
+        elif "billing" in error_str.lower():
+            user_msg = "Veo requires billing to be enabled on your Google Cloud account."
+        elif "invalid" in error_str.lower() and "api" in error_str.lower():
+            user_msg = "Invalid API key. Check your configuration."
+        elif "timeout" in error_str.lower():
+            user_msg = "Request timed out. The server may be overloaded. Try again."
+        elif "queue" in error_str.lower():
+            user_msg = "Server is busy. Please try again in a few minutes."
+        else:
+            user_msg = f"Animation error: {error_str[:150]}"
+        status_placeholder.error(user_msg)
 
     # Clear progress bar after completion
     progress_placeholder.empty()
@@ -1361,6 +1415,7 @@ def render_scene_card(state, scene: Scene) -> None:
             "Static": AnimationType.NONE,
             "Lip Sync": AnimationType.LIP_SYNC,
             "Prompt": AnimationType.PROMPT,
+            "Veo 3.1 (PAID)": AnimationType.VEO,
         }
         anim_labels = list(anim_options.keys())
         current_idx = list(anim_options.values()).index(current_anim_type) if current_anim_type in anim_options.values() else 0
@@ -1375,8 +1430,8 @@ def render_scene_card(state, scene: Scene) -> None:
         )
         new_anim_type = anim_options[selected_anim_label]
 
-        # Show motion prompt input if prompt-based animation is selected
-        if new_anim_type == AnimationType.PROMPT:
+        # Show motion prompt input if prompt-based animation is selected (Prompt or Veo)
+        if new_anim_type in (AnimationType.PROMPT, AnimationType.VEO):
             current_motion_prompt = getattr(scene, 'motion_prompt', '') or scene.visual_prompt
             new_motion_prompt = st.text_input(
                 "Motion Prompt",
@@ -1416,7 +1471,12 @@ def render_scene_card(state, scene: Scene) -> None:
                 )
             with anim_col2:
                 button_label = "Re-animate" if has_animation else "Animate"
-                anim_type_name = "Lip Sync" if new_anim_type == AnimationType.LIP_SYNC else "Prompt"
+                anim_type_names = {
+                    AnimationType.LIP_SYNC: "Lip Sync",
+                    AnimationType.PROMPT: "Prompt",
+                    AnimationType.VEO: "Veo 3.1",
+                }
+                anim_type_name = anim_type_names.get(new_anim_type, "Animation")
                 if st.button(button_label, key=f"animate_{scene.index}", help=f"Generate {anim_type_name} animation"):
                     _run_scene_animation_inline(state, scene.index, anim_resolution)
 
@@ -1988,7 +2048,7 @@ def generate_single_animation(state, scene_index: int, resolution: str = "720P")
 
 
 def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = False) -> None:
-    """Generate lip-sync animations for scenes marked for animation."""
+    """Generate animations for scenes marked for animation (respects animation type)."""
     if is_demo_mode:
         st.warning("Animation generation is not available in demo mode. Please upload real audio.")
         return
@@ -1999,19 +2059,16 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
         return
 
     audio_path = getattr(state, 'audio_path', None)
-    if not audio_path or audio_path == "demo_mode":
-        st.error("No audio file found. Please upload audio first.")
-        return
 
     animations_dir = Path(project_dir) / "animations"
     animations_dir.mkdir(parents=True, exist_ok=True)
 
     scenes = state.scenes
 
-    # Find scenes that need animation
+    # Find scenes that need animation (check animation_type, not just 'animated' flag)
     pending_scenes = [
         s for s in scenes
-        if getattr(s, 'animated', False)
+        if getattr(s, 'animation_type', AnimationType.NONE) != AnimationType.NONE
         and s.image_path
         and Path(s.image_path).exists()
         and (not getattr(s, 'video_path', None) or not Path(s.video_path).exists())
@@ -2021,32 +2078,112 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
         st.info("No scenes need animation!")
         return
 
-    with st.status(f"Generating {len(pending_scenes)} lip-sync animations...", expanded=True) as status:
-        st.write("Using Wan2.2-S2V via Hugging Face Spaces (FREE, cloud-based)")
+    # Count by type
+    lip_sync_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.LIP_SYNC)
+    prompt_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.PROMPT)
+    veo_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.VEO)
+
+    status_label = f"Generating {len(pending_scenes)} animations"
+    type_parts = []
+    if lip_sync_count > 0:
+        type_parts.append(f"{lip_sync_count} lip-sync")
+    if prompt_count > 0:
+        type_parts.append(f"{prompt_count} prompt")
+    if veo_count > 0:
+        type_parts.append(f"{veo_count} Veo")
+    if type_parts:
+        status_label += f" ({', '.join(type_parts)})"
+
+    with st.status(f"{status_label}...", expanded=True) as status:
         st.write(f"Resolution: {resolution}")
 
-        animator = LipSyncAnimator()
-        progress_bar = st.progress(0.0, text="Connecting to Wan2.2-S2V...")
+        # Create animators lazily
+        lip_sync_animator = None
+        prompt_animator = None
+        veo_animator = None
+
+        progress_bar = st.progress(0.0, text="Starting animations...")
+        last_error_msg = None  # Track last error message for display
 
         success_count = 0
         for idx, scene in enumerate(pending_scenes):
+            anim_type = getattr(scene, 'animation_type', AnimationType.LIP_SYNC)
+            anim_type_names = {
+                AnimationType.LIP_SYNC: "lip-sync",
+                AnimationType.PROMPT: "prompt",
+                AnimationType.VEO: "Veo",
+            }
+            anim_type_name = anim_type_names.get(anim_type, "unknown")
+
             progress_bar.progress(
                 idx / len(pending_scenes),
-                text=f"Animating scene {scene.index + 1} ({idx + 1}/{len(pending_scenes)})..."
+                text=f"Animating scene {scene.index + 1} ({anim_type_name}) ({idx + 1}/{len(pending_scenes)})..."
             )
 
             output_path = animations_dir / f"animated_scene_{scene.index:03d}.mp4"
 
+            # Track progress messages
+            error_msg_holder = {"msg": None}
+
+            def progress_callback(msg: str, prog: float):
+                st.write(f"  {msg}")
+                # Capture error messages (progress 0.0 usually indicates error)
+                if prog == 0.0 and ("failed" in msg.lower() or "error" in msg.lower() or "exceeded" in msg.lower()):
+                    error_msg_holder["msg"] = msg
+
             try:
-                result = animator.animate_scene(
-                    image_path=Path(scene.image_path),
-                    audio_path=Path(audio_path),
-                    start_time=scene.start_time,
-                    duration=scene.duration,
-                    output_path=output_path,
-                    resolution=resolution,
-                    progress_callback=lambda msg, prog: st.write(f"  {msg}"),
-                )
+                result = None
+
+                if anim_type == AnimationType.LIP_SYNC:
+                    # Lip sync requires audio
+                    if not audio_path or audio_path == "demo_mode":
+                        st.write(f"⚠️ Scene {scene.index + 1}: Skipped - no audio for lip sync")
+                        continue
+
+                    if lip_sync_animator is None:
+                        st.write("Using Wan2.2-S2V for lip-sync (FREE, cloud-based)")
+                        lip_sync_animator = LipSyncAnimator()
+
+                    result = lip_sync_animator.animate_scene(
+                        image_path=Path(scene.image_path),
+                        audio_path=Path(audio_path),
+                        start_time=scene.start_time,
+                        duration=scene.duration,
+                        output_path=output_path,
+                        resolution=resolution,
+                        progress_callback=progress_callback,
+                    )
+
+                elif anim_type == AnimationType.PROMPT:
+                    if prompt_animator is None:
+                        st.write("Using Wan2.2-TI2V-5B for prompt animation (FREE, cloud-based)")
+                        prompt_animator = PromptAnimator()
+
+                    motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+
+                    result = prompt_animator.animate_scene(
+                        image_path=Path(scene.image_path),
+                        prompt=motion_prompt,
+                        output_path=output_path,
+                        duration_seconds=scene.duration,
+                        progress_callback=progress_callback,
+                    )
+
+                elif anim_type == AnimationType.VEO:
+                    if veo_animator is None:
+                        st.write("Using Google Veo 3.1 (PAID, high-quality)")
+                        veo_animator = VeoAnimator()
+
+                    motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+
+                    result = veo_animator.animate_scene(
+                        image_path=Path(scene.image_path),
+                        prompt=motion_prompt,
+                        output_path=output_path,
+                        duration_seconds=scene.duration,
+                        resolution="720p",  # Default to 720p for speed
+                        progress_callback=progress_callback,
+                    )
 
                 if result and result.exists():
                     # Update scene with video path
@@ -2054,10 +2191,25 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                     success_count += 1
                     st.write(f"✅ Scene {scene.index + 1} animated successfully")
                 else:
-                    st.write(f"❌ Scene {scene.index + 1} animation failed")
+                    # Show error message if captured
+                    if error_msg_holder["msg"]:
+                        st.write(f"❌ Scene {scene.index + 1}: {error_msg_holder['msg']}")
+                        last_error_msg = error_msg_holder["msg"]
+                    else:
+                        st.write(f"❌ Scene {scene.index + 1} animation failed")
 
             except Exception as e:
-                st.write(f"❌ Scene {scene.index + 1} error: {e}")
+                error_str = str(e)
+                # Provide user-friendly error messages
+                if "GPU quota" in error_str or "exceeded" in error_str.lower():
+                    import re
+                    time_match = re.search(r"Try again in (\d+:\d+:\d+)", error_str)
+                    wait_time = time_match.group(1) if time_match else "~24 hours"
+                    user_msg = f"HuggingFace GPU quota exceeded. Try again in {wait_time}."
+                    last_error_msg = user_msg
+                else:
+                    user_msg = str(e)[:100]
+                st.write(f"❌ Scene {scene.index + 1} error: {user_msg}")
 
         progress_bar.progress(1.0, text="Done!")
         update_state(scenes=scenes)
@@ -2073,8 +2225,9 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                 state="error"
             )
         else:
+            error_hint = f" - {last_error_msg}" if last_error_msg else ""
             status.update(
-                label="Animation generation failed",
+                label=f"Animation generation failed{error_hint}",
                 state="error"
             )
 
