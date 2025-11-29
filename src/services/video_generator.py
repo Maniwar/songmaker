@@ -889,9 +889,10 @@ class VideoGenerator:
                 )
 
                 if has_animation:
-                    # For animated clips after the first scene, add crossfade padding
+                    # For animated clips after the first clip, add crossfade padding
                     # This ensures lip sync starts AFTER the crossfade completes
-                    crossfade_pad = crossfade_duration if i > 0 else 0.0
+                    # Use len(clip_paths) > 0 instead of i > 0 to handle skipped scenes
+                    crossfade_pad = crossfade_duration if len(clip_paths) > 0 else 0.0
 
                     # Use the pre-generated animated video clip
                     self.prepare_animated_clip(
@@ -1005,9 +1006,10 @@ class VideoGenerator:
                 )
 
                 if has_animation:
-                    # For animated clips after the first scene, add crossfade padding
+                    # For animated clips after the first clip, add crossfade padding
                     # This ensures lip sync starts AFTER the crossfade completes
-                    crossfade_pad = crossfade_duration if i > 0 else 0.0
+                    # Use len(clip_paths) > 0 instead of i > 0 to handle skipped scenes
+                    crossfade_pad = crossfade_duration if len(clip_paths) > 0 else 0.0
 
                     # Use the pre-generated animated video clip
                     self.prepare_animated_clip(
