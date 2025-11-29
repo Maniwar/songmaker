@@ -2161,11 +2161,12 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
 
                     motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
 
+                    # Request 1s extra - better to trim than pad (padding looks weird)
                     result = prompt_animator.animate_scene(
                         image_path=Path(scene.image_path),
                         prompt=motion_prompt,
                         output_path=output_path,
-                        duration_seconds=scene.duration,
+                        duration_seconds=scene.duration + 1.0,
                         progress_callback=progress_callback,
                     )
 
@@ -2176,11 +2177,12 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
 
                     motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
 
+                    # Veo rounds to 4/6/8s internally, but request +1s to ensure >= target
                     result = veo_animator.animate_scene(
                         image_path=Path(scene.image_path),
                         prompt=motion_prompt,
                         output_path=output_path,
-                        duration_seconds=scene.duration,
+                        duration_seconds=scene.duration + 1.0,
                         resolution="720p",  # Default to 720p for speed
                         progress_callback=progress_callback,
                     )
