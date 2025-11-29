@@ -36,6 +36,7 @@ When planning scenes:
 
 For each scene, provide:
 - A detailed visual prompt (for image generation) - MUST include visual world context
+- A motion prompt (for animation) - describes the CHARACTER'S PHYSICAL ACTION/MOVEMENT
 - The mood/emotion of the scene
 - A Ken Burns effect - IMPORTANT: Use VARIED effects across scenes for visual interest:
   - zoom_in: For intimate moments, drawing attention inward
@@ -43,6 +44,16 @@ For each scene, provide:
   - pan_left/pan_right: For movement, transitions, or following action
   - pan_up: For uplifting moments, hope, looking to the sky
   - pan_down: For grounding, introspection, or somber moments
+
+MOTION PROMPTS (for animation):
+Motion prompts describe what the character DOES - their physical action and movement.
+Keep motion prompts SHORT (5-15 words) and focused on ACTION, not appearance.
+Examples:
+- "strumming guitar passionately while swaying to the beat"
+- "walking slowly through rain, head bowed in sorrow"
+- "dancing energetically with arms raised"
+- "sitting at piano, fingers moving gracefully across keys"
+- "standing still, wind gently blowing through hair"
 
 Consider the narrative arc:
 - Introduction: Establish setting (use zoom_out or pan effects)
@@ -320,8 +331,11 @@ For each scene, provide:
    - MUST reference the visual world setting (e.g., if medieval fantasy, show castles/knights/forests)
    - The prompt should MATCH the specific lyrics for that scene's timestamp
    - Include visual elements that represent the words being sung
-2. The mood of this specific scene
-3. A Ken Burns effect: zoom_in, zoom_out, pan_left, pan_right, pan_up, pan_down
+2. A motion prompt (5-15 words describing CHARACTER ACTION for animation)
+   - Describes physical movement/action (NOT appearance)
+   - Examples: "playing guitar passionately", "dancing with arms raised", "walking through rain"
+3. The mood of this specific scene
+4. A Ken Burns effect: zoom_in, zoom_out, pan_left, pan_right, pan_up, pan_down
    - IMPORTANT: Use VARIED effects - don't use the same effect for all scenes!
 
 Respond in this exact JSON format:
@@ -329,6 +343,7 @@ Respond in this exact JSON format:
     "scenes": [
         {{
             "visual_prompt": "Detailed description INCLUDING the visual world setting",
+            "motion_prompt": "Short action description for animation",
             "mood": "emotional tone of this scene",
             "effect": "zoom_in"
         }}
@@ -383,6 +398,7 @@ Create exactly {num_scenes} scenes. Only respond with the JSON."""
                         mood=scene_data.get("mood", concept.mood),
                         effect=effect,
                         words=words,
+                        motion_prompt=scene_data.get("motion_prompt"),
                     )
                 )
 
@@ -432,9 +448,12 @@ Create exactly {num_scenes} scenes. Only respond with the JSON."""
                 prompt = f"{style}. Scene depicting: {lyrics}"
                 if character:
                     prompt = f"{character} - {prompt}"
+                # Generic motion prompt for fallback
+                motion_prompt = "performing with emotion, moving to the music"
             else:
                 # Instrumental section
                 prompt = f"{style}. {concept.mood} instrumental moment, abstract visual"
+                motion_prompt = "swaying gently to the music"
 
             # Get the varied effect
             effect_str = effect_hints[i] if i < len(effect_hints) else "zoom_in"
@@ -452,6 +471,7 @@ Create exactly {num_scenes} scenes. Only respond with the JSON."""
                     mood=concept.mood,
                     effect=effect,
                     words=words,
+                    motion_prompt=motion_prompt,
                 )
             )
 

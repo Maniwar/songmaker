@@ -14,8 +14,9 @@ from src.services.image_generator import ImageGenerator
 from src.services.video_generator import VideoGenerator
 from src.services.subtitle_generator import SubtitleGenerator
 from src.services.lip_sync_animator import LipSyncAnimator, check_lip_sync_available
+from src.services.prompt_animator import PromptAnimator, check_prompt_animator_available
 from src.ui.components.state import get_state, update_state, advance_step, go_to_step
-from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word
+from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word, AnimationType
 
 
 def _sanitize_filename(name: str, max_length: int = 20) -> str:
@@ -851,6 +852,44 @@ def render_prompt_review(state, is_demo_mode: bool) -> None:
             else:
                 st.caption("Parallel processing disabled in sequential mode")
 
+        # Hero Image Upload (optional - for visual consistency)
+        st.markdown("**Hero Image (Optional)**")
+        hero_help = (
+            "Upload a reference image to maintain visual consistency across scenes. "
+            "In parallel mode: used as reference for ALL scenes. "
+            "In sequential mode: seeds the first scene."
+        )
+        st.caption(hero_help)
+
+        hero_col1, hero_col2 = st.columns([2, 1])
+        with hero_col1:
+            hero_file = st.file_uploader(
+                "Upload hero image",
+                type=["png", "jpg", "jpeg", "webp"],
+                key="hero_image_uploader",
+                label_visibility="collapsed",
+            )
+            if hero_file is not None:
+                # Save to project directory
+                project_dir = state.project_dir
+                if project_dir:
+                    hero_path = Path(project_dir) / "hero_image.png"
+                    from PIL import Image as PILImage
+                    hero_img = PILImage.open(hero_file)
+                    hero_path.parent.mkdir(parents=True, exist_ok=True)
+                    hero_img.save(str(hero_path))
+                    if str(hero_path) != getattr(state, 'hero_image_path', None):
+                        update_state(hero_image_path=str(hero_path))
+                    st.success(f"Hero image saved!")
+
+        with hero_col2:
+            current_hero = getattr(state, 'hero_image_path', None)
+            if current_hero and Path(current_hero).exists():
+                st.image(current_hero, caption="Current hero image", width=150)
+                if st.button("Clear hero image", key="clear_hero_image"):
+                    update_state(hero_image_path=None)
+                    st.rerun()
+
     st.markdown("---")
 
     # Display each scene's prompt with editing capability
@@ -1191,11 +1230,6 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
         st.error("No project directory found.")
         return
 
-    audio_path = getattr(state, 'audio_path', None)
-    if not audio_path or audio_path == "demo_mode":
-        st.error("No audio file found.")
-        return
-
     scenes = state.scenes
     if scene_index >= len(scenes):
         st.error("Invalid scene index.")
@@ -1205,6 +1239,23 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
     if not scene.image_path or not Path(scene.image_path).exists():
         st.error("Scene has no image to animate.")
         return
+
+    # Get animation type
+    animation_type = getattr(scene, 'animation_type', AnimationType.LIP_SYNC)
+
+    # For lip sync, we need audio
+    audio_path = getattr(state, 'audio_path', None)
+    if animation_type == AnimationType.LIP_SYNC:
+        if not audio_path or audio_path == "demo_mode":
+            st.error("No audio file found for lip sync animation.")
+            return
+
+    # For prompt animation, we need a motion prompt
+    if animation_type == AnimationType.PROMPT:
+        motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+        if not motion_prompt:
+            st.error("No motion prompt found for prompt animation.")
+            return
 
     animations_dir = Path(project_dir) / "animations"
     animations_dir.mkdir(parents=True, exist_ok=True)
@@ -1221,28 +1272,44 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
     progress_placeholder = st.empty()
     status_placeholder = st.empty()
 
-    status_placeholder.info(f"Re-animating at {resolution}...")
+    anim_type_label = "lip sync" if animation_type == AnimationType.LIP_SYNC else "prompt"
+    status_placeholder.info(f"Animating ({anim_type_label}) at {resolution}...")
     progress_bar = progress_placeholder.progress(0.0)
-
-    animator = LipSyncAnimator()
 
     def progress_callback(msg: str, prog: float):
         progress_bar.progress(prog)
         status_placeholder.info(msg)
 
     try:
-        result = animator.animate_scene(
-            image_path=Path(scene.image_path),
-            audio_path=Path(audio_path),
-            start_time=scene.start_time,
-            duration=scene.duration,
-            output_path=output_path,
-            resolution=resolution,
-            progress_callback=progress_callback,
-        )
+        result = None
+
+        if animation_type == AnimationType.LIP_SYNC:
+            # Use LipSyncAnimator for audio-driven lip sync
+            animator = LipSyncAnimator()
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                audio_path=Path(audio_path),
+                start_time=scene.start_time,
+                duration=scene.duration,
+                output_path=output_path,
+                resolution=resolution,
+                progress_callback=progress_callback,
+            )
+        elif animation_type == AnimationType.PROMPT:
+            # Use PromptAnimator for prompt-driven motion
+            animator = PromptAnimator()
+            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=min(scene.duration, 5.0),  # TI2V-5B supports 2-5 seconds
+                progress_callback=progress_callback,
+            )
 
         if result and result.exists():
             scenes[scene_index].video_path = result
+            scenes[scene_index].animated = True
             update_state(scenes=scenes)
             status_placeholder.success("Animation complete!")
         else:
@@ -1277,41 +1344,81 @@ def render_scene_card(state, scene: Scene) -> None:
     # Image or animation preview
     if has_animation:
         st.video(str(scene.video_path))
-        # Re-animate controls with resolution selector
-        reanimate_col1, reanimate_col2 = st.columns([1, 1])
-        with reanimate_col1:
-            reanimate_resolution = st.selectbox(
-                "Resolution",
-                options=["720P", "480P"],
-                index=0,
-                key=f"reanimate_res_{scene.index}",
-                label_visibility="collapsed",
-            )
-        with reanimate_col2:
-            if st.button("Re-animate", key=f"reanimate_{scene.index}", help="Regenerate lip-sync animation"):
-                # Run animation directly in fragment
-                _run_scene_animation_inline(state, scene.index, reanimate_resolution)
     elif has_image:
         st.image(str(scene.image_path), use_container_width=True)
     else:
         st.error("Missing image - click Regenerate")
 
-    # Animation toggle (only show if image exists)
+    # Animation type selector (only show if image exists)
     if has_image:
-        animate_checked = st.checkbox(
-            "Animate character (lip-sync)",
-            value=getattr(scene, 'animated', False),
-            key=f"animate_{scene.index}",
-            help="Enable to animate this scene with full-body lip-sync singing using Wan2.2-S2V"
+        # Get current animation type
+        current_anim_type = getattr(scene, 'animation_type', AnimationType.NONE)
+        # Handle legacy 'animated' field - convert to animation_type
+        if current_anim_type == AnimationType.NONE and getattr(scene, 'animated', False):
+            current_anim_type = AnimationType.LIP_SYNC
+
+        anim_options = {
+            "Static": AnimationType.NONE,
+            "Lip Sync": AnimationType.LIP_SYNC,
+            "Prompt": AnimationType.PROMPT,
+        }
+        anim_labels = list(anim_options.keys())
+        current_idx = list(anim_options.values()).index(current_anim_type) if current_anim_type in anim_options.values() else 0
+
+        selected_anim_label = st.radio(
+            "Animation",
+            options=anim_labels,
+            index=current_idx,
+            key=f"anim_type_{scene.index}",
+            horizontal=True,
+            label_visibility="collapsed",
         )
-        if animate_checked != getattr(scene, 'animated', False):
+        new_anim_type = anim_options[selected_anim_label]
+
+        # Show motion prompt input if prompt-based animation is selected
+        if new_anim_type == AnimationType.PROMPT:
+            current_motion_prompt = getattr(scene, 'motion_prompt', '') or scene.visual_prompt
+            new_motion_prompt = st.text_input(
+                "Motion Prompt",
+                value=current_motion_prompt,
+                key=f"motion_prompt_{scene.index}",
+                placeholder="e.g., playing guitar, dancing",
+                help="Describe the motion you want",
+            )
+            # Update motion prompt if changed
+            if new_motion_prompt != getattr(scene, 'motion_prompt', None):
+                scenes = state.scenes
+                scenes[scene.index].motion_prompt = new_motion_prompt
+                update_state(scenes=scenes)
+
+        # Update animation type if changed
+        if new_anim_type != current_anim_type:
             scenes = state.scenes
-            scenes[scene.index].animated = animate_checked
-            if not animate_checked:
+            scenes[scene.index].animation_type = new_anim_type
+            # Update legacy 'animated' field for compatibility
+            scenes[scene.index].animated = new_anim_type != AnimationType.NONE
+            if new_anim_type == AnimationType.NONE:
                 # Clear video path when disabling animation
                 scenes[scene.index].video_path = None
             update_state(scenes=scenes)
             st.rerun()
+
+        # Animate/Re-animate controls (only if animation type is not NONE)
+        if new_anim_type != AnimationType.NONE:
+            anim_col1, anim_col2 = st.columns([1, 1])
+            with anim_col1:
+                anim_resolution = st.selectbox(
+                    "Resolution",
+                    options=["720P", "480P"],
+                    index=0,
+                    key=f"anim_res_{scene.index}",
+                    label_visibility="collapsed",
+                )
+            with anim_col2:
+                button_label = "Re-animate" if has_animation else "Animate"
+                anim_type_name = "Lip Sync" if new_anim_type == AnimationType.LIP_SYNC else "Prompt"
+                if st.button(button_label, key=f"animate_{scene.index}", help=f"Generate {anim_type_name} animation"):
+                    _run_scene_animation_inline(state, scene.index, anim_resolution)
 
     # Scene details in expander - editable prompt and lyrics
     with st.expander("Edit Scene", expanded=False):
@@ -1637,10 +1744,18 @@ def generate_images_from_prompts(state, is_demo_mode: bool) -> None:
         character_desc = state.concept.character_description if state.concept else None
         visual_world = state.concept.visual_world if state.concept else None
 
+        # Load hero image if set
+        hero_image = None
+        hero_image_path = getattr(state, 'hero_image_path', None)
+        if hero_image_path and Path(hero_image_path).exists():
+            from PIL import Image as PILImage
+            hero_image = PILImage.open(hero_image_path)
+            st.write(f"Using hero image for visual consistency")
+
         def image_progress(msg: str, prog: float):
             progress_bar.progress(prog, text=msg)
 
-        # Pass resolution, sequential mode, parallel workers and visual_world to image generator
+        # Pass resolution, sequential mode, parallel workers, visual_world and hero_image to image generator
         image_paths = image_gen.generate_storyboard(
             scene_prompts=prompts,
             style_prefix=style_prefix,
@@ -1651,6 +1766,7 @@ def generate_images_from_prompts(state, is_demo_mode: bool) -> None:
             sequential_mode=sequential_mode,
             visual_world=visual_world,
             max_workers=parallel_workers,
+            hero_image=hero_image,
         )
 
         # Ensure we have the same number of paths as scenes

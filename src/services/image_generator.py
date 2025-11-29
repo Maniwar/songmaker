@@ -239,6 +239,7 @@ class ImageGenerator:
         sequential_mode: bool = False,
         visual_world: Optional[str] = None,
         max_workers: int = 4,
+        hero_image: Optional[Image.Image] = None,
     ) -> list[Path]:
         """
         Generate a series of images for a storyboard.
@@ -254,6 +255,9 @@ class ImageGenerator:
             sequential_mode: If True, use previous image as reference for consistency
             visual_world: Visual world/setting for consistency across all scenes
             max_workers: Maximum number of parallel image generations (ignored if sequential_mode=True)
+            hero_image: Optional reference image for visual consistency
+                - In parallel mode: used as reference for ALL scene generations
+                - In sequential mode: seeds the FIRST scene (scene 0)
 
         Returns:
             List of paths to generated images (always same length as scene_prompts)
@@ -277,10 +281,16 @@ class ImageGenerator:
 
                 output_path = output_dir / f"scene_{i:03d}.png"
 
-                # Get reference image from previous scene if in sequential mode
+                # Get reference image for this scene
+                # In sequential mode: use hero_image for scene 0, then previous scene's image
                 reference_image = None
-                if sequential_mode and i > 0 and generated_images[i - 1] is not None:
-                    reference_image = generated_images[i - 1]
+                if sequential_mode:
+                    if i == 0 and hero_image is not None:
+                        # First scene uses hero_image as seed
+                        reference_image = hero_image
+                    elif i > 0 and generated_images[i - 1] is not None:
+                        # Subsequent scenes use previous scene's image
+                        reference_image = generated_images[i - 1]
 
                 image = self.generate_scene_image(
                     prompt=prompt,
@@ -314,7 +324,7 @@ class ImageGenerator:
                     style_prefix=style_prefix,
                     character_description=character_description,
                     visual_world=visual_world,
-                    reference_image=None,  # No reference in parallel mode
+                    reference_image=hero_image,  # Use hero_image for ALL scenes in parallel mode
                     output_path=output_path,
                     image_size=image_size,
                 )
