@@ -753,6 +753,7 @@ class VideoGenerator:
         output_path: Path,
         resolution: Optional[tuple[int, int]] = None,
         fps: Optional[int] = None,
+        crossfade_pad: float = 0.0,
     ) -> Path:
         """
         Prepare an animated clip to match target resolution, fps, and duration.
@@ -767,6 +768,7 @@ class VideoGenerator:
             output_path: Path for the output video
             resolution: Optional (width, height) tuple
             fps: Optional frames per second
+            crossfade_pad: Duration to pad at START with first frame (for crossfade sync)
 
         Returns:
             Path to the prepared clip
@@ -789,8 +791,16 @@ class VideoGenerator:
         # The animated video's timing is synced to the audio it was generated with.
         filter_str = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}"
 
+        # For crossfade synchronization: pad the START with frozen first frame
+        # This ensures the lip sync animation starts AFTER the crossfade completes,
+        # matching when the audio for this scene actually begins playing.
+        if crossfade_pad > 0:
+            filter_str = f"{filter_str},tpad=start_mode=clone:start_duration={crossfade_pad}"
+
         # If video is shorter than target, pad with last frame (tpad)
         # If video is longer, it will be trimmed by -t parameter
+        # Account for crossfade pad in the total duration
+        effective_target = target_duration + crossfade_pad
         if current_duration > 0 and current_duration < target_duration - 0.1:
             pad_duration = target_duration - current_duration
             filter_str = f"{filter_str},tpad=stop_mode=clone:stop_duration={pad_duration}"
@@ -808,7 +818,7 @@ class VideoGenerator:
         cmd.extend([
             "-an",  # Remove audio (we'll add the original audio track later)
             "-t",
-            str(target_duration),
+            str(effective_target),
             str(output_path),
         ])
 
