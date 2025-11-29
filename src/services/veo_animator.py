@@ -5,7 +5,6 @@ Unlike the free HuggingFace options, this is a PAID service but offers superior 
 """
 
 import logging
-import shutil
 import time
 from io import BytesIO
 from pathlib import Path
@@ -75,7 +74,6 @@ class VeoAnimator:
         duration_seconds: float = 4.0,
         resolution: str = "720p",
         aspect_ratio: str = "16:9",
-        generate_audio: bool = False,  # Disabled by default for music videos
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> Optional[Path]:
         """
@@ -88,7 +86,6 @@ class VeoAnimator:
             duration_seconds: Target duration (will use closest Veo option: 4, 6, or 8)
             resolution: Video resolution ("720p" or "1080p")
             aspect_ratio: Aspect ratio ("16:9" or "9:16")
-            generate_audio: Whether to generate audio (disabled by default for music videos)
             progress_callback: Optional callback for progress updates
 
         Returns:
@@ -101,11 +98,14 @@ class VeoAnimator:
 
         try:
             # Load and prepare the image
-            image = Image.open(image_path)
+            pil_image = Image.open(image_path)
 
-            # Convert to bytes for the API
+            # Convert to bytes for the API (JPEG for smaller size)
             img_buffer = BytesIO()
-            image.save(img_buffer, format="PNG")
+            # Convert RGBA to RGB if needed (JPEG doesn't support alpha)
+            if pil_image.mode == 'RGBA':
+                pil_image = pil_image.convert('RGB')
+            pil_image.save(img_buffer, format="JPEG", quality=95)
             img_bytes = img_buffer.getvalue()
 
             # Get the appropriate duration
@@ -116,23 +116,24 @@ class VeoAnimator:
 
             client = self._get_client()
 
-            # Create the image part for the API
-            image_part = types.Part.from_bytes(data=img_bytes, mime_type="image/png")
+            # Create the Image object for Veo API (not Part)
+            # Veo expects types.Image, not types.Part
+            veo_image = types.Image(image_bytes=img_bytes, mime_type="image/jpeg")
 
             if progress_callback:
                 progress_callback(f"Generating video: {prompt[:50]}...", 0.3)
 
             # Generate video using Veo 3.1
             # Note: Veo is an async operation - we need to poll for completion
+            # Note: generate_audio is not supported in the Gemini API for Veo
             operation = client.models.generate_videos(
                 model=self.MODEL_NAME,
                 prompt=prompt,
-                image=image_part,
+                image=veo_image,
                 config=types.GenerateVideosConfig(
                     aspect_ratio=aspect_ratio,
                     duration_seconds=veo_duration,
                     resolution=resolution,
-                    generate_audio=generate_audio,
                 ),
             )
 

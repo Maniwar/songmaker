@@ -10,7 +10,7 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 from src.config import Config, config as default_config
-from src.models.schemas import Scene, KenBurnsEffect
+from src.models.schemas import Scene, KenBurnsEffect, AnimationType
 
 
 def _escape_ffmpeg_path(path: Path) -> str:
@@ -816,10 +816,13 @@ class VideoGenerator:
         # If video is shorter than target, pad with last frame (fallback only)
         # If video is longer, it will be trimmed by -t parameter
         # Account for crossfade pad in the total duration
-        # NOTE: We request duration+1s from APIs, so padding should be rare.
-        # Only pad if video is significantly short (>0.5s) - small gaps are fine
+        # NOTE: We request duration+1s from APIs for prompt/veo, so padding should be rare.
+        # CRITICAL: ALL scenes must have exact duration to maintain audio sync!
+        # Even prompt/veo scenes - if they're short, it causes cumulative timing drift
+        # that throws off ALL subsequent lip sync scenes. Always pad to exact duration.
         effective_target = target_duration + crossfade_pad
-        if current_duration > 0 and current_duration < target_duration - 0.5:
+        # Always use tight tolerance - any shortness causes timing drift
+        if current_duration > 0 and current_duration < target_duration - 0.05:
             pad_duration = target_duration - current_duration
             logger.warning(f"Video {pad_duration:.1f}s short, padding with freeze frame")
             filter_parts.append(f"tpad=stop_duration={pad_duration}:stop_mode=clone")
@@ -915,12 +918,16 @@ class VideoGenerator:
                 if has_animation:
                     # Use the pre-generated animated video clip
                     # No crossfade padding needed since we disable crossfade for animated videos
+                    # Lip sync needs strict duration (exact timing with audio)
+                    # Prompt/VEO can have loose tolerance (no audio sync dependency)
+                    is_lip_sync = getattr(scene, 'animation_type', None) == AnimationType.LIP_SYNC
                     self.prepare_animated_clip(
                         video_path=Path(scene.video_path),
                         target_duration=scene.duration,
                         output_path=clip_path,
                         resolution=resolution,
                         fps=fps,
+                        strict_duration=is_lip_sync,
                     )
                 elif scene.image_path is not None:
                     # Create Ken Burns clip from static image
@@ -1037,12 +1044,16 @@ class VideoGenerator:
                 if has_animation:
                     # Use the pre-generated animated video clip
                     # No crossfade padding needed since we disable crossfade for animated videos
+                    # Lip sync needs strict duration (exact timing with audio)
+                    # Prompt/VEO can have loose tolerance (no audio sync dependency)
+                    is_lip_sync = getattr(scene, 'animation_type', None) == AnimationType.LIP_SYNC
                     self.prepare_animated_clip(
                         video_path=Path(scene.video_path),
                         target_duration=scene.duration,
                         output_path=clip_path,
                         resolution=resolution,
                         fps=fps,
+                        strict_duration=is_lip_sync,
                     )
                 elif scene.image_path is not None:
                     # Create Ken Burns clip from static image

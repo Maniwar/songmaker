@@ -16,6 +16,7 @@ from src.services.subtitle_generator import SubtitleGenerator
 from src.services.lip_sync_animator import LipSyncAnimator, check_lip_sync_available
 from src.services.prompt_animator import PromptAnimator, check_prompt_animator_available
 from src.services.veo_animator import VeoAnimator, check_veo_available
+from src.services.animation_chainer import PromptAnimationChainer, VeoAnimationChainer
 from src.ui.components.state import get_state, update_state, advance_step, go_to_step
 from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word, AnimationType
 
@@ -2157,32 +2158,41 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                 elif anim_type == AnimationType.PROMPT:
                     if prompt_animator is None:
                         st.write("Using Wan2.2-TI2V-5B for prompt animation (FREE, cloud-based)")
-                        prompt_animator = PromptAnimator()
+                        # Use chainer which handles long scenes by generating multiple
+                        # segments and stitching them together
+                        prompt_animator = PromptAnimationChainer()
 
                     motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
 
-                    # Request 1s extra - better to trim than pad (padding looks weird)
+                    # Chainer handles scenes of any length:
+                    # - Short scenes (<=5s): generates single segment
+                    # - Long scenes (>5s): chains multiple segments using last frame
                     result = prompt_animator.animate_scene(
                         image_path=Path(scene.image_path),
                         prompt=motion_prompt,
                         output_path=output_path,
-                        duration_seconds=scene.duration + 1.0,
+                        duration_seconds=scene.duration,  # Request exact duration
+                        quality_preset="fast",  # 320x576, 8 steps - reliable for free tier
                         progress_callback=progress_callback,
                     )
 
                 elif anim_type == AnimationType.VEO:
                     if veo_animator is None:
                         st.write("Using Google Veo 3.1 (PAID, high-quality)")
-                        veo_animator = VeoAnimator()
+                        # Use chainer which handles long scenes by generating multiple
+                        # segments and stitching them together
+                        veo_animator = VeoAnimationChainer()
 
                     motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
 
-                    # Veo rounds to 4/6/8s internally, but request +1s to ensure >= target
+                    # Chainer handles scenes of any length:
+                    # - Short scenes (<=8s): generates single segment
+                    # - Long scenes (>8s): chains multiple segments using last frame
                     result = veo_animator.animate_scene(
                         image_path=Path(scene.image_path),
                         prompt=motion_prompt,
                         output_path=output_path,
-                        duration_seconds=scene.duration + 1.0,
+                        duration_seconds=scene.duration,  # Request exact duration
                         resolution="720p",  # Default to 720p for speed
                         progress_callback=progress_callback,
                     )
