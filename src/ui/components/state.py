@@ -263,6 +263,258 @@ def get_project_info(filepath: Path) -> dict:
         }
 
 
+def scan_recoverable_projects() -> list[dict]:
+    """
+    Scan the output directory for projects that can be recovered.
+
+    A recoverable project is a directory with an images/ subfolder containing
+    scene images. Returns info about each recoverable project.
+    """
+    from src.config import config
+
+    recoverable = []
+    output_dir = config.output_dir
+
+    if not output_dir.exists():
+        return []
+
+    for item in output_dir.iterdir():
+        if not item.is_dir():
+            continue
+        # Skip special directories
+        if item.name in ("images", "videos", "subtitles", "songs"):
+            continue
+
+        # Check for images directory with scene images
+        images_dir = item / "images"
+        if not images_dir.exists():
+            continue
+
+        scene_images = sorted(images_dir.glob("scene_*.png"))
+        if not scene_images:
+            continue
+
+        # Check for other assets
+        animations_dir = item / "animations"
+        animations = list(animations_dir.glob("animated_scene_*.mp4")) if animations_dir.exists() else []
+        lyrics_file = item / "lyrics.ass"
+        final_videos = list(item.glob("*.mp4"))
+        # Filter out animation files from final videos
+        final_videos = [v for v in final_videos if "animated_scene" not in v.name]
+
+        recoverable.append({
+            "path": item,
+            "name": item.name,
+            "image_count": len(scene_images),
+            "animation_count": len(animations),
+            "has_lyrics": lyrics_file.exists(),
+            "has_final_video": len(final_videos) > 0,
+            "final_video": final_videos[0] if final_videos else None,
+            "modified": item.stat().st_mtime,
+        })
+
+    # Sort by modification time, newest first
+    recoverable.sort(key=lambda x: x["modified"], reverse=True)
+    return recoverable
+
+
+def recover_project(project_path: Path, audio_path: Optional[Path] = None) -> bool:
+    """
+    Recover a project from its output directory.
+
+    This reconstructs minimal state from the saved files, allowing the user
+    to resume from the storyboard view.
+
+    Args:
+        project_path: Path to the project directory
+        audio_path: Optional path to the audio file
+
+    Returns:
+        True if recovery succeeded
+    """
+    from src.models.schemas import Scene, KenBurnsEffect, Word, Transcript, Segment
+
+    images_dir = project_path / "images"
+    animations_dir = project_path / "animations"
+    lyrics_file = project_path / "lyrics.ass"
+
+    # Find scene images
+    scene_images = sorted(images_dir.glob("scene_*.png"))
+    if not scene_images:
+        return False
+
+    # Create scenes from images
+    scenes = []
+    for img_path in scene_images:
+        # Extract scene index from filename (scene_XXX.png)
+        try:
+            idx = int(img_path.stem.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+
+        # Check for matching animation
+        animation_path = animations_dir / f"animated_scene_{idx:03d}.mp4"
+        has_animation = animation_path.exists()
+
+        # Create scene with placeholder timing (will be updated if audio provided)
+        scene = Scene(
+            index=idx,
+            start_time=0.0,  # Placeholder
+            end_time=0.0,  # Placeholder
+            visual_prompt="(Recovered from files)",
+            mood="unknown",
+            effect=KenBurnsEffect.ZOOM_IN,
+            image_path=img_path,
+            words=[],
+            animated=has_animation,
+            video_path=animation_path if has_animation else None,
+        )
+        scenes.append(scene)
+
+    # Sort scenes by index
+    scenes.sort(key=lambda s: s.index)
+
+    # Try to parse lyrics from .ass file if present
+    words_by_scene = {}
+    if lyrics_file.exists():
+        try:
+            words_by_scene = _parse_ass_file(lyrics_file)
+        except Exception:
+            pass
+
+    # Estimate timing based on audio duration or scene count
+    audio_duration = 0.0
+    if audio_path and audio_path.exists():
+        try:
+            from pydub import AudioSegment
+            audio = AudioSegment.from_file(str(audio_path))
+            audio_duration = len(audio) / 1000.0
+        except Exception:
+            pass
+
+    # Assign timing to scenes
+    if audio_duration > 0 and scenes:
+        scene_duration = audio_duration / len(scenes)
+        for i, scene in enumerate(scenes):
+            scene.start_time = i * scene_duration
+            scene.end_time = (i + 1) * scene_duration
+            # Assign words from parsed .ass file if available
+            if scene.index in words_by_scene:
+                scene.words = words_by_scene[scene.index]
+
+    # Create minimal transcript for compatibility
+    all_words = []
+    for scene in scenes:
+        all_words.extend(scene.words)
+
+    transcript = Transcript(
+        segments=[Segment(
+            text=" ".join(w.word for w in all_words),
+            start=0.0,
+            end=audio_duration,
+            words=all_words,
+        )] if all_words else [],
+        language="en",
+        duration=audio_duration,
+    )
+
+    # Create new state with recovered data
+    new_state = AppState(
+        current_step=WorkflowStep.GENERATE,
+        scenes=scenes,
+        project_dir=str(project_path),
+        transcript=transcript,
+        audio_path=str(audio_path) if audio_path else None,
+        audio_duration=audio_duration,
+        prompts_ready=True,
+        storyboard_ready=True,
+        generated_images=[str(s.image_path) for s in scenes if s.image_path],
+    )
+
+    st.session_state.app_state = new_state
+    return True
+
+
+def _parse_ass_file(ass_path: Path) -> dict[int, list]:
+    """
+    Parse an ASS subtitle file to extract word timing.
+
+    Returns a dict mapping scene index to list of Word objects.
+    This is a best-effort parser for karaoke-style ASS files.
+    """
+    from src.models.schemas import Word
+
+    words_by_scene = {}
+
+    try:
+        with open(ass_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Find Dialogue lines
+        import re
+        dialogue_pattern = r"Dialogue:\s*\d+,(\d+:\d+:\d+\.\d+),(\d+:\d+:\d+\.\d+),.*?,,.*?,(.*)"
+
+        for match in re.finditer(dialogue_pattern, content):
+            start_str, end_str, text = match.groups()
+
+            # Parse timestamps (H:MM:SS.CC format)
+            def parse_time(t):
+                parts = t.replace(".", ":").split(":")
+                h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+                cs = int(parts[3]) if len(parts) > 3 else 0
+                return h * 3600 + m * 60 + s + cs / 100.0
+
+            start = parse_time(start_str)
+            end = parse_time(end_str)
+
+            # Clean text of ASS tags
+            clean_text = re.sub(r"\{[^}]*\}", "", text).strip()
+            if not clean_text:
+                continue
+
+            # Split into words and distribute timing
+            word_list = clean_text.split()
+            if not word_list:
+                continue
+
+            duration = end - start
+            word_duration = duration / len(word_list)
+
+            # Estimate which scene this belongs to (will be refined later)
+            # For now, just collect all words
+            for i, word_text in enumerate(word_list):
+                word = Word(
+                    word=word_text,
+                    start=start + i * word_duration,
+                    end=start + (i + 1) * word_duration,
+                )
+                # Scene index will be determined by timing later
+                # For now, use scene 0 as placeholder
+                if 0 not in words_by_scene:
+                    words_by_scene[0] = []
+                words_by_scene[0].append(word)
+
+    except Exception:
+        pass
+
+    return words_by_scene
+
+
+def list_audio_files() -> list[Path]:
+    """List available audio files in output/songs directory."""
+    from src.config import config
+
+    songs_dir = config.output_dir / "songs"
+    if not songs_dir.exists():
+        return []
+
+    audio_files = []
+    for ext in ["*.mp3", "*.wav", "*.m4a", "*.ogg"]:
+        audio_files.extend(songs_dir.glob(ext))
+
+    return sorted(audio_files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
 def render_project_sidebar() -> None:
     """Render the project management sidebar section."""
     with st.sidebar:
@@ -299,6 +551,54 @@ def render_project_sidebar() -> None:
                         if st.button("X", key=f"del_{project_path.stem}"):
                             if delete_project(project_path):
                                 st.rerun()
+
+        # Recover project from files
+        recoverable_projects = scan_recoverable_projects()
+        if recoverable_projects:
+            with st.expander("Recover Project", expanded=False):
+                st.caption("Recover from output files")
+
+                # List available audio files for pairing
+                audio_files = list_audio_files()
+                audio_options = ["(No audio)"] + [f.name for f in audio_files]
+
+                for proj in recoverable_projects[:8]:  # Show last 8
+                    from datetime import datetime
+                    modified = datetime.fromtimestamp(proj["modified"]).strftime("%m/%d %H:%M")
+
+                    # Status icons
+                    status = f"{proj['image_count']} imgs"
+                    if proj["animation_count"] > 0:
+                        status += f", {proj['animation_count']} anims"
+                    if proj["has_final_video"]:
+                        status += " [video]"
+
+                    st.markdown(f"**{proj['name'][:25]}**")
+                    st.caption(f"{status} - {modified}")
+
+                    # Audio selection for this project
+                    selected_audio = st.selectbox(
+                        "Audio file",
+                        options=audio_options,
+                        key=f"recover_audio_{proj['name']}",
+                        label_visibility="collapsed",
+                    )
+
+                    if st.button("Recover", key=f"recover_{proj['name']}", use_container_width=True):
+                        audio_path = None
+                        if selected_audio != "(No audio)":
+                            for af in audio_files:
+                                if af.name == selected_audio:
+                                    audio_path = af
+                                    break
+
+                        if recover_project(proj["path"], audio_path):
+                            st.success("Project recovered!")
+                            st.rerun()
+                        else:
+                            st.error("Recovery failed")
+
+                    st.markdown("---")
 
         # New project
         st.divider()
