@@ -786,24 +786,36 @@ class VideoGenerator:
 
         encoder_args = self._get_encoder_args(quality="fast")
 
-        # Build filter string: scale to target resolution
+        # Build filter string with proper ordering for lip sync:
+        # 1. First apply start padding (BEFORE any other processing) so timing is correct
+        # 2. Then scale and letterbox
+        # 3. Finally normalize fps
         # IMPORTANT: Do NOT adjust playback speed - this would break lip sync!
-        # The animated video's timing is synced to the audio it was generated with.
-        filter_str = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}"
+        filter_parts = []
 
-        # For crossfade synchronization: pad the START with frozen first frame
+        # For crossfade synchronization: pad the START with frozen first frame FIRST
         # This ensures the lip sync animation starts AFTER the crossfade completes,
         # matching when the audio for this scene actually begins playing.
+        # Apply tpad BEFORE other filters to ensure frame timing is correct.
         if crossfade_pad > 0:
-            filter_str = f"{filter_str},tpad=start_mode=clone:start_duration={crossfade_pad}"
+            filter_parts.append(f"tpad=start_duration={crossfade_pad}:start_mode=clone")
 
-        # If video is shorter than target, pad with last frame (tpad)
+        # Scale and letterbox
+        filter_parts.append(f"scale={width}:{height}:force_original_aspect_ratio=decrease")
+        filter_parts.append(f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
+
+        # Normalize fps (AFTER tpad to preserve timing)
+        filter_parts.append(f"fps={fps}")
+
+        # If video is shorter than target, pad with last frame
         # If video is longer, it will be trimmed by -t parameter
         # Account for crossfade pad in the total duration
         effective_target = target_duration + crossfade_pad
         if current_duration > 0 and current_duration < target_duration - 0.1:
             pad_duration = target_duration - current_duration
-            filter_str = f"{filter_str},tpad=stop_mode=clone:stop_duration={pad_duration}"
+            filter_parts.append(f"tpad=stop_duration={pad_duration}:stop_mode=clone")
+
+        filter_str = ",".join(filter_parts)
 
         cmd = [
             "ffmpeg",
