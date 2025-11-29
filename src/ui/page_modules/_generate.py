@@ -1055,6 +1055,17 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
 
     st.markdown("---")
 
+    # Check if any scene needs re-animation (set from fragment)
+    reanimate_scene_idx = st.session_state.get("reanimate_scene_idx", None)
+    reanimate_resolution = st.session_state.get("reanimate_resolution", "480P")
+    if reanimate_scene_idx is not None:
+        # Clear the flags first
+        del st.session_state["reanimate_scene_idx"]
+        if "reanimate_resolution" in st.session_state:
+            del st.session_state["reanimate_resolution"]
+        # Run the animation
+        generate_single_animation(state, reanimate_scene_idx, reanimate_resolution)
+
     # Display storyboard grid
     render_storyboard_grid(state)
 
@@ -1206,6 +1217,22 @@ def render_scene_card(state, scene: Scene) -> None:
     # Image or animation preview
     if has_animation:
         st.video(str(scene.video_path))
+        # Re-animate controls with resolution selector
+        reanimate_col1, reanimate_col2 = st.columns([1, 1])
+        with reanimate_col1:
+            reanimate_resolution = st.selectbox(
+                "Resolution",
+                options=["480P", "720P"],
+                index=0,
+                key=f"reanimate_res_{scene.index}",
+                label_visibility="collapsed",
+            )
+        with reanimate_col2:
+            if st.button("Re-animate", key=f"reanimate_{scene.index}", help="Regenerate lip-sync animation"):
+                # Set flags for parent to handle (fragments can't run long operations)
+                st.session_state["reanimate_scene_idx"] = scene.index
+                st.session_state["reanimate_resolution"] = reanimate_resolution
+                st.rerun()
     elif has_image:
         st.image(str(scene.image_path), use_container_width=True)
     else:
@@ -1714,6 +1741,66 @@ def regenerate_missing_images(state) -> None:
             )
         else:
             status.update(label="All missing images generated!", state="complete")
+
+    st.rerun()
+
+
+def generate_single_animation(state, scene_index: int, resolution: str = "480P") -> None:
+    """Re-animate a single scene."""
+    project_dir = getattr(state, 'project_dir', None)
+    if not project_dir:
+        st.error("No project directory found.")
+        return
+
+    audio_path = getattr(state, 'audio_path', None)
+    if not audio_path or audio_path == "demo_mode":
+        st.error("No audio file found.")
+        return
+
+    scenes = state.scenes
+    if scene_index >= len(scenes):
+        st.error("Invalid scene index.")
+        return
+
+    scene = scenes[scene_index]
+    if not scene.image_path or not Path(scene.image_path).exists():
+        st.error("Scene has no image to animate.")
+        return
+
+    animations_dir = Path(project_dir) / "animations"
+    animations_dir.mkdir(parents=True, exist_ok=True)
+
+    with st.status(f"Re-animating scene {scene_index + 1} at {resolution}...", expanded=True) as status:
+        st.write("Connecting to Wan2.2-S2V...")
+        animator = LipSyncAnimator()
+        output_path = animations_dir / f"animated_scene_{scene_index:03d}.mp4"
+
+        progress_bar = st.progress(0.0)
+
+        def progress_callback(msg: str, prog: float):
+            progress_bar.progress(prog)
+            st.write(f"  {msg}")
+
+        try:
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                audio_path=Path(audio_path),
+                start_time=scene.start_time,
+                duration=scene.duration,
+                output_path=output_path,
+                resolution=resolution,
+                progress_callback=progress_callback,
+            )
+
+            if result and result.exists():
+                scenes[scene_index].video_path = result
+                update_state(scenes=scenes)
+                status.update(label=f"Scene {scene_index + 1} re-animated!", state="complete")
+            else:
+                status.update(label=f"Animation failed for scene {scene_index + 1}", state="error")
+
+        except Exception as e:
+            status.update(label=f"Animation error: {e}", state="error")
 
     st.rerun()
 
