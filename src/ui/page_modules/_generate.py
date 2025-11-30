@@ -1345,7 +1345,10 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
         if result and result.exists():
             scenes[scene_index].video_path = result
             scenes[scene_index].animated = True
+            scenes[scene_index].animation_type = animation_type
             update_state(scenes=scenes)
+            # Persist to scenes.json so animations are recognized after recovery
+            save_scene_metadata(Path(project_dir), scenes)
             status_placeholder.success("Animation complete!")
         else:
             # Use captured error message if available, otherwise generic message
