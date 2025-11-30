@@ -1455,6 +1455,8 @@ def render_scene_card(state, scene: Scene) -> None:
                                 scenes = state.scenes
                                 scenes[scene.index].motion_prompt = ai_prompt
                                 update_state(scenes=scenes)
+                                # Update widget state so text_input shows new value after rerun
+                                st.session_state[f"motion_prompt_{scene.index}"] = ai_prompt
                                 st.rerun()
                             else:
                                 st.error("Failed")
