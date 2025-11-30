@@ -174,6 +174,80 @@ class ImageGenerator:
             # Try fallback to placeholder image
             return self._create_placeholder_image(prompt, output_path)
 
+    def generate_motion_prompt_from_image(
+        self,
+        image_path: Path,
+    ) -> Optional[str]:
+        """
+        Analyze an image and generate a motion prompt for animation.
+
+        Uses Gemini's vision capabilities to describe what motion/action
+        would be appropriate for animating the scene.
+
+        Args:
+            image_path: Path to the scene image
+
+        Returns:
+            Motion prompt string, or None if analysis failed
+        """
+        from google.genai import types
+
+        try:
+            client = self._get_client()
+
+            # Load the image
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+
+            # Build the prompt for motion analysis
+            prompt_text = """Analyze this image and suggest a short motion prompt for video animation.
+
+Focus on what natural movement would bring this scene to life:
+- If there's a person: describe their action (playing guitar, singing, dancing, etc.)
+- If it's a landscape: describe ambient motion (wind through trees, waves, clouds moving)
+- If there are objects: describe subtle movements (flickering lights, swaying items)
+
+Requirements:
+- Keep it SHORT (under 15 words)
+- Be SPECIFIC to what's in the image
+- Focus on ONE primary motion
+- Use present participle verbs (playing, singing, swaying, flowing)
+
+Examples:
+- "playing guitar passionately with subtle head movement"
+- "wind gently moving through the forest leaves"
+- "performer dancing energetically on stage"
+
+Respond with ONLY the motion prompt, nothing else."""
+
+            contents = [
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+                        types.Part.from_text(text=prompt_text),
+                    ],
+                ),
+            ]
+
+            # Use the text model for analysis
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=contents,
+            )
+
+            if response.text:
+                # Clean up the response
+                motion_prompt = response.text.strip()
+                # Remove quotes if present
+                motion_prompt = motion_prompt.strip('"\'')
+                return motion_prompt
+
+        except Exception as e:
+            print(f"Motion prompt generation failed: {e}")
+
+        return None
+
     def _create_placeholder_image(
         self, prompt: str, output_path: Optional[Path] = None
     ) -> Optional[Image.Image]:

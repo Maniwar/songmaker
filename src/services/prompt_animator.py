@@ -96,6 +96,15 @@ class PromptAnimator:
         """
         from gradio_client import handle_file
 
+        # SAFETY: Cap duration to API maximum (5 seconds for Wan2.2-TI2V-5B)
+        # This prevents accidental long duration requests that would fail
+        MAX_API_DURATION = 5.0
+        if duration_seconds > MAX_API_DURATION:
+            logger.warning(
+                f"Duration {duration_seconds}s exceeds API max of {MAX_API_DURATION}s, capping"
+            )
+            duration_seconds = MAX_API_DURATION
+
         # Apply quality preset if specified (only resolution and steps, NOT duration)
         if quality_preset and quality_preset in self.QUALITY_PRESETS:
             preset = self.QUALITY_PRESETS[quality_preset]

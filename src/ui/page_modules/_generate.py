@@ -1434,13 +1434,30 @@ def render_scene_card(state, scene: Scene) -> None:
         # Show motion prompt input if prompt-based animation is selected (Prompt or Veo)
         if new_anim_type in (AnimationType.PROMPT, AnimationType.VEO):
             current_motion_prompt = getattr(scene, 'motion_prompt', '') or scene.visual_prompt
-            new_motion_prompt = st.text_input(
-                "Motion Prompt",
-                value=current_motion_prompt,
-                key=f"motion_prompt_{scene.index}",
-                placeholder="e.g., playing guitar, dancing",
-                help="Describe the motion you want",
-            )
+            prompt_col, ai_col = st.columns([4, 1])
+            with prompt_col:
+                new_motion_prompt = st.text_input(
+                    "Motion Prompt",
+                    value=current_motion_prompt,
+                    key=f"motion_prompt_{scene.index}",
+                    placeholder="e.g., playing guitar, dancing",
+                    help="Describe the motion you want",
+                )
+            with ai_col:
+                # AI Generate button for motion prompt
+                if scene.image_path and Path(scene.image_path).exists():
+                    if st.button("AI", key=f"ai_motion_{scene.index}", help="Generate motion prompt from image using AI"):
+                        with st.spinner("Analyzing..."):
+                            from src.services.image_generator import ImageGenerator
+                            generator = ImageGenerator()
+                            ai_prompt = generator.generate_motion_prompt_from_image(Path(scene.image_path))
+                            if ai_prompt:
+                                scenes = state.scenes
+                                scenes[scene.index].motion_prompt = ai_prompt
+                                update_state(scenes=scenes)
+                                st.rerun()
+                            else:
+                                st.error("Failed")
             # Update motion prompt if changed
             if new_motion_prompt != getattr(scene, 'motion_prompt', None):
                 scenes = state.scenes
