@@ -1433,13 +1433,27 @@ def render_scene_card(state, scene: Scene) -> None:
 
         # Show motion prompt input if prompt-based animation is selected (Prompt or Veo)
         if new_anim_type in (AnimationType.PROMPT, AnimationType.VEO):
-            current_motion_prompt = getattr(scene, 'motion_prompt', '') or scene.visual_prompt
+            widget_key = f"motion_prompt_{scene.index}"
+            ai_result_key = f"_ai_motion_result_{scene.index}"
+            scene_motion_prompt = getattr(scene, 'motion_prompt', None)
+
+            # Check if AI generated a new prompt (stored in temp key from previous render)
+            if ai_result_key in st.session_state:
+                st.session_state[widget_key] = st.session_state[ai_result_key]
+                del st.session_state[ai_result_key]
+            # Clear stale "(Recovered from files)" from old code, or initialize from scene
+            elif widget_key in st.session_state:
+                if st.session_state[widget_key] == "(Recovered from files)":
+                    st.session_state[widget_key] = scene_motion_prompt or ""
+            else:
+                # Initialize from scene data
+                st.session_state[widget_key] = scene_motion_prompt or ""
+
             prompt_col, ai_col = st.columns([4, 1])
             with prompt_col:
                 new_motion_prompt = st.text_input(
                     "Motion Prompt",
-                    value=current_motion_prompt,
-                    key=f"motion_prompt_{scene.index}",
+                    key=widget_key,
                     placeholder="e.g., playing guitar, dancing",
                     help="Describe the motion you want",
                 )
@@ -1455,15 +1469,13 @@ def render_scene_card(state, scene: Scene) -> None:
                                 scenes = state.scenes
                                 scenes[scene.index].motion_prompt = ai_prompt
                                 update_state(scenes=scenes)
-                                # Delete widget state so text_input picks up new value on rerun
-                                widget_key = f"motion_prompt_{scene.index}"
-                                if widget_key in st.session_state:
-                                    del st.session_state[widget_key]
+                                # Store in temp key - will be transferred to widget on next render
+                                st.session_state[ai_result_key] = ai_prompt
                                 st.rerun()
                             else:
                                 st.error("Failed")
             # Update motion prompt if changed
-            if new_motion_prompt != getattr(scene, 'motion_prompt', None):
+            if new_motion_prompt != scene_motion_prompt:
                 scenes = state.scenes
                 scenes[scene.index].motion_prompt = new_motion_prompt
                 update_state(scenes=scenes)
