@@ -15,6 +15,70 @@ from src.models.schemas import AppState, WorkflowStep
 # Default projects directory
 PROJECTS_DIR = Path("projects")
 
+# Scene metadata filename
+SCENE_METADATA_FILE = "scenes.json"
+
+
+def save_scene_metadata(project_path: Path, scenes: list) -> bool:
+    """
+    Save scene metadata (prompts, effects, etc.) to a JSON file.
+
+    This allows prompts and other scene data to be recovered when loading a project.
+
+    Args:
+        project_path: Path to the project directory
+        scenes: List of Scene objects
+
+    Returns:
+        True if save succeeded
+    """
+    try:
+        metadata = []
+        for scene in scenes:
+            scene_data = {
+                "index": scene.index,
+                "start_time": scene.start_time,
+                "end_time": scene.end_time,
+                "visual_prompt": scene.visual_prompt,
+                "mood": scene.mood,
+                "effect": scene.effect.value if hasattr(scene.effect, 'value') else scene.effect,
+                "motion_prompt": getattr(scene, 'motion_prompt', None),
+                "animation_type": scene.animation_type.value if hasattr(scene.animation_type, 'value') else str(scene.animation_type),
+                "animated": getattr(scene, 'animated', False),
+            }
+            metadata.append(scene_data)
+
+        metadata_path = project_path / SCENE_METADATA_FILE
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        return True
+    except Exception as e:
+        print(f"Failed to save scene metadata: {e}")
+        return False
+
+
+def load_scene_metadata(project_path: Path) -> Optional[dict]:
+    """
+    Load scene metadata from JSON file.
+
+    Returns:
+        Dictionary mapping scene index to metadata, or None if file doesn't exist
+    """
+    metadata_path = project_path / SCENE_METADATA_FILE
+    if not metadata_path.exists():
+        return None
+
+    try:
+        with open(metadata_path, 'r') as f:
+            metadata_list = json.load(f)
+
+        # Convert to dict keyed by index for easy lookup
+        return {item['index']: item for item in metadata_list}
+    except Exception as e:
+        print(f"Failed to load scene metadata: {e}")
+        return None
+
 
 def _sanitize_path_component(name: str) -> str:
     """Sanitize a single path component (directory or file name)."""
@@ -332,7 +396,7 @@ def recover_project(project_path: Path, audio_path: Optional[Path] = None) -> bo
     Returns:
         True if recovery succeeded
     """
-    from src.models.schemas import Scene, KenBurnsEffect, Word, Transcript, Segment
+    from src.models.schemas import Scene, KenBurnsEffect, AnimationType, Word, Transcript, Segment
 
     images_dir = project_path / "images"
     animations_dir = project_path / "animations"
@@ -342,6 +406,9 @@ def recover_project(project_path: Path, audio_path: Optional[Path] = None) -> bo
     scene_images = sorted(images_dir.glob("scene_*.png"))
     if not scene_images:
         return False
+
+    # Load scene metadata if available
+    scene_metadata = load_scene_metadata(project_path)
 
     # Create scenes from images
     scenes = []
@@ -356,17 +423,38 @@ def recover_project(project_path: Path, audio_path: Optional[Path] = None) -> bo
         animation_path = animations_dir / f"animated_scene_{idx:03d}.mp4"
         has_animation = animation_path.exists()
 
-        # Create scene with placeholder timing (will be updated if audio provided)
+        # Get metadata for this scene if available
+        meta = scene_metadata.get(idx, {}) if scene_metadata else {}
+
+        # Parse effect from metadata
+        effect = KenBurnsEffect.ZOOM_IN  # default
+        if meta.get("effect"):
+            try:
+                effect = KenBurnsEffect(meta["effect"])
+            except ValueError:
+                pass
+
+        # Parse animation_type from metadata
+        animation_type = AnimationType.NONE  # default
+        if meta.get("animation_type"):
+            try:
+                animation_type = AnimationType(meta["animation_type"])
+            except ValueError:
+                pass
+
+        # Create scene with metadata values or placeholders
         scene = Scene(
             index=idx,
-            start_time=0.0,  # Placeholder
-            end_time=0.0,  # Placeholder
-            visual_prompt="(Recovered from files)",
-            mood="unknown",
-            effect=KenBurnsEffect.ZOOM_IN,
+            start_time=meta.get("start_time", 0.0),
+            end_time=meta.get("end_time", 0.0),
+            visual_prompt=meta.get("visual_prompt", "(Recovered from files)"),
+            mood=meta.get("mood", "unknown"),
+            effect=effect,
             image_path=img_path,
             words=[],
-            animated=has_animation,
+            animated=meta.get("animated", has_animation),
+            animation_type=animation_type,
+            motion_prompt=meta.get("motion_prompt"),
             video_path=animation_path if has_animation else None,
         )
         scenes.append(scene)

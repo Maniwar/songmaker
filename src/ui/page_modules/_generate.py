@@ -17,7 +17,7 @@ from src.services.lip_sync_animator import LipSyncAnimator, check_lip_sync_avail
 from src.services.prompt_animator import PromptAnimator, check_prompt_animator_available
 from src.services.veo_animator import VeoAnimator, check_veo_available
 from src.services.animation_chainer import PromptAnimationChainer, VeoAnimationChainer
-from src.ui.components.state import get_state, update_state, advance_step, go_to_step
+from src.ui.components.state import get_state, update_state, advance_step, go_to_step, save_scene_metadata
 from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word, AnimationType
 
 
@@ -1885,6 +1885,9 @@ def generate_images_from_prompts(state, is_demo_mode: bool) -> None:
             storyboard_ready=True,
         )
 
+        # Save scene metadata (prompts, effects, etc.) for recovery
+        save_scene_metadata(Path(project_dir), scenes)
+
         st.write(f"Generated {len(successful_images)}/{len(scenes)} images")
         status.update(label="Storyboard complete!", state="complete")
 
@@ -2345,6 +2348,10 @@ def generate_video_from_storyboard(state, crossfade: float, is_demo_mode: bool) 
         return
 
     project_dir = Path(project_dir)
+
+    # Save scene metadata before creating video (captures any user edits)
+    if state.scenes:
+        save_scene_metadata(project_dir, state.scenes)
 
     # Check if project directory exists, try to fix if not
     if not project_dir.exists():
