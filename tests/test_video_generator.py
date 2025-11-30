@@ -25,8 +25,8 @@ class TestVideoGenerator:
         assert "d=150" in filter_str
         # Should have correct resolution
         assert "s=1920x1080" in filter_str
-        # Zoom in should have increasing zoom
-        assert "zoom+0.001" in filter_str
+        # Zoom in should use smooth progress-based calculation (positive increment)
+        assert "+0.15*on/" in filter_str
 
     def test_ken_burns_filter_zoom_out(self, generator):
         filter_str = generator._get_ken_burns_filter(
@@ -37,8 +37,8 @@ class TestVideoGenerator:
         )
 
         assert "zoompan" in filter_str
-        # Zoom out should have decreasing zoom
-        assert "zoom-0.001" in filter_str
+        # Zoom out should use smooth progress-based calculation (negative decrement)
+        assert "-0.15*on/" in filter_str
 
     def test_ken_burns_filter_pan_left(self, generator):
         filter_str = generator._get_ken_burns_filter(

@@ -11,12 +11,44 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _get_default_whisper_device() -> str:
+    """Auto-detect the best device for WhisperX.
+
+    Priority:
+    1. WHISPER_DEVICE env var if set
+    2. MPS on Apple Silicon (macOS with M-series chips)
+    3. CUDA if available
+    4. CPU as fallback
+    """
+    env_device = os.getenv("WHISPER_DEVICE")
+    if env_device:
+        return env_device
+
+    # Try MPS (Apple Silicon)
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            return "mps"
+    except (ImportError, AttributeError):
+        pass
+
+    # Try CUDA
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except ImportError:
+        pass
+
+    return "cpu"
+
+
 @dataclass
 class WhisperConfig:
     """WhisperX configuration."""
 
     model: str = field(default_factory=lambda: os.getenv("WHISPER_MODEL", "large-v3"))
-    device: str = field(default_factory=lambda: os.getenv("WHISPER_DEVICE", "cpu"))
+    device: str = field(default_factory=_get_default_whisper_device)
     compute_type: str = field(
         default_factory=lambda: os.getenv("WHISPER_COMPUTE_TYPE", "float32")
     )
@@ -95,6 +127,18 @@ class Config:
     # Transcription backend: "whisperx" or "assemblyai"
     transcription_backend: str = field(
         default_factory=lambda: os.getenv("TRANSCRIPTION_BACKEND", "whisperx")
+    )
+
+    # Enable Demucs vocal separation for better music transcription
+    # Set to "true" to preprocess audio through Demucs before WhisperX
+    # Note: Only affects transcription, final video uses original audio
+    use_demucs: bool = field(
+        default_factory=lambda: os.getenv("USE_DEMUCS", "false").lower() == "true"
+    )
+
+    # Demucs model: "htdemucs" (default), "htdemucs_ft", "mdx", "mdx_extra"
+    demucs_model: str = field(
+        default_factory=lambda: os.getenv("DEMUCS_MODEL", "htdemucs")
     )
 
     # Sub-configurations

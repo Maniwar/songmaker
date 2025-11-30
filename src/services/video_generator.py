@@ -105,37 +105,60 @@ class VideoGenerator:
         duration: float,
         resolution: str,
         fps: int,
+        start_zoom: float = 1.0,
     ) -> str:
-        """Get FFmpeg zoompan filter for the specified Ken Burns effect."""
+        """Get FFmpeg zoompan filter for the specified Ken Burns effect.
+
+        Uses smooth progress-based calculations instead of per-frame increments
+        to eliminate judder. The zoom/pan is calculated as a function of
+        normalized progress (on/d) for smooth, consistent motion.
+
+        Args:
+            effect: The Ken Burns effect type
+            duration: Duration in seconds
+            resolution: Output resolution as "WIDTHxHEIGHT"
+            fps: Frames per second
+            start_zoom: Starting zoom level (default 1.0, use >1 to continue from zoomed)
+        """
         frames = int(duration * fps)
         width, height = resolution.split("x")
 
+        # Zoom range: 15% zoom over the duration for smooth, subtle motion
+        zoom_range = 0.15
+        end_zoom = start_zoom + zoom_range
+
         effects = {
-            KenBurnsEffect.ZOOM_IN: (           
-                f"zoompan=z='min(zoom+0.001,1.3)':"
+            # Smooth zoom in: linear interpolation from start_zoom to end_zoom
+            KenBurnsEffect.ZOOM_IN: (
+                f"zoompan=z='{start_zoom}+{zoom_range}*on/{frames}':"
                 f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
                 f"d={frames}:s={resolution}:fps={fps}"
             ),
+            # Smooth zoom out: linear interpolation from end_zoom to start_zoom
             KenBurnsEffect.ZOOM_OUT: (
-                f"zoompan=z='if(lte(zoom,1.0),1.3,max(1.001,zoom-0.001))':"
+                f"zoompan=z='{end_zoom}-{zoom_range}*on/{frames}':"
                 f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-                                                                 f"d={frames}:s={resolution}:fps={fps}"
+                f"d={frames}:s={resolution}:fps={fps}"
             ),
+            # Pan left with fixed zoom
             KenBurnsEffect.PAN_LEFT: (
                 f"zoompan=z='1.15':"
                 f"x='(iw-iw/zoom)*(1-on/{frames})':y='(ih-ih/zoom)/2':"
                 f"d={frames}:s={resolution}:fps={fps}"
             ),
+            # Pan right with fixed zoom
             KenBurnsEffect.PAN_RIGHT: (
                 f"zoompan=z='1.15':"
                 f"x='(iw-iw/zoom)*on/{frames}':y='(ih-ih/zoom)/2':"
                 f"d={frames}:s={resolution}:fps={fps}"
             ),
+            # Pan up with fixed zoom
             KenBurnsEffect.PAN_UP: (
                 f"zoompan=z='1.15':"
                 f"x='(iw-iw/zoom)/2':y='(ih-ih/zoom)*(1-on/{frames})':"
                 f"d={frames}:s={resolution}:fps={fps}"
             ),
+            # Pan down with fixed zoom
             KenBurnsEffect.PAN_DOWN: (
                 f"zoompan=z='1.15':"
                 f"x='(iw-iw/zoom)/2':y='(ih-ih/zoom)*on/{frames}':"
@@ -628,8 +651,13 @@ class VideoGenerator:
             subprocess.run(cmd, check=True, capture_output=True)
 
             if subtitle_path and subtitle_path.exists():
-                # Add subtitles (already time-shifted for scene start = 0)
-                self.add_subtitles(with_audio, subtitle_path, output_path, burn_in=True)
+                # For preview, we need to shift subtitle timing to start from 0
+                # Create a temporary shifted subtitle file
+                shifted_sub = temp_dir / "shifted.ass"
+                self._shift_subtitles(subtitle_path, shifted_sub, -start_time)
+
+                # Add subtitles
+                self.add_subtitles(with_audio, shifted_sub, output_path, burn_in=True)
             else:
                 import shutil
                 shutil.copy(with_audio, output_path)

@@ -8,6 +8,7 @@ whisperx>=3.1.0
 faster-whisper>=1.1.0
 pydub>=0.25.1
 assemblyai>=0.35.0
+demucs>=4.0.0  # Vocal separation for better music transcription
 
 # Video/Image Processing
 Pillow>=10.4.0

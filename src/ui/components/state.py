@@ -426,13 +426,18 @@ def recover_project(project_path: Path, audio_path: Optional[Path] = None) -> bo
         # Get metadata for this scene if available
         meta = scene_metadata.get(idx, {}) if scene_metadata else {}
 
-        # Parse effect from metadata
-        effect = KenBurnsEffect.ZOOM_IN  # default
+        # Parse effect from metadata, or cycle through effects for variety
+        effect = None
         if meta.get("effect"):
             try:
                 effect = KenBurnsEffect(meta["effect"])
             except ValueError:
                 pass
+
+        # If no effect from metadata (legacy project), cycle through effects based on index
+        if effect is None:
+            all_effects = list(KenBurnsEffect)
+            effect = all_effects[idx % len(all_effects)]
 
         # Parse animation_type from metadata
         animation_type = AnimationType.NONE  # default

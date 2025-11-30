@@ -3,6 +3,7 @@
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
 import streamlit as st
 from pydub import AudioSegment
@@ -132,10 +133,19 @@ def _resync_single_scene_lyrics(state, scene_index: int) -> None:
     update_state(scenes=state.scenes)
 
     # Clear cached lyrics text area values so they refresh with new words
+    # Two key conventions are used in the UI:
+    # - Prompt review uses loop index: key=f"lyrics_{i}" where i is list position
+    # - Storyboard cards use scene.index: key=f"card_lyrics_{scene.index}"
+    # We clear both to ensure consistency
+    scene = state.scenes[scene_index]
     lyrics_keys_to_clear = [
-        f"lyrics_{scene_index}",           # prompt review
-        f"card_lyrics_{scene_index}",      # storyboard card
+        f"lyrics_{scene_index}",           # prompt review (uses list position as loop index)
+        f"card_lyrics_{scene.index}",      # storyboard card (uses scene's internal index)
     ]
+    # Also clear using scene.index for prompt review if it differs from list position
+    if scene.index != scene_index:
+        lyrics_keys_to_clear.append(f"lyrics_{scene.index}")
+
     for key in lyrics_keys_to_clear:
         if key in st.session_state:
             del st.session_state[key]
@@ -157,9 +167,18 @@ def _resync_lyrics_to_scenes(state) -> None:
         _resync_single_scene_lyrics(state, i)
 
 
-def _redo_transcription(state) -> bool:
+def _redo_transcription(
+    state,
+    lyrics_hint: Optional[str] = None,
+    use_demucs: Optional[bool] = None,
+) -> bool:
     """
     Re-run WhisperX transcription on the audio file.
+
+    Args:
+        state: App state with audio path
+        lyrics_hint: Optional lyrics text to improve transcription accuracy
+        use_demucs: Whether to use Demucs vocal separation. If None, uses config default.
 
     Returns:
         True if transcription succeeded, False otherwise
@@ -186,6 +205,8 @@ def _redo_transcription(state) -> bool:
         transcript = processor.transcribe(
             audio_path,
             progress_callback=progress_callback,
+            lyrics_hint=lyrics_hint,
+            use_demucs=use_demucs,
         )
 
         # Update state with new transcript
@@ -210,7 +231,12 @@ def _redo_transcription(state) -> bool:
         processor.cleanup()
 
 
-def _redo_scene_transcription(state, scene_index: int) -> bool:
+def _redo_scene_transcription(
+    state,
+    scene_index: int,
+    lyrics_hint: Optional[str] = None,
+    use_demucs: Optional[bool] = None,
+) -> bool:
     """
     Re-run WhisperX transcription on just a single scene's audio clip.
 
@@ -220,6 +246,8 @@ def _redo_scene_transcription(state, scene_index: int) -> bool:
     Args:
         state: App state with audio path and scenes
         scene_index: Index of the scene to re-transcribe
+        lyrics_hint: Optional known lyrics to improve transcription accuracy
+        use_demucs: Whether to use Demucs vocal separation (None = use config default)
 
     Returns:
         True if transcription succeeded, False otherwise
@@ -267,6 +295,8 @@ def _redo_scene_transcription(state, scene_index: int) -> bool:
             transcript = processor.transcribe(
                 tmp_path,
                 progress_callback=progress_callback,
+                lyrics_hint=lyrics_hint,
+                use_demucs=use_demucs,
             )
 
             # Offset all word timestamps by the scene's start time
@@ -285,11 +315,20 @@ def _redo_scene_transcription(state, scene_index: int) -> bool:
             update_state(scenes=state.scenes)
 
             # Clear cached lyrics text area values so they refresh with new words
-            # These keys match the text_area keys in render_prompt_review and render_scene_card
+            # Multiple key conventions are used in the UI:
+            # - Prompt review uses loop index: key=f"lyrics_{i}" where i is list position
+            # - Storyboard cards use scene.index: key=f"card_lyrics_{scene.index}"
+            # - Scene transcription options use: key=f"scene_lyrics_hint_{scene.index}"
+            # We clear all to ensure consistency
             lyrics_keys_to_clear = [
-                f"lyrics_{scene_index}",           # prompt review
-                f"card_lyrics_{scene_index}",      # storyboard card
+                f"lyrics_{scene_index}",               # prompt review (uses list position)
+                f"card_lyrics_{scene.index}",          # storyboard card (uses scene's internal index)
+                f"scene_lyrics_hint_{scene.index}",    # scene transcription options hint
             ]
+            # Also clear using scene.index for prompt review if it differs from list position
+            if scene.index != scene_index:
+                lyrics_keys_to_clear.append(f"lyrics_{scene.index}")
+
             for key in lyrics_keys_to_clear:
                 if key in st.session_state:
                     del st.session_state[key]
@@ -1005,13 +1044,29 @@ def render_prompt_review(state, is_demo_mode: bool) -> None:
 
         st.markdown("---")
 
+    # Transcription options (in expander to save space)
+    with st.expander("Transcription Options", expanded=False):
+        lyrics_hint = st.text_area(
+            "Lyrics Hint (improves transcription accuracy):",
+            value=state.lyrics if hasattr(state, 'lyrics') and state.lyrics else "",
+            height=150,
+            key="lyrics_hint_input",
+            help="Providing the actual lyrics helps WhisperX recognize words more accurately, especially for music with instruments.",
+        )
+        use_demucs = st.checkbox(
+            "Use Demucs vocal separation",
+            value=config.use_demucs,
+            key="use_demucs_checkbox",
+            help="Separates vocals from music before transcription for better word recognition. Takes longer but improves accuracy for songs with heavy instrumentation.",
+        )
+
     # Action buttons
     col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
         if st.button("Redo Transcription", type="secondary", help="Re-run WhisperX to get new word timestamps"):
             with st.spinner("Re-transcribing audio..."):
-                if _redo_transcription(state):
+                if _redo_transcription(state, lyrics_hint=lyrics_hint if lyrics_hint else None, use_demucs=use_demucs):
                     st.success("Transcription updated! Lyrics re-synced.")
                     st.rerun()
 
@@ -1060,15 +1115,48 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
     scenes_with_images = sum(1 for s in state.scenes if s.image_path and Path(s.image_path).exists())
     missing_count = total_scenes - scenes_with_images
 
-    # Animation stats
-    scenes_marked_for_animation = sum(1 for s in state.scenes if getattr(s, 'animated', False))
+    # Animation stats - break down by type
+    from src.models.schemas import AnimationType
+
+    # Count scenes by animation type
+    scenes_by_type = {}
+    for anim_type in AnimationType:
+        if anim_type != AnimationType.NONE:
+            scenes_by_type[anim_type] = [
+                s for s in state.scenes
+                if getattr(s, 'animation_type', None) == anim_type
+            ]
+
+    # Also count legacy animated=True scenes without animation_type set
+    legacy_animated = [
+        s for s in state.scenes
+        if getattr(s, 'animated', False)
+        and getattr(s, 'animation_type', None) in (None, AnimationType.NONE)
+    ]
+
+    # Total marked for animation
+    scenes_marked_for_animation = sum(len(scenes) for scenes in scenes_by_type.values()) + len(legacy_animated)
+
+    # Count scenes that already have animations
     scenes_with_animation = sum(
         1 for s in state.scenes
-        if getattr(s, 'animated', False)
-        and getattr(s, 'video_path', None)
-        and Path(s.video_path).exists()
+        if getattr(s, 'animated', False) or getattr(s, 'animation_type', None) not in (None, AnimationType.NONE)
+        if getattr(s, 'video_path', None) and Path(s.video_path).exists()
     )
-    pending_animations = scenes_marked_for_animation - scenes_with_animation
+
+    # Pending by type (scenes marked but no video file yet)
+    pending_by_type = {}
+    for anim_type, scenes in scenes_by_type.items():
+        pending = [s for s in scenes if not (getattr(s, 'video_path', None) and Path(s.video_path).exists())]
+        if pending:
+            pending_by_type[anim_type] = len(pending)
+
+    # Legacy pending
+    legacy_pending = [s for s in legacy_animated if not (getattr(s, 'video_path', None) and Path(s.video_path).exists())]
+    if legacy_pending:
+        pending_by_type[AnimationType.LIP_SYNC] = pending_by_type.get(AnimationType.LIP_SYNC, 0) + len(legacy_pending)
+
+    pending_animations = sum(pending_by_type.values())
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -1104,41 +1192,77 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
 
     # Animation controls (if any scenes are marked for animation)
     if scenes_marked_for_animation > 0:
-        st.subheader("🎬 Lip Sync Animation")
-        if not check_lip_sync_available():
-            st.warning("Lip sync animation requires `gradio_client`. Install with: `pip install gradio_client`")
+        st.subheader("🎬 Scene Animations")
+
+        # Build info message based on pending animation types
+        if pending_animations > 0:
+            type_labels = {
+                AnimationType.LIP_SYNC: "Wan2.2-S2V (FREE)",
+                AnimationType.PROMPT: "Wan2.2-TI2V (FREE)",
+                AnimationType.ATLASCLOUD: "AtlasCloud (PAID)",
+                AnimationType.VEO: "Google Veo (PAID)",
+            }
+            pending_parts = []
+            for anim_type, count in pending_by_type.items():
+                label = type_labels.get(anim_type, anim_type.value)
+                pending_parts.append(f"{count}× {label}")
+
+            st.info(f"**{pending_animations} pending animation(s):** {', '.join(pending_parts)}")
         else:
-            st.info(
-                f"**{scenes_marked_for_animation} scene(s)** marked for animation using Wan2.2-S2V. "
-                "This cloud-based service is FREE and works on all platforms."
-            )
-            anim_col1, anim_col2, anim_col3 = st.columns([2, 1, 1])
-            with anim_col1:
-                resolution = st.selectbox(
-                    "Animation Resolution",
-                    options=["720P", "480P"],
-                    index=0,
-                    help="Higher resolution takes longer to generate",
-                    key="animation_resolution",
-                )
-            with anim_col2:
-                if pending_animations > 0:
-                    if st.button("🎬 Generate Animations", type="primary"):
-                        generate_animations(state, resolution, is_demo_mode)
-                else:
-                    st.success("All animations ready!")
-            with anim_col3:
-                if scenes_with_animation > 0:
-                    if st.button("🔄 Regenerate All Animations"):
-                        # Clear existing animations
-                        scenes = state.scenes
-                        for s in scenes:
-                            if getattr(s, 'animated', False):
-                                s.video_path = None
-                        update_state(scenes=scenes)
-                        generate_animations(state, resolution, is_demo_mode)
+            st.success(f"✓ All {scenes_marked_for_animation} animations ready!")
+
+        # Show Wan2.2 controls only if there are lip_sync or prompt type pending
+        wan_pending = pending_by_type.get(AnimationType.LIP_SYNC, 0) + pending_by_type.get(AnimationType.PROMPT, 0)
+        if wan_pending > 0:
+            if not check_lip_sync_available():
+                st.warning("Lip sync animation requires `gradio_client`. Install with: `pip install gradio_client`")
+            else:
+                anim_col1, anim_col2, anim_col3 = st.columns([2, 1, 1])
+                with anim_col1:
+                    resolution = st.selectbox(
+                        "Animation Resolution",
+                        options=["720P", "480P"],
+                        index=0,
+                        help="Higher resolution takes longer to generate",
+                        key="animation_resolution",
+                    )
+                with anim_col2:
+                    if wan_pending > 0:
+                        if st.button("🎬 Generate Wan2.2 Animations", type="primary"):
+                            generate_animations(state, resolution, is_demo_mode)
+                    else:
+                        st.success("Wan2.2 animations ready!")
+                with anim_col3:
+                    if scenes_with_animation > 0:
+                        if st.button("🔄 Regenerate Wan2.2 Animations"):
+                            # Clear existing animations for Wan2.2 types only
+                            scenes = state.scenes
+                            for s in scenes:
+                                anim_type = getattr(s, 'animation_type', None)
+                                if anim_type in (AnimationType.LIP_SYNC, AnimationType.PROMPT) or (
+                                    getattr(s, 'animated', False) and anim_type in (None, AnimationType.NONE)
+                                ):
+                                    s.video_path = None
+                            update_state(scenes=scenes)
+                            generate_animations(state, resolution, is_demo_mode)
 
         st.markdown("---")
+
+    # Transcription options (in expander to save space)
+    with st.expander("Transcription Options", expanded=False):
+        storyboard_lyrics_hint = st.text_area(
+            "Lyrics Hint (improves transcription accuracy):",
+            value=state.lyrics if hasattr(state, 'lyrics') and state.lyrics else "",
+            height=150,
+            key="storyboard_lyrics_hint_input",
+            help="Providing the actual lyrics helps WhisperX recognize words more accurately, especially for music with instruments.",
+        )
+        storyboard_use_demucs = st.checkbox(
+            "Use Demucs vocal separation",
+            value=config.use_demucs,
+            key="storyboard_use_demucs_checkbox",
+            help="Separates vocals from music before transcription for better word recognition. Takes longer but improves accuracy for songs with heavy instrumentation.",
+        )
 
     # Action buttons
     if missing_count > 0:
@@ -1152,7 +1276,7 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
         with col3:
             if st.button("Redo Transcription", type="secondary", help="Re-run WhisperX"):
                 with st.spinner("Re-transcribing audio..."):
-                    if _redo_transcription(state):
+                    if _redo_transcription(state, lyrics_hint=storyboard_lyrics_hint if storyboard_lyrics_hint else None, use_demucs=storyboard_use_demucs):
                         st.success("Transcription updated!")
                         st.rerun()
         with col4:
@@ -1176,7 +1300,7 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
         with col2:
             if st.button("Redo Transcription", type="secondary", help="Re-run WhisperX"):
                 with st.spinner("Re-transcribing audio..."):
-                    if _redo_transcription(state):
+                    if _redo_transcription(state, lyrics_hint=storyboard_lyrics_hint if storyboard_lyrics_hint else None, use_demucs=storyboard_use_demucs):
                         st.success("Transcription updated!")
                         st.rerun()
         with col3:
@@ -1399,7 +1523,24 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
 def render_scene_card(state, scene: Scene) -> None:
     """Render a single scene card with image and controls. Uses fragment for performance."""
     has_image = scene.image_path and Path(scene.image_path).exists()
-    has_animation = getattr(scene, 'video_path', None) and Path(scene.video_path).exists()
+
+    # Check for animation: first from scene.video_path, then check disk for existing file
+    animation_path = None
+    if getattr(scene, 'video_path', None) and Path(scene.video_path).exists():
+        animation_path = Path(scene.video_path)
+    elif has_image:
+        # Try to find animation based on scene index - derive project dir from image path
+        # Image is at: {project_dir}/images/scene_{idx:03d}.png
+        # Animation at: {project_dir}/animations/animated_scene_{idx:03d}.mp4
+        image_path = Path(scene.image_path)
+        project_dir = image_path.parent.parent  # Go up from images/ to project dir
+        expected_anim = project_dir / "animations" / f"animated_scene_{scene.index:03d}.mp4"
+        if expected_anim.exists():
+            animation_path = expected_anim
+            # Update the scene's video_path so it's available elsewhere
+            scene.video_path = expected_anim
+
+    has_animation = animation_path is not None
 
     # Scene header with status indicator
     status_icons = ""
@@ -1416,7 +1557,7 @@ def render_scene_card(state, scene: Scene) -> None:
 
     # Image or animation preview
     if has_animation:
-        st.video(str(scene.video_path))
+        st.video(str(animation_path))
     elif has_image:
         st.image(str(scene.image_path), use_container_width=True)
     else:
@@ -1643,12 +1784,33 @@ def render_scene_card(state, scene: Scene) -> None:
         # Editable lyrics - fix transcription errors OR add missing lyrics
         current_lyrics = " ".join(w.word for w in scene.words) if scene.words else ""
 
+        # Transcription options (in expander to save space)
+        with st.expander("Transcription Options", expanded=False):
+            scene_lyrics_hint = st.text_area(
+                "Lyrics Hint (improves accuracy):",
+                value=current_lyrics,
+                height=80,
+                key=f"scene_lyrics_hint_{scene.index}",
+                help="Provide the expected lyrics for this scene to help WhisperX recognize words more accurately.",
+            )
+            scene_use_demucs = st.checkbox(
+                "Use Demucs vocal separation",
+                value=config.use_demucs,
+                key=f"scene_use_demucs_{scene.index}",
+                help="Separates vocals from music before transcription. Takes longer but improves accuracy.",
+            )
+
         # Transcription buttons for this scene
         trans_col1, trans_col2 = st.columns(2)
         with trans_col1:
             if st.button("Redo Transcription", key=f"redo_trans_{scene.index}", type="secondary", help="Re-transcribe just this scene's audio"):
                 with st.spinner("Transcribing scene audio..."):
-                    if _redo_scene_transcription(state, scene.index):
+                    if _redo_scene_transcription(
+                        state,
+                        scene.index,
+                        lyrics_hint=scene_lyrics_hint if scene_lyrics_hint.strip() else None,
+                        use_demucs=scene_use_demucs,
+                    ):
                         st.success("Scene transcribed!")
                         st.rerun()
         with trans_col2:

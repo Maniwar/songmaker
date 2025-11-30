@@ -1,6 +1,8 @@
 """Audio processing service with support for multiple transcription backends."""
 
 import gc
+import logging
+import tempfile
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
@@ -9,6 +11,7 @@ from pydub import AudioSegment
 from src.config import Config, config as default_config
 from src.models.schemas import Word, Segment, Transcript
 
+logger = logging.getLogger(__name__)
 
 TranscriptionBackend = Literal["whisperx", "assemblyai"]
 
@@ -114,6 +117,7 @@ class AudioProcessor:
         backend: Optional[TranscriptionBackend] = None,
         lyrics_hint: Optional[str] = None,
         language: Optional[str] = None,
+        use_demucs: Optional[bool] = None,
     ) -> Transcript:
         """
         Transcribe audio file with word-level timestamps.
@@ -126,6 +130,10 @@ class AudioProcessor:
                          For music, this dramatically improves recognition.
             language: Optional language code (e.g., 'en' for English).
                       If not provided, will be auto-detected.
+            use_demucs: Whether to use Demucs vocal separation before transcription.
+                       If None, uses config.use_demucs. Only applies to WhisperX backend.
+                       NOTE: The separated vocals are only for transcription; final video
+                       uses the original audio.
 
         Returns:
             Transcript with word-level timestamps
@@ -136,7 +144,7 @@ class AudioProcessor:
             return self._transcribe_assemblyai(audio_path, progress_callback)
         else:
             return self._transcribe_whisperx(
-                audio_path, progress_callback, lyrics_hint, language
+                audio_path, progress_callback, lyrics_hint, language, use_demucs
             )
 
     def _transcribe_whisperx(
@@ -145,6 +153,7 @@ class AudioProcessor:
         progress_callback: Optional[Callable[[str, float], None]] = None,
         lyrics_hint: Optional[str] = None,
         language: Optional[str] = None,
+        use_demucs: Optional[bool] = None,
     ) -> Transcript:
         """Transcribe using WhisperX (local processing).
 
@@ -154,106 +163,172 @@ class AudioProcessor:
             lyrics_hint: Known lyrics to improve transcription accuracy.
                         Passed to WhisperX via asr_options when loading the model.
             language: Language code (e.g., 'en'). If None, auto-detected.
+            use_demucs: Whether to use Demucs vocal separation. If None, uses config.
         """
+        import os
         import re
+        import shutil
         import whisperx
 
-        if progress_callback:
-            if lyrics_hint:
-                progress_callback("Loading WhisperX with lyrics hint...", 0.1)
+        # Determine whether to use Demucs preprocessing
+        should_use_demucs = use_demucs if use_demucs is not None else self.config.use_demucs
+        vocals_path: Optional[Path] = None
+        temp_dir: Optional[Path] = None
+
+        # If Demucs is enabled, separate vocals first
+        if should_use_demucs:
+            if progress_callback:
+                progress_callback("Separating vocals with Demucs (for better transcription)...", 0.05)
+
+            from src.services.demucs_separator import (
+                check_demucs_available,
+                separate_vocals_for_transcription,
+            )
+
+            if check_demucs_available():
+                temp_dir = Path(tempfile.mkdtemp(prefix="demucs_transcription_"))
+
+                def demucs_progress(msg: str, prog: float):
+                    # Map Demucs progress (0-1) to our progress range (0.05-0.25)
+                    if progress_callback:
+                        mapped_prog = 0.05 + (prog * 0.20)
+                        progress_callback(f"Demucs: {msg}", mapped_prog)
+
+                vocals_path = separate_vocals_for_transcription(
+                    audio_path=audio_path,
+                    output_dir=temp_dir,
+                    model_name=self.config.demucs_model,
+                    progress_callback=demucs_progress,
+                )
+
+                if vocals_path and vocals_path.exists():
+                    logger.info(f"Using separated vocals for transcription: {vocals_path}")
+                else:
+                    logger.warning("Demucs vocal separation failed, using original audio")
+                    vocals_path = None
             else:
-                progress_callback("Loading WhisperX models...", 0.1)
+                logger.warning(
+                    "Demucs not installed but USE_DEMUCS=true. "
+                    "Install with: pip install demucs"
+                )
 
-        # Clean up lyrics for use as initial prompt
-        clean_lyrics = None
-        if lyrics_hint:
-            # Remove section markers like [Verse], [Chorus], etc.
-            clean_lyrics = re.sub(r'\[.*?\]', '', lyrics_hint)
-            clean_lyrics = ' '.join(clean_lyrics.split())  # Normalize whitespace
-            # Log that we're using lyrics hint
-            print(f"[WhisperX] Using lyrics hint ({len(clean_lyrics)} chars): {clean_lyrics[:100]}...")
+        # Use separated vocals for transcription if available, otherwise original
+        transcription_audio_path = vocals_path if vocals_path else audio_path
 
-        # Load model with lyrics hint (passed via asr_options)
-        self._load_whisperx_models(initial_prompt=clean_lyrics, language=language)
+        try:
+            if progress_callback:
+                base_progress = 0.25 if should_use_demucs else 0.1
+                if lyrics_hint:
+                    progress_callback("Loading WhisperX with lyrics hint...", base_progress)
+                else:
+                    progress_callback("Loading WhisperX models...", base_progress)
 
-        if progress_callback:
-            progress_callback("Loading audio file...", 0.2)
-
-        # Load audio
-        audio = whisperx.load_audio(str(audio_path))
-        duration = self.get_audio_duration(audio_path)
-
-        if progress_callback:
+            # Clean up lyrics for use as initial prompt
+            clean_lyrics = None
             if lyrics_hint:
-                progress_callback("Transcribing audio with lyrics hint...", 0.3)
-            else:
-                progress_callback("Transcribing audio...", 0.3)
+                # Remove section markers like [Verse], [Chorus], etc.
+                clean_lyrics = re.sub(r'\[.*?\]', '', lyrics_hint)
+                clean_lyrics = ' '.join(clean_lyrics.split())  # Normalize whitespace
+                # Log that we're using lyrics hint
+                print(f"[WhisperX] Using lyrics hint ({len(clean_lyrics)} chars): {clean_lyrics[:100]}...")
 
-        # Build transcribe options (language passed at model load time)
-        transcribe_options = {
-            "batch_size": self.config.whisper.batch_size,
-        }
+            # Load model with lyrics hint (passed via asr_options)
+            self._load_whisperx_models(initial_prompt=clean_lyrics, language=language)
 
-        # Transcribe
-        result = self._model.transcribe(audio, **transcribe_options)
+            if progress_callback:
+                progress_callback("Loading audio file...", 0.3 if should_use_demucs else 0.2)
 
-        detected_language = language or result.get("language", "en")
+            # Load audio for transcription (use separated vocals if available)
+            # But ALWAYS use original audio_path for duration (final video uses original audio)
+            audio = whisperx.load_audio(str(transcription_audio_path))
+            duration = self.get_audio_duration(audio_path)  # Use original for duration
 
-        if progress_callback:
-            progress_callback("Loading alignment model...", 0.5)
+            if progress_callback:
+                progress_msg = "Transcribing "
+                if vocals_path:
+                    progress_msg += "separated vocals"
+                else:
+                    progress_msg += "audio"
+                if lyrics_hint:
+                    progress_msg += " with lyrics hint..."
+                else:
+                    progress_msg += "..."
+                progress_callback(progress_msg, 0.4 if should_use_demucs else 0.3)
 
-        # Load alignment model
-        self._load_align_model(detected_language)
+            # Build transcribe options (language passed at model load time)
+            transcribe_options = {
+                "batch_size": self.config.whisper.batch_size,
+            }
 
-        if progress_callback:
-            progress_callback("Aligning words to audio...", 0.7)
+            # Transcribe
+            result = self._model.transcribe(audio, **transcribe_options)
 
-        # Align for word-level timestamps
-        result = whisperx.align(
-            result["segments"],
-            self._align_model,
-            self._align_metadata,
-            audio,
-            self.config.whisper.device,
-            return_char_alignments=False,
-        )
+            detected_language = language or result.get("language", "en")
 
-        if progress_callback:
-            progress_callback("Processing results...", 0.9)
+            if progress_callback:
+                progress_callback("Loading alignment model...", 0.6 if should_use_demucs else 0.5)
 
-        # Convert to our models
-        segments = []
-        for seg in result["segments"]:
-            words = []
-            for word_data in seg.get("words", []):
-                # Skip words without timing (can happen with alignment issues)
-                if "start" not in word_data or "end" not in word_data:
-                    continue
-                words.append(
-                    Word(
-                        word=word_data["word"],
-                        start=word_data["start"],
-                        end=word_data["end"],
+            # Load alignment model
+            self._load_align_model(detected_language)
+
+            if progress_callback:
+                progress_callback("Aligning words to audio...", 0.75 if should_use_demucs else 0.7)
+
+            # Align for word-level timestamps
+            result = whisperx.align(
+                result["segments"],
+                self._align_model,
+                self._align_metadata,
+                audio,
+                self.config.whisper.device,
+                return_char_alignments=False,
+            )
+
+            if progress_callback:
+                progress_callback("Processing results...", 0.9)
+
+            # Convert to our models
+            segments = []
+            for seg in result["segments"]:
+                words = []
+                for word_data in seg.get("words", []):
+                    # Skip words without timing (can happen with alignment issues)
+                    if "start" not in word_data or "end" not in word_data:
+                        continue
+                    words.append(
+                        Word(
+                            word=word_data["word"],
+                            start=word_data["start"],
+                            end=word_data["end"],
+                        )
+                    )
+
+                segments.append(
+                    Segment(
+                        text=seg["text"].strip(),
+                        start=seg["start"],
+                        end=seg["end"],
+                        words=words,
                     )
                 )
 
-            segments.append(
-                Segment(
-                    text=seg["text"].strip(),
-                    start=seg["start"],
-                    end=seg["end"],
-                    words=words,
-                )
+            if progress_callback:
+                progress_callback("Transcription complete!", 1.0)
+
+            return Transcript(
+                segments=segments,
+                language=detected_language,
+                duration=duration,
             )
 
-        if progress_callback:
-            progress_callback("Transcription complete!", 1.0)
-
-        return Transcript(
-            segments=segments,
-            language=detected_language,
-            duration=duration,
-        )
+        finally:
+            # Clean up Demucs temp files
+            if temp_dir and temp_dir.exists():
+                try:
+                    shutil.rmtree(temp_dir)
+                    logger.debug(f"Cleaned up Demucs temp directory: {temp_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temp directory {temp_dir}: {e}")
 
     def _transcribe_assemblyai(
         self,
@@ -293,6 +368,7 @@ def transcribe_audio(
     backend: Optional[TranscriptionBackend] = None,
     lyrics_hint: Optional[str] = None,
     language: Optional[str] = None,
+    use_demucs: Optional[bool] = None,
 ) -> Transcript:
     """
     Convenience function to transcribe audio.
@@ -305,6 +381,10 @@ def transcribe_audio(
         lyrics_hint: Known lyrics to improve transcription accuracy.
                     Dramatically helps with music where vocals are mixed with instruments.
         language: Language code (e.g., 'en'). If None, auto-detected.
+        use_demucs: Whether to use Demucs vocal separation before transcription.
+                   If None, uses config.use_demucs. Only applies to WhisperX backend.
+                   NOTE: Separated vocals are only for transcription; final video
+                   uses the original audio.
 
     Returns:
         Transcript with word-level timestamps
@@ -316,6 +396,7 @@ def transcribe_audio(
             progress_callback,
             lyrics_hint=lyrics_hint,
             language=language,
+            use_demucs=use_demucs,
         )
     finally:
         processor.cleanup()
