@@ -1412,9 +1412,8 @@ def render_scene_card(state, scene: Scene) -> None:
     if has_image:
         # Get current animation type
         current_anim_type = getattr(scene, 'animation_type', AnimationType.NONE)
-        # Handle legacy 'animated' field - convert to animation_type
-        if current_anim_type == AnimationType.NONE and getattr(scene, 'animated', False):
-            current_anim_type = AnimationType.LIP_SYNC
+        # Note: Legacy 'animated' field is no longer auto-converted to LIP_SYNC.
+        # Animation type is now persisted in scenes.json metadata.
 
         anim_options = {
             "Static": AnimationType.NONE,
