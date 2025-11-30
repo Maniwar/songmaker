@@ -1489,11 +1489,13 @@ def render_scene_card(state, scene: Scene) -> None:
         st.markdown("**Scene Timing**")
         timing_cols = st.columns(2)
         with timing_cols[0]:
+            # Ensure max_value is at least 0.0 (handles very short scenes)
+            start_max = max(0.0, scene.end_time - 0.5)
             new_start_time = st.number_input(
                 "Start (seconds)",
                 min_value=0.0,
-                max_value=scene.end_time - 0.5,
-                value=scene.start_time,
+                max_value=start_max,
+                value=min(scene.start_time, start_max),
                 step=0.1,
                 key=f"timing_start_{scene.index}",
                 help="Adjust when this scene starts in the song"
