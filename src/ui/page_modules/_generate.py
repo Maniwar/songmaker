@@ -1326,6 +1326,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
                 prompt=motion_prompt,
                 output_path=output_path,
                 duration_seconds=min(scene.duration, 5.0),  # TI2V-5B supports 2-5 seconds
+                quality_preset="fast",  # 320x576, 8 steps - stays within free tier GPU limits
                 progress_callback=progress_callback,
             )
         elif animation_type == AnimationType.VEO:
