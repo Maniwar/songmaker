@@ -358,6 +358,40 @@ class VideoGenerator:
         except ValueError:
             return 0.0
 
+    def _extract_last_frame(self, video_path: Path, output_path: Path) -> bool:
+        """Extract the last frame of a video as an image.
+
+        Args:
+            video_path: Path to the video file
+            output_path: Path to save the extracted frame (PNG format)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Get video duration
+            duration = self._get_media_duration(video_path)
+            if duration <= 0:
+                return False
+
+            # Seek to near the end (0.1s before end) and extract one frame
+            seek_time = max(0, duration - 0.1)
+
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-ss", str(seek_time),
+                "-i", str(video_path),
+                "-vframes", "1",
+                "-q:v", "2",  # High quality
+                str(output_path),
+            ]
+
+            subprocess.run(cmd, check=True, capture_output=True)
+            return output_path.exists()
+        except subprocess.CalledProcessError:
+            return False
+
     def add_audio(
         self,
         video_path: Path,
@@ -758,6 +792,7 @@ class VideoGenerator:
         fps: Optional[int] = None,
         crossfade_pad: float = 0.0,
         strict_duration: bool = True,
+        effect: Optional[KenBurnsEffect] = None,
     ) -> Path:
         """
         Prepare an animated clip to match target resolution, fps, and duration.
@@ -765,6 +800,9 @@ class VideoGenerator:
         IMPORTANT: For lip-synced animations, we NEVER adjust playback speed
         because the lip movements are baked in to match the original audio timing.
         We only scale resolution and trim/pad to fit the target duration.
+
+        If the video is shorter than the target duration and an effect is provided,
+        we extend with Ken Burns animation on the last frame instead of freezing.
 
         Args:
             video_path: Path to the animated video clip
@@ -775,6 +813,8 @@ class VideoGenerator:
             crossfade_pad: Duration to pad at START with first frame (for crossfade sync)
             strict_duration: If True (lip sync), pad even small gaps to maintain audio sync.
                            If False (prompt/veo), only pad large gaps (>0.5s).
+            effect: Optional Ken Burns effect to use when extending short videos.
+                   If None, falls back to freeze frame extension.
 
         Returns:
             Path to the prepared clip
@@ -783,7 +823,7 @@ class VideoGenerator:
             res_str = f"{resolution[0]}x{resolution[1]}"
         else:
             res_str = self.config.video.resolution
-        fps = fps or self.config.video.fps
+        fps_val = fps or self.config.video.fps
 
         width, height = res_str.split("x")
 
@@ -792,6 +832,24 @@ class VideoGenerator:
 
         encoder_args = self._get_encoder_args(quality="fast")
 
+        # Check if we need to extend the video
+        needs_extension = current_duration > 0 and current_duration < target_duration - 0.05
+        pad_duration = target_duration - current_duration if needs_extension else 0
+
+        # If we need to extend and have a Ken Burns effect, use that instead of freeze frame
+        if needs_extension and effect is not None and pad_duration > 0.1:
+            logger.info(f"Video {pad_duration:.1f}s short, extending with Ken Burns effect")
+            return self._extend_with_ken_burns(
+                video_path=video_path,
+                target_duration=target_duration,
+                output_path=output_path,
+                resolution=(int(width), int(height)),
+                fps=fps_val,
+                effect=effect,
+                crossfade_pad=crossfade_pad,
+            )
+
+        # Standard processing (no Ken Burns extension needed)
         # Build filter string with proper ordering for lip sync:
         # 1. First apply start padding (BEFORE any other processing) so timing is correct
         # 2. Then scale and letterbox
@@ -811,19 +869,13 @@ class VideoGenerator:
         filter_parts.append(f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
 
         # Normalize fps (AFTER tpad to preserve timing)
-        filter_parts.append(f"fps={fps}")
+        filter_parts.append(f"fps={fps_val}")
 
-        # If video is shorter than target, pad with last frame (fallback only)
+        # If video is shorter than target and no Ken Burns effect, pad with last frame
         # If video is longer, it will be trimmed by -t parameter
         # Account for crossfade pad in the total duration
-        # NOTE: We request duration+1s from APIs for prompt/veo, so padding should be rare.
-        # CRITICAL: ALL scenes must have exact duration to maintain audio sync!
-        # Even prompt/veo scenes - if they're short, it causes cumulative timing drift
-        # that throws off ALL subsequent lip sync scenes. Always pad to exact duration.
         effective_target = target_duration + crossfade_pad
-        # Always use tight tolerance - any shortness causes timing drift
-        if current_duration > 0 and current_duration < target_duration - 0.05:
-            pad_duration = target_duration - current_duration
+        if needs_extension:
             logger.warning(f"Video {pad_duration:.1f}s short, padding with freeze frame")
             filter_parts.append(f"tpad=stop_duration={pad_duration}:stop_mode=clone")
 
@@ -845,6 +897,125 @@ class VideoGenerator:
             str(effective_target),
             str(output_path),
         ])
+
+        subprocess.run(cmd, check=True, capture_output=True)
+        return output_path
+
+    def _extend_with_ken_burns(
+        self,
+        video_path: Path,
+        target_duration: float,
+        output_path: Path,
+        resolution: tuple[int, int],
+        fps: int,
+        effect: KenBurnsEffect,
+        crossfade_pad: float = 0.0,
+    ) -> Path:
+        """
+        Extend a short video by adding Ken Burns animation on the last frame.
+
+        This creates a more visually interesting extension than freezing the last frame.
+
+        Args:
+            video_path: Path to the short video
+            target_duration: Target total duration
+            output_path: Path for the output video
+            resolution: (width, height) tuple
+            fps: Frames per second
+            effect: Ken Burns effect to apply to the extension
+            crossfade_pad: Duration to pad at START (for crossfade sync)
+
+        Returns:
+            Path to the extended video
+        """
+        current_duration = self._get_media_duration(video_path)
+        extension_duration = target_duration - current_duration
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir = Path(temp_dir)
+
+            # Step 1: Extract the last frame
+            last_frame_path = temp_dir / "last_frame.png"
+            if not self._extract_last_frame(video_path, last_frame_path):
+                # Fall back to freeze frame if extraction fails
+                logger.warning("Failed to extract last frame, falling back to freeze")
+                return self._prepare_with_freeze(
+                    video_path, target_duration, output_path, resolution, fps, crossfade_pad
+                )
+
+            # Step 2: Create Ken Burns extension clip from the last frame
+            extension_clip_path = temp_dir / "extension.mp4"
+            res_str = f"{resolution[0]}x{resolution[1]}"
+            self.create_scene_clip(
+                image_path=last_frame_path,
+                duration=extension_duration,
+                effect=effect,
+                output_path=extension_clip_path,
+                resolution=resolution,
+                fps=fps,
+            )
+
+            # Step 3: Prepare the original video (scale, fps, trim to actual duration)
+            prepared_video_path = temp_dir / "prepared.mp4"
+            filter_parts = []
+            if crossfade_pad > 0:
+                filter_parts.append(f"tpad=start_duration={crossfade_pad}:start_mode=clone")
+            filter_parts.append(f"scale={resolution[0]}:{resolution[1]}:force_original_aspect_ratio=decrease")
+            filter_parts.append(f"pad={resolution[0]}:{resolution[1]}:(ow-iw)/2:(oh-ih)/2")
+            filter_parts.append(f"fps={fps}")
+            filter_str = ",".join(filter_parts)
+
+            encoder_args = self._get_encoder_args(quality="fast")
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(video_path),
+                "-vf", filter_str,
+                "-t", str(current_duration + crossfade_pad),
+                "-an",
+            ]
+            cmd.extend(encoder_args)
+            cmd.append(str(prepared_video_path))
+            subprocess.run(cmd, check=True, capture_output=True)
+
+            # Step 4: Concatenate the prepared video with the Ken Burns extension
+            self._concatenate_simple([prepared_video_path, extension_clip_path], output_path)
+
+            logger.info(f"Extended video with {extension_duration:.1f}s Ken Burns animation")
+            return output_path
+
+    def _prepare_with_freeze(
+        self,
+        video_path: Path,
+        target_duration: float,
+        output_path: Path,
+        resolution: tuple[int, int],
+        fps: int,
+        crossfade_pad: float = 0.0,
+    ) -> Path:
+        """Fallback method: prepare video with freeze frame extension."""
+        current_duration = self._get_media_duration(video_path)
+        pad_duration = target_duration - current_duration
+
+        filter_parts = []
+        if crossfade_pad > 0:
+            filter_parts.append(f"tpad=start_duration={crossfade_pad}:start_mode=clone")
+        filter_parts.append(f"scale={resolution[0]}:{resolution[1]}:force_original_aspect_ratio=decrease")
+        filter_parts.append(f"pad={resolution[0]}:{resolution[1]}:(ow-iw)/2:(oh-ih)/2")
+        filter_parts.append(f"fps={fps}")
+        if pad_duration > 0:
+            filter_parts.append(f"tpad=stop_duration={pad_duration}:stop_mode=clone")
+        filter_str = ",".join(filter_parts)
+
+        encoder_args = self._get_encoder_args(quality="fast")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-vf", filter_str,
+            "-t", str(target_duration + crossfade_pad),
+            "-an",
+        ]
+        cmd.extend(encoder_args)
+        cmd.append(str(output_path))
 
         subprocess.run(cmd, check=True, capture_output=True)
         return output_path
@@ -919,8 +1090,11 @@ class VideoGenerator:
                     # Use the pre-generated animated video clip
                     # No crossfade padding needed since we disable crossfade for animated videos
                     # Lip sync needs strict duration (exact timing with audio)
-                    # Prompt/VEO can have loose tolerance (no audio sync dependency)
+                    # Prompt/VEO can use Ken Burns to extend short videos
                     is_lip_sync = getattr(scene, 'animation_type', None) == AnimationType.LIP_SYNC
+                    # Only use Ken Burns extension for non-lip-sync animations
+                    # Lip-sync must freeze frame to maintain audio timing
+                    extend_effect = None if is_lip_sync else scene.effect
                     self.prepare_animated_clip(
                         video_path=Path(scene.video_path),
                         target_duration=scene.duration,
@@ -928,6 +1102,7 @@ class VideoGenerator:
                         resolution=resolution,
                         fps=fps,
                         strict_duration=is_lip_sync,
+                        effect=extend_effect,
                     )
                 elif scene.image_path is not None:
                     # Create Ken Burns clip from static image
@@ -1045,8 +1220,11 @@ class VideoGenerator:
                     # Use the pre-generated animated video clip
                     # No crossfade padding needed since we disable crossfade for animated videos
                     # Lip sync needs strict duration (exact timing with audio)
-                    # Prompt/VEO can have loose tolerance (no audio sync dependency)
+                    # Prompt/VEO can use Ken Burns to extend short videos
                     is_lip_sync = getattr(scene, 'animation_type', None) == AnimationType.LIP_SYNC
+                    # Only use Ken Burns extension for non-lip-sync animations
+                    # Lip-sync must freeze frame to maintain audio timing
+                    extend_effect = None if is_lip_sync else scene.effect
                     self.prepare_animated_clip(
                         video_path=Path(scene.video_path),
                         target_duration=scene.duration,
@@ -1054,6 +1232,7 @@ class VideoGenerator:
                         resolution=resolution,
                         fps=fps,
                         strict_duration=is_lip_sync,
+                        effect=extend_effect,
                     )
                 elif scene.image_path is not None:
                     # Create Ken Burns clip from static image

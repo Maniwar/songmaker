@@ -2037,6 +2037,7 @@ def generate_single_animation(state, scene_index: int, resolution: str = "720P")
 
             if result and result.exists():
                 scenes[scene_index].video_path = result
+                scenes[scene_index].animated = True  # Mark as animated so UI shows video
                 update_state(scenes=scenes)
                 status.update(label=f"Scene {scene_index + 1} re-animated!", state="complete")
             else:
@@ -2198,8 +2199,10 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                     )
 
                 if result and result.exists():
-                    # Update scene with video path
-                    scenes[scene.index].video_path = result
+                    # Update scene with video path directly on the scene object
+                    # (scene is a reference to the object in scenes list)
+                    scene.video_path = result
+                    scene.animated = True  # Mark as animated so UI shows video
                     success_count += 1
                     st.write(f"✅ Scene {scene.index + 1} animated successfully")
                 else:
