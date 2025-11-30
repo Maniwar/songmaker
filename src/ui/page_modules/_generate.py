@@ -16,6 +16,7 @@ from src.services.subtitle_generator import SubtitleGenerator
 from src.services.lip_sync_animator import LipSyncAnimator, check_lip_sync_available
 from src.services.prompt_animator import PromptAnimator, check_prompt_animator_available
 from src.services.veo_animator import VeoAnimator, check_veo_available
+from src.services.atlascloud_animator import AtlasCloudAnimator, check_atlascloud_available
 from src.services.animation_chainer import PromptAnimationChainer, VeoAnimationChainer
 from src.ui.components.state import get_state, update_state, advance_step, go_to_step, save_scene_metadata
 from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word, AnimationType
@@ -1285,6 +1286,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
         AnimationType.LIP_SYNC: "lip sync",
         AnimationType.PROMPT: "prompt",
         AnimationType.VEO: "Veo 3.1 (PAID)",
+        AnimationType.ATLASCLOUD: "AtlasCloud (PAID)",
     }
     anim_type_label = anim_type_labels.get(animation_type, "animation")
     status_placeholder.info(f"Animating ({anim_type_label}) at {resolution}...")
@@ -1338,6 +1340,18 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
                 prompt=motion_prompt,
                 output_path=output_path,
                 duration_seconds=scene.duration,  # Veo supports 4, 6, or 8 seconds
+                resolution="720p",  # Can be 720p or 1080p
+                progress_callback=progress_callback,
+            )
+        elif animation_type == AnimationType.ATLASCLOUD:
+            # Use AtlasCloudAnimator for Wan 2.5 animation (PAID, no GPU limits)
+            animator = AtlasCloudAnimator()
+            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=5 if scene.duration < 7.5 else 10,  # AtlasCloud supports 5 or 10 seconds
                 resolution="720p",  # Can be 720p or 1080p
                 progress_callback=progress_callback,
             )
@@ -1420,6 +1434,7 @@ def render_scene_card(state, scene: Scene) -> None:
             "Lip Sync": AnimationType.LIP_SYNC,
             "Prompt": AnimationType.PROMPT,
             "Veo 3.1 (PAID)": AnimationType.VEO,
+            "AtlasCloud (PAID)": AnimationType.ATLASCLOUD,
         }
         anim_labels = list(anim_options.keys())
         current_idx = list(anim_options.values()).index(current_anim_type) if current_anim_type in anim_options.values() else 0
@@ -1434,8 +1449,8 @@ def render_scene_card(state, scene: Scene) -> None:
         )
         new_anim_type = anim_options[selected_anim_label]
 
-        # Show motion prompt input if prompt-based animation is selected (Prompt or Veo)
-        if new_anim_type in (AnimationType.PROMPT, AnimationType.VEO):
+        # Show motion prompt input if prompt-based animation is selected (Prompt, Veo, or AtlasCloud)
+        if new_anim_type in (AnimationType.PROMPT, AnimationType.VEO, AnimationType.ATLASCLOUD):
             widget_key = f"motion_prompt_{scene.index}"
             ai_result_key = f"_ai_motion_result_{scene.index}"
             scene_motion_prompt = getattr(scene, 'motion_prompt', None)
@@ -1512,6 +1527,7 @@ def render_scene_card(state, scene: Scene) -> None:
                     AnimationType.LIP_SYNC: "Lip Sync",
                     AnimationType.PROMPT: "Prompt",
                     AnimationType.VEO: "Veo 3.1",
+                    AnimationType.ATLASCLOUD: "AtlasCloud",
                 }
                 anim_type_name = anim_type_names.get(new_anim_type, "Animation")
                 if st.button(button_label, key=f"animate_{scene.index}", help=f"Generate {anim_type_name} animation"):
@@ -2125,6 +2141,7 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
     lip_sync_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.LIP_SYNC)
     prompt_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.PROMPT)
     veo_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.VEO)
+    atlascloud_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.ATLASCLOUD)
 
     status_label = f"Generating {len(pending_scenes)} animations"
     type_parts = []
@@ -2134,6 +2151,8 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
         type_parts.append(f"{prompt_count} prompt")
     if veo_count > 0:
         type_parts.append(f"{veo_count} Veo")
+    if atlascloud_count > 0:
+        type_parts.append(f"{atlascloud_count} AtlasCloud")
     if type_parts:
         status_label += f" ({', '.join(type_parts)})"
 
@@ -2144,6 +2163,7 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
         lip_sync_animator = None
         prompt_animator = None
         veo_animator = None
+        atlascloud_animator = None
 
         progress_bar = st.progress(0.0, text="Starting animations...")
         last_error_msg = None  # Track last error message for display
@@ -2155,6 +2175,7 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                 AnimationType.LIP_SYNC: "lip-sync",
                 AnimationType.PROMPT: "prompt",
                 AnimationType.VEO: "Veo",
+                AnimationType.ATLASCLOUD: "AtlasCloud",
             }
             anim_type_name = anim_type_names.get(anim_type, "unknown")
 
@@ -2236,6 +2257,23 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                         output_path=output_path,
                         duration_seconds=scene.duration,  # Request exact duration
                         resolution="720p",  # Default to 720p for speed
+                        progress_callback=progress_callback,
+                    )
+
+                elif anim_type == AnimationType.ATLASCLOUD:
+                    if atlascloud_animator is None:
+                        st.write("Using AtlasCloud Wan 2.5 (PAID, no GPU limits)")
+                        atlascloud_animator = AtlasCloudAnimator()
+
+                    motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+
+                    # AtlasCloud supports 5 or 10 second durations
+                    result = atlascloud_animator.animate_scene(
+                        image_path=Path(scene.image_path),
+                        prompt=motion_prompt,
+                        output_path=output_path,
+                        duration_seconds=5 if scene.duration < 7.5 else 10,
+                        resolution="720p",
                         progress_callback=progress_callback,
                     )
 

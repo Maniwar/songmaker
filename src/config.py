@@ -80,6 +80,9 @@ class Config:
     fal_api_key: str = field(
         default_factory=lambda: os.getenv("FAL_KEY", "")
     )
+    atlascloud_api_key: str = field(
+        default_factory=lambda: os.getenv("ATLASCLOUD_API_KEY", "")
+    )
     hf_token: Optional[str] = field(
         default_factory=lambda: os.getenv("HF_TOKEN")
     )
