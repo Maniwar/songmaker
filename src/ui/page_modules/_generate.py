@@ -18,6 +18,7 @@ from src.services.lip_sync_animator import LipSyncAnimator, check_lip_sync_avail
 from src.services.prompt_animator import PromptAnimator, check_prompt_animator_available
 from src.services.veo_animator import VeoAnimator, check_veo_available
 from src.services.atlascloud_animator import AtlasCloudAnimator, check_atlascloud_available
+from src.services.seedance_animator import SeedanceAnimator, check_seedance_available
 from src.services.animation_chainer import PromptAnimationChainer, VeoAnimationChainer
 from src.ui.components.state import get_state, update_state, advance_step, go_to_step, save_scene_metadata
 from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word, AnimationType
@@ -1201,6 +1202,7 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                 AnimationType.PROMPT: "Wan2.2-TI2V (FREE)",
                 AnimationType.ATLASCLOUD: "AtlasCloud (PAID)",
                 AnimationType.VEO: "Google Veo (PAID)",
+                AnimationType.SEEDANCE: "Seedance Pro (PAID)",
             }
             pending_parts = []
             for anim_type, count in pending_by_type.items():
@@ -1211,40 +1213,36 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
         else:
             st.success(f"✓ All {scenes_marked_for_animation} animations ready!")
 
-        # Show Wan2.2 controls only if there are lip_sync or prompt type pending
-        wan_pending = pending_by_type.get(AnimationType.LIP_SYNC, 0) + pending_by_type.get(AnimationType.PROMPT, 0)
-        if wan_pending > 0:
-            if not check_lip_sync_available():
-                st.warning("Lip sync animation requires `gradio_client`. Install with: `pip install gradio_client`")
-            else:
-                anim_col1, anim_col2, anim_col3 = st.columns([2, 1, 1])
-                with anim_col1:
-                    resolution = st.selectbox(
-                        "Animation Resolution",
-                        options=["720P", "480P"],
-                        index=0,
-                        help="Higher resolution takes longer to generate",
-                        key="animation_resolution",
-                    )
-                with anim_col2:
-                    if wan_pending > 0:
-                        if st.button("🎬 Generate Wan2.2 Animations", type="primary"):
-                            generate_animations(state, resolution, is_demo_mode)
-                    else:
-                        st.success("Wan2.2 animations ready!")
-                with anim_col3:
-                    if scenes_with_animation > 0:
-                        if st.button("🔄 Regenerate Wan2.2 Animations"):
-                            # Clear existing animations for Wan2.2 types only
-                            scenes = state.scenes
-                            for s in scenes:
-                                anim_type = getattr(s, 'animation_type', None)
-                                if anim_type in (AnimationType.LIP_SYNC, AnimationType.PROMPT) or (
-                                    getattr(s, 'animated', False) and anim_type in (None, AnimationType.NONE)
-                                ):
-                                    s.video_path = None
-                            update_state(scenes=scenes)
-                            generate_animations(state, resolution, is_demo_mode)
+        # Show animation controls if there are any pending animations
+        if pending_animations > 0:
+            # Check if Wan2.2 (free tier) animations need gradio_client
+            wan_pending = pending_by_type.get(AnimationType.LIP_SYNC, 0) + pending_by_type.get(AnimationType.PROMPT, 0)
+            if wan_pending > 0 and not check_lip_sync_available():
+                st.warning("Lip sync/Prompt animation requires `gradio_client`. Install with: `pip install gradio_client`")
+
+            anim_col1, anim_col2, anim_col3 = st.columns([2, 1, 1])
+            with anim_col1:
+                resolution = st.selectbox(
+                    "Animation Resolution",
+                    options=["720P", "480P"],
+                    index=0,
+                    help="Higher resolution takes longer to generate",
+                    key="animation_resolution",
+                )
+            with anim_col2:
+                if st.button("🎬 Generate Animations", type="primary"):
+                    generate_animations(state, resolution, is_demo_mode)
+            with anim_col3:
+                if scenes_with_animation > 0:
+                    if st.button("🔄 Regenerate All Animations"):
+                        # Clear existing animations for all types
+                        scenes = state.scenes
+                        for s in scenes:
+                            anim_type = getattr(s, 'animation_type', None)
+                            if anim_type not in (None, AnimationType.NONE):
+                                s.video_path = None
+                        update_state(scenes=scenes)
+                        generate_animations(state, resolution, is_demo_mode)
 
         st.markdown("---")
 
@@ -1411,6 +1409,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
         AnimationType.PROMPT: "prompt",
         AnimationType.VEO: "Veo 3.1 (PAID)",
         AnimationType.ATLASCLOUD: "AtlasCloud (PAID)",
+        AnimationType.SEEDANCE: "Seedance Pro (PAID)",
     }
     anim_type_label = anim_type_labels.get(animation_type, "animation")
     status_placeholder.info(f"Animating ({anim_type_label}) at {resolution}...")
@@ -1477,6 +1476,20 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
                 output_path=output_path,
                 duration_seconds=5 if scene.duration < 7.5 else 10,  # AtlasCloud supports 5 or 10 seconds
                 resolution="720p",  # Can be 720p or 1080p
+                progress_callback=progress_callback,
+            )
+        elif animation_type == AnimationType.SEEDANCE:
+            # Use SeedanceAnimator for Seedance Pro animation (PAID, up to 12s)
+            animator = SeedanceAnimator()
+            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            # Seedance supports 2-12 second durations - pick closest match
+            target_duration = min(12, max(2, int(scene.duration)))
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=target_duration,
+                resolution="720p",  # Can be 480p, 720p, or 1080p
                 progress_callback=progress_callback,
             )
 
@@ -1576,6 +1589,7 @@ def render_scene_card(state, scene: Scene) -> None:
             "Prompt": AnimationType.PROMPT,
             "Veo 3.1 (PAID)": AnimationType.VEO,
             "AtlasCloud (PAID)": AnimationType.ATLASCLOUD,
+            "Seedance (PAID)": AnimationType.SEEDANCE,
         }
         anim_labels = list(anim_options.keys())
         current_idx = list(anim_options.values()).index(current_anim_type) if current_anim_type in anim_options.values() else 0
@@ -1590,11 +1604,15 @@ def render_scene_card(state, scene: Scene) -> None:
         )
         new_anim_type = anim_options[selected_anim_label]
 
-        # Show motion prompt input if prompt-based animation is selected (Prompt, Veo, or AtlasCloud)
-        if new_anim_type in (AnimationType.PROMPT, AnimationType.VEO, AnimationType.ATLASCLOUD):
+        # Show motion prompt input if prompt-based animation is selected (Prompt, Veo, AtlasCloud, or Seedance)
+        if new_anim_type in (AnimationType.PROMPT, AnimationType.VEO, AnimationType.ATLASCLOUD, AnimationType.SEEDANCE):
             widget_key = f"motion_prompt_{scene.index}"
             ai_result_key = f"_ai_motion_result_{scene.index}"
             scene_motion_prompt = getattr(scene, 'motion_prompt', None)
+
+            # Default to visual_prompt if no motion_prompt is set
+            # This gives users a starting point based on the scene description
+            default_prompt = scene_motion_prompt or scene.visual_prompt or ""
 
             # Check if AI generated a new prompt (stored in temp key from previous render)
             if ai_result_key in st.session_state:
@@ -1603,10 +1621,10 @@ def render_scene_card(state, scene: Scene) -> None:
             # Clear stale "(Recovered from files)" from old code, or initialize from scene
             elif widget_key in st.session_state:
                 if st.session_state[widget_key] == "(Recovered from files)":
-                    st.session_state[widget_key] = scene_motion_prompt or ""
+                    st.session_state[widget_key] = default_prompt
             else:
-                # Initialize from scene data
-                st.session_state[widget_key] = scene_motion_prompt or ""
+                # Initialize from scene data or visual prompt as default
+                st.session_state[widget_key] = default_prompt
 
             prompt_col, ai_col = st.columns([4, 1])
             with prompt_col:
@@ -1648,11 +1666,32 @@ def render_scene_card(state, scene: Scene) -> None:
             if new_anim_type == AnimationType.NONE:
                 # Clear video path when disabling animation
                 scenes[scene.index].video_path = None
+            # Auto-fill motion prompt from visual prompt when switching to prompt-based animation
+            elif new_anim_type in (AnimationType.PROMPT, AnimationType.VEO, AnimationType.ATLASCLOUD, AnimationType.SEEDANCE):
+                if not getattr(scenes[scene.index], 'motion_prompt', None):
+                    scenes[scene.index].motion_prompt = scene.visual_prompt
+                    # Also update the widget session state so it shows immediately
+                    widget_key = f"motion_prompt_{scene.index}"
+                    if widget_key in st.session_state:
+                        st.session_state[widget_key] = scene.visual_prompt
             update_state(scenes=scenes)
             st.rerun()
 
         # Animate/Re-animate controls (only if animation type is not NONE)
         if new_anim_type != AnimationType.NONE:
+            # Show expected animation duration based on type
+            scene_dur = scene.duration
+            if new_anim_type == AnimationType.SEEDANCE:
+                anim_dur = min(12, max(2, int(scene_dur)))
+                st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, Seedance: 2-12s)")
+            elif new_anim_type == AnimationType.ATLASCLOUD:
+                anim_dur = 5 if scene_dur < 7.5 else 10
+                st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, AtlasCloud: 5 or 10s)")
+            elif new_anim_type == AnimationType.VEO:
+                st.caption(f"Duration: {scene_dur:.1f}s (Veo chains segments for long scenes)")
+            else:
+                st.caption(f"Duration: {scene_dur:.1f}s")
+
             anim_col1, anim_col2 = st.columns([1, 1])
             with anim_col1:
                 anim_resolution = st.selectbox(
@@ -1669,6 +1708,7 @@ def render_scene_card(state, scene: Scene) -> None:
                     AnimationType.PROMPT: "Prompt",
                     AnimationType.VEO: "Veo 3.1",
                     AnimationType.ATLASCLOUD: "AtlasCloud",
+                    AnimationType.SEEDANCE: "Seedance",
                 }
                 anim_type_name = anim_type_names.get(new_anim_type, "Animation")
                 if st.button(button_label, key=f"animate_{scene.index}", help=f"Generate {anim_type_name} animation"):
@@ -2304,6 +2344,7 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
     prompt_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.PROMPT)
     veo_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.VEO)
     atlascloud_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.ATLASCLOUD)
+    seedance_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.SEEDANCE)
 
     status_label = f"Generating {len(pending_scenes)} animations"
     type_parts = []
@@ -2315,6 +2356,8 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
         type_parts.append(f"{veo_count} Veo")
     if atlascloud_count > 0:
         type_parts.append(f"{atlascloud_count} AtlasCloud")
+    if seedance_count > 0:
+        type_parts.append(f"{seedance_count} Seedance")
     if type_parts:
         status_label += f" ({', '.join(type_parts)})"
 
@@ -2326,6 +2369,7 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
         prompt_animator = None
         veo_animator = None
         atlascloud_animator = None
+        seedance_animator = None
 
         progress_bar = st.progress(0.0, text="Starting animations...")
         last_error_msg = None  # Track last error message for display
@@ -2338,6 +2382,7 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                 AnimationType.PROMPT: "prompt",
                 AnimationType.VEO: "Veo",
                 AnimationType.ATLASCLOUD: "AtlasCloud",
+                AnimationType.SEEDANCE: "Seedance",
             }
             anim_type_name = anim_type_names.get(anim_type, "unknown")
 
@@ -2435,6 +2480,24 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                         prompt=motion_prompt,
                         output_path=output_path,
                         duration_seconds=5 if scene.duration < 7.5 else 10,
+                        resolution="720p",
+                        progress_callback=progress_callback,
+                    )
+
+                elif anim_type == AnimationType.SEEDANCE:
+                    if seedance_animator is None:
+                        st.write("Using Seedance Pro (PAID, up to 12s)")
+                        seedance_animator = SeedanceAnimator()
+
+                    motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+
+                    # Seedance supports 2-12 second durations
+                    target_duration = min(12, max(2, int(scene.duration)))
+                    result = seedance_animator.animate_scene(
+                        image_path=Path(scene.image_path),
+                        prompt=motion_prompt,
+                        output_path=output_path,
+                        duration_seconds=target_duration,
                         resolution="720p",
                         progress_callback=progress_callback,
                     )
