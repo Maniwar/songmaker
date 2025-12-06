@@ -2392,13 +2392,18 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                 text=f"Animating scene {scene.index + 1} ({anim_type_name}) ({idx + 1}/{len(pending_scenes)})..."
             )
 
+            # Show starting message (persists)
+            st.write(f"▶️ Scene {scene.index + 1} ({anim_type_name})")
+
             output_path = animations_dir / f"animated_scene_{scene.index:03d}.mp4"
 
             # Track progress messages
             error_msg_holder = {"msg": None}
+            # Create placeholder for real-time updates (elapsed time) for THIS scene
+            scene_status = st.empty()
 
             def progress_callback(msg: str, prog: float):
-                st.write(f"  {msg}")
+                scene_status.text(f"   ↳ {msg}")  # Update in place with indent
                 # Capture error messages (progress 0.0 usually indicates error)
                 if prog == 0.0 and ("failed" in msg.lower() or "error" in msg.lower() or "exceeded" in msg.lower()):
                     error_msg_holder["msg"] = msg
@@ -2503,22 +2508,26 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                         progress_callback=progress_callback,
                     )
 
+                # Clear the real-time status placeholder
+                scene_status.empty()
+
                 if result and result.exists():
                     # Update scene with video path directly on the scene object
                     # (scene is a reference to the object in scenes list)
                     scene.video_path = result
                     scene.animated = True  # Mark as animated so UI shows video
                     success_count += 1
-                    st.write(f"✅ Scene {scene.index + 1} animated successfully")
+                    st.write(f"   ✅ Complete!")
                 else:
                     # Show error message if captured
                     if error_msg_holder["msg"]:
-                        st.write(f"❌ Scene {scene.index + 1}: {error_msg_holder['msg']}")
+                        st.write(f"   ❌ {error_msg_holder['msg']}")
                         last_error_msg = error_msg_holder["msg"]
                     else:
-                        st.write(f"❌ Scene {scene.index + 1} animation failed")
+                        st.write(f"   ❌ Animation failed")
 
             except Exception as e:
+                scene_status.empty()
                 error_str = str(e)
                 # Provide user-friendly error messages
                 if "GPU quota" in error_str or "exceeded" in error_str.lower():
@@ -2529,7 +2538,7 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                     last_error_msg = user_msg
                 else:
                     user_msg = str(e)[:100]
-                st.write(f"❌ Scene {scene.index + 1} error: {user_msg}")
+                st.write(f"   ❌ Error: {user_msg}")
 
         progress_bar.progress(1.0, text="Done!")
         update_state(scenes=scenes)
