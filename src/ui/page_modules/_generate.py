@@ -2278,10 +2278,11 @@ def generate_single_animation(state, scene_index: int, resolution: str = "720P")
         output_path = animations_dir / f"animated_scene_{scene_index:03d}.mp4"
 
         progress_bar = st.progress(0.0)
+        status_text = st.empty()
 
         def progress_callback(msg: str, prog: float):
             progress_bar.progress(prog)
-            st.write(f"  {msg}")
+            status_text.text(msg)
 
         try:
             result = animator.animate_scene(
