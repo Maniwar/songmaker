@@ -26,14 +26,23 @@ class VeoAnimator:
     Features:
     - High-quality video generation (720p/1080p)
     - 4, 6, or 8 second durations
-    - Native audio generation (can be disabled)
+    - Standard or Fast model selection
+    - Audio generation toggle (disable to save ~33% cost)
     - Uses existing Google API key (same as image generation)
 
     Note: This is a PAID API. Check Google AI pricing for costs.
     """
 
-    # Model configuration
-    MODEL_NAME = "veo-3.1-generate-preview"
+    # Model options
+    MODELS = {
+        "veo-3.1": "veo-3.1-generate-preview",
+        "veo-3.1-fast": "veo-3.1-fast-generate-preview",
+        "veo-3.0": "veo-3.0-generate-001",
+        "veo-3.0-fast": "veo-3.0-fast-generate-001",
+    }
+
+    # Default to fast model (cheaper, faster)
+    DEFAULT_MODEL = "veo-3.1-fast"
 
     # Duration options in seconds
     DURATION_OPTIONS = [4, 6, 8]
@@ -41,9 +50,13 @@ class VeoAnimator:
     # Resolution options
     RESOLUTION_OPTIONS = ["720p", "1080p"]
 
-    def __init__(self, config: Optional[Config] = None):
+    def __init__(self, config: Optional[Config] = None, model: str = None):
         self.config = config or default_config
         self._client = None
+        # Use specified model, or config, or default to fast
+        self.model = model or getattr(self.config, 'veo_model', self.DEFAULT_MODEL)
+        if self.model not in self.MODELS:
+            self.model = self.DEFAULT_MODEL
 
     def _get_client(self):
         """Lazy load Google GenAI client."""
@@ -74,6 +87,7 @@ class VeoAnimator:
         duration_seconds: float = 4.0,
         resolution: str = "720p",
         aspect_ratio: str = "16:9",
+        generate_audio: bool = False,
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> Optional[Path]:
         """
@@ -86,6 +100,7 @@ class VeoAnimator:
             duration_seconds: Target duration (will use closest Veo option: 4, 6, or 8)
             resolution: Video resolution ("720p" or "1080p")
             aspect_ratio: Aspect ratio ("16:9" or "9:16")
+            generate_audio: Whether to generate audio (False saves ~33% cost)
             progress_callback: Optional callback for progress updates
 
         Returns:
@@ -123,17 +138,21 @@ class VeoAnimator:
             if progress_callback:
                 progress_callback(f"Generating video: {prompt[:50]}...", 0.3)
 
-            # Generate video using Veo 3.1
+            # Generate video using selected Veo model
             # Note: Veo is an async operation - we need to poll for completion
-            # Note: generate_audio is not supported in the Gemini API for Veo
+            # generate_audio=False saves ~33% cost since we have our own audio
+            model_id = self.MODELS[self.model]
+            logger.info(f"Using Veo model: {model_id} (audio={'on' if generate_audio else 'off'})")
+
             operation = client.models.generate_videos(
-                model=self.MODEL_NAME,
+                model=model_id,
                 prompt=prompt,
                 image=veo_image,
                 config=types.GenerateVideosConfig(
                     aspect_ratio=aspect_ratio,
                     duration_seconds=veo_duration,
                     resolution=resolution,
+                    generateAudio=generate_audio,
                 ),
             )
 

@@ -31,21 +31,27 @@ class Wan2S2VAnimator:
     - Free and cross-platform (cloud-based)
 
     Limitations:
-    - Slow (~10 minutes per scene)
-    - Queue times on busy days
+    - Slow (~10-20 minutes per scene due to queue)
+    - Queue times vary significantly based on server load
+    - May timeout on very busy days
     """
 
     # Hugging Face Space URL for Wan2.2-S2V
     SPACE_URL = "Wan-AI/Wan2.2-S2V"
 
-    def __init__(self):
+    # Timeout in seconds (25 minutes - generous for busy servers)
+    DEFAULT_TIMEOUT = 1500
+
+    def __init__(self, timeout: int = None):
         self._client = None
+        self.timeout = timeout or self.DEFAULT_TIMEOUT
 
     def _get_client(self):
-        """Lazy load Gradio client."""
+        """Lazy load Gradio client with timeout settings."""
         if self._client is None:
             from gradio_client import Client
 
+            # Create client with longer timeout for slow HF Spaces
             self._client = Client(self.SPACE_URL)
         return self._client
 

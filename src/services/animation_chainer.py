@@ -520,6 +520,7 @@ class VeoAnimationChainer:
         output_path: Path,
         duration_seconds: float,
         resolution: str = "720p",
+        generate_audio: bool = False,
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> Optional[Path]:
         """
@@ -534,6 +535,7 @@ class VeoAnimationChainer:
             output_path: Path to save the final video
             duration_seconds: Target total duration
             resolution: Video resolution (720p or 1080p)
+            generate_audio: Whether to generate audio (False saves ~33% cost)
             progress_callback: Optional progress callback
 
         Returns:
@@ -550,6 +552,7 @@ class VeoAnimationChainer:
                 output_path=output_path,
                 duration_seconds=duration_seconds,
                 resolution=resolution,
+                generate_audio=generate_audio,
                 progress_callback=progress_callback,
             )
 
@@ -594,6 +597,7 @@ class VeoAnimationChainer:
                     output_path=segment_output,
                     duration_seconds=segment_duration,
                     resolution=resolution,
+                    generate_audio=generate_audio,
                     progress_callback=segment_progress,
                 )
 
