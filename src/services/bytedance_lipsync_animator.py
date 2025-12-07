@@ -14,9 +14,10 @@ Workflow:
 
 Pricing: ~$0.0224/second ($0.112 base) for both models
 
-Note: Inputs must be URLs, not base64 data.
+Note: Uses base64 data URLs for video and audio inputs.
 """
 
+import base64
 import logging
 import tempfile
 import time
@@ -73,9 +74,6 @@ class AtlasCloudLipsyncAnimator:
 
     BASE_URL = "https://api.atlascloud.ai/api/v1/model"
 
-    # For file uploads, AtlasCloud API requires URLs
-    UPLOAD_URL = "https://api.atlascloud.ai/api/v1/files/upload"
-
     def __init__(self, config: Optional[Config] = None, model: str = "kling"):
         self.config = config or default_config
         self._api_key = self.config.atlascloud_api_key
@@ -89,34 +87,40 @@ class AtlasCloudLipsyncAnimator:
             "Content-Type": "application/json",
         }
 
-    def _upload_file(self, file_path: Path) -> Optional[str]:
-        """Upload a file to AtlasCloud and get a URL.
+    def _encode_video(self, video_path: Path) -> str:
+        """Encode video to base64 data URL."""
+        with open(video_path, "rb") as f:
+            video_data = f.read()
 
-        Returns the hosted URL or None if upload fails.
-        """
-        try:
-            with open(file_path, "rb") as f:
-                files = {"file": (file_path.name, f)}
-                headers = {"Authorization": f"Bearer {self._api_key}"}
-                response = requests.post(
-                    self.UPLOAD_URL,
-                    headers=headers,
-                    files=files,
-                    timeout=120,
-                )
-                response.raise_for_status()
-                result = response.json()
-                # The response should contain the file URL
-                url = result.get("data", {}).get("url") or result.get("url")
-                if url:
-                    logger.info(f"Uploaded {file_path.name} -> {url}")
-                    return url
-                else:
-                    logger.error(f"No URL in upload response: {result}")
-                    return None
-        except Exception as e:
-            logger.error(f"File upload failed: {e}")
-            return None
+        # Determine mime type
+        suffix = video_path.suffix.lower()
+        mime_map = {
+            ".mp4": "video/mp4",
+            ".webm": "video/webm",
+            ".mov": "video/quicktime",
+        }
+        mime_type = mime_map.get(suffix, "video/mp4")
+
+        base64_data = base64.b64encode(video_data).decode("utf-8")
+        return f"data:{mime_type};base64,{base64_data}"
+
+    def _encode_audio(self, audio_path: Path) -> str:
+        """Encode audio to base64 data URL."""
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+
+        # Determine mime type
+        suffix = audio_path.suffix.lower()
+        mime_map = {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".aac": "audio/aac",
+        }
+        mime_type = mime_map.get(suffix, "audio/wav")
+
+        base64_data = base64.b64encode(audio_data).decode("utf-8")
+        return f"data:{mime_type};base64,{base64_data}"
 
     def apply_lipsync(
         self,
@@ -148,35 +152,29 @@ class AtlasCloudLipsyncAnimator:
             return None
 
         if progress_callback:
-            progress_callback("Uploading video...", 0.1)
+            progress_callback("Encoding video...", 0.1)
 
         try:
-            # Upload video file to get URL
-            video_url = self._upload_file(video_path)
-            if not video_url:
-                if progress_callback:
-                    progress_callback("Error: Failed to upload video", 0.0)
-                return None
+            # Encode video to base64 data URL
+            video_data_url = self._encode_video(video_path)
+            logger.info(f"Encoded video: {len(video_data_url)} chars")
 
             if progress_callback:
-                progress_callback("Uploading audio...", 0.2)
+                progress_callback("Encoding audio...", 0.2)
 
-            # Upload audio file to get URL
-            audio_url = self._upload_file(audio_path)
-            if not audio_url:
-                if progress_callback:
-                    progress_callback("Error: Failed to upload audio", 0.0)
-                return None
+            # Encode audio to base64 data URL
+            audio_data_url = self._encode_audio(audio_path)
+            logger.info(f"Encoded audio: {len(audio_data_url)} chars")
 
             if progress_callback:
                 model_name = "Kling" if "kling" in self.model else "ByteDance"
                 progress_callback(f"Submitting to {model_name} Lipsync...", 0.3)
 
-            # Build request payload (API requires URLs)
+            # Build request payload with base64 data URLs
             payload = {
                 "model": self.model,
-                "video": video_url,
-                "audio": audio_url,
+                "video": video_data_url,
+                "audio": audio_data_url,
             }
 
             logger.info(f"AtlasCloud Lipsync request: model={self.model}, video={video_path.name}")

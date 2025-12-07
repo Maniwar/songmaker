@@ -35,6 +35,11 @@ def save_scene_metadata(project_path: Path, scenes: list) -> bool:
     try:
         metadata = []
         for scene in scenes:
+            # Convert video_path to string if it's a Path object
+            video_path = getattr(scene, 'video_path', None)
+            if video_path is not None:
+                video_path = str(video_path)
+
             scene_data = {
                 "index": scene.index,
                 "start_time": scene.start_time,
@@ -45,6 +50,7 @@ def save_scene_metadata(project_path: Path, scenes: list) -> bool:
                 "motion_prompt": getattr(scene, 'motion_prompt', None),
                 "animation_type": scene.animation_type.value if hasattr(scene.animation_type, 'value') else str(scene.animation_type),
                 "animated": getattr(scene, 'animated', False),
+                "video_path": video_path,
             }
             metadata.append(scene_data)
 

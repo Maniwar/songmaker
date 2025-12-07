@@ -204,6 +204,96 @@ class KlingAnimator:
                     progress_callback(f"Animation failed: {e}", 0.0)
                 return None
 
+    def apply_lipsync_to_video(
+        self,
+        video_path: Path,
+        audio_path: Path,
+        start_time: float,
+        duration: float,
+        output_path: Path,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> Optional[Path]:
+        """
+        Apply lip sync to an existing video using Kling AI via fal.ai.
+
+        This method is used for the Seedance+LipSync workflow where we already
+        have a motion video from Seedance and want to add lip sync.
+
+        Args:
+            video_path: Path to the input video (e.g., from Seedance)
+            audio_path: Path to the full audio file
+            start_time: Start time in the audio (seconds)
+            duration: Duration of the audio segment (seconds)
+            output_path: Path to save the output video
+            progress_callback: Optional callback for progress updates
+
+        Returns:
+            Path to the lip-synced video, or None if generation failed
+        """
+        if progress_callback:
+            progress_callback("Preparing audio clip...", 0.1)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir = Path(temp_dir)
+            audio_clip_path = temp_dir / "audio_clip.wav"
+
+            try:
+                # Extract audio segment
+                audio = AudioSegment.from_file(str(audio_path))
+                start_ms = int(start_time * 1000)
+                end_ms = int((start_time + duration) * 1000)
+                clip = audio[start_ms:end_ms]
+                clip.export(str(audio_clip_path), format="wav")
+
+                if progress_callback:
+                    progress_callback("Uploading files to Kling...", 0.3)
+
+                # Upload files to fal.ai storage
+                video_url = self._upload_to_fal(video_path)
+                audio_url = self._upload_to_fal(audio_clip_path)
+
+                if progress_callback:
+                    progress_callback("Generating lip-sync animation...", 0.5)
+
+                # Apply Kling LipSync
+                fal = self._get_fal_client()
+
+                result = fal.subscribe(
+                    self.LIPSYNC_ENDPOINT,
+                    arguments={
+                        "video_url": video_url,
+                        "audio_url": audio_url,
+                    },
+                    with_logs=True,
+                    on_queue_update=lambda update: self._handle_queue_update(
+                        update, progress_callback
+                    ),
+                )
+
+                if progress_callback:
+                    progress_callback("Downloading result...", 0.9)
+
+                # Download result video
+                if result and "video" in result:
+                    result_url = result["video"]["url"]
+                    self._download_video(result_url, output_path)
+
+                    if progress_callback:
+                        progress_callback("Lip sync complete!", 1.0)
+
+                    return output_path
+                else:
+                    print(f"Kling lip sync result: {result}")
+                    if progress_callback:
+                        progress_callback("No video generated", 0.0)
+                    return None
+
+            except Exception as e:
+                print(f"Kling lip sync failed: {e}")
+                if progress_callback:
+                    progress_callback(f"Lip sync failed: {e}", 0.0)
+                return None
+
     def _create_i2v_video(
         self,
         image_path: Path,
