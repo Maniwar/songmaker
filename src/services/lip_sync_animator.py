@@ -156,6 +156,11 @@ class Wan2S2VAnimator:
                     # Get queue status
                     try:
                         status = job.status()
+                        # Debug: log full status object on first check
+                        if elapsed < 10:
+                            logger.info(f"[Queue Debug] Status object: {status}")
+                            logger.info(f"[Queue Debug] Status attrs: {dir(status)}")
+
                         if hasattr(status, 'code'):
                             status_name = status.code.name if hasattr(status.code, 'name') else str(status.code)
 
@@ -163,6 +168,9 @@ class Wan2S2VAnimator:
                                 queue_pos = getattr(status, 'rank', 0)
                                 queue_size = getattr(status, 'queue_size', 0)
                                 eta_seconds = getattr(status, 'eta', 0) or 0
+
+                                # Debug: log queue info
+                                logger.info(f"[Queue] pos={queue_pos}, size={queue_size}, eta={eta_seconds}s ({eta_seconds/60:.1f}min)")
 
                                 # Fail early if queue is too long
                                 if eta_seconds > max_queue_eta:
