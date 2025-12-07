@@ -2456,6 +2456,9 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
     veo_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.VEO)
     atlascloud_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.ATLASCLOUD)
     seedance_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.SEEDANCE)
+    kling_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.KLING)
+    wan_s2v_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.WAN_S2V)
+    seedance_lipsync_count = sum(1 for s in pending_scenes if getattr(s, 'animation_type', None) == AnimationType.SEEDANCE_LIPSYNC)
 
     status_label = f"Generating {len(pending_scenes)} animations"
     type_parts = []
@@ -2469,6 +2472,12 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
         type_parts.append(f"{atlascloud_count} AtlasCloud")
     if seedance_count > 0:
         type_parts.append(f"{seedance_count} Seedance")
+    if kling_count > 0:
+        type_parts.append(f"{kling_count} Kling")
+    if wan_s2v_count > 0:
+        type_parts.append(f"{wan_s2v_count} Wan S2V")
+    if seedance_lipsync_count > 0:
+        type_parts.append(f"{seedance_lipsync_count} Seedance+LipSync")
     if type_parts:
         status_label += f" ({', '.join(type_parts)})"
 
