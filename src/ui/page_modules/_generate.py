@@ -19,6 +19,7 @@ from src.services.prompt_animator import PromptAnimator, check_prompt_animator_a
 from src.services.veo_animator import VeoAnimator, check_veo_available
 from src.services.atlascloud_animator import AtlasCloudAnimator, check_atlascloud_available
 from src.services.seedance_animator import SeedanceAnimator, check_seedance_available
+from src.services.bytedance_lipsync_animator import AtlasCloudLipsyncAnimator, check_atlascloud_lipsync_available
 from src.services.animation_chainer import PromptAnimationChainer, VeoAnimationChainer
 from src.ui.components.state import get_state, update_state, advance_step, go_to_step, save_scene_metadata
 from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word, AnimationType
@@ -1203,6 +1204,7 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                 AnimationType.ATLASCLOUD: "AtlasCloud (PAID)",
                 AnimationType.VEO: "Google Veo (PAID)",
                 AnimationType.SEEDANCE: "Seedance Pro (PAID)",
+                AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync (PAID)",
             }
             pending_parts = []
             for anim_type, count in pending_by_type.items():
@@ -1410,6 +1412,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
         AnimationType.VEO: "Veo 3.1 (PAID)",
         AnimationType.ATLASCLOUD: "AtlasCloud (PAID)",
         AnimationType.SEEDANCE: "Seedance Pro (PAID)",
+        AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync (PAID)",
     }
     anim_type_label = anim_type_labels.get(animation_type, "animation")
     status_placeholder.info(f"Animating ({anim_type_label}) at {resolution}...")
@@ -1492,6 +1495,44 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
                 resolution="720p",  # Can be 480p, 720p, or 1080p
                 progress_callback=progress_callback,
             )
+
+        elif animation_type == AnimationType.SEEDANCE_LIPSYNC:
+            # Two-step workflow: Seedance motion → AtlasCloud lip sync
+            if not audio_path or audio_path == "demo_mode":
+                status_placeholder.error("Audio required for lip sync animation")
+                return
+
+            status_placeholder.info("Step 1: Generating motion with Seedance Pro...")
+            animator = SeedanceAnimator()
+            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            target_duration = min(10, max(2, int(scene.duration)))  # Kling lipsync max 10s
+
+            motion_output = output_path.with_suffix(".motion.mp4")
+            motion_result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                prompt=motion_prompt,
+                output_path=motion_output,
+                duration_seconds=target_duration,
+                resolution="720p",
+                progress_callback=progress_callback,
+            )
+
+            if motion_result and motion_result.exists():
+                status_placeholder.info("Step 2: Applying lip sync with AtlasCloud...")
+                lipsync_animator = AtlasCloudLipsyncAnimator(model="kling")
+                result = lipsync_animator.apply_lipsync_to_scene(
+                    video_path=motion_result,
+                    audio_path=Path(audio_path),
+                    start_time=scene.start_time,
+                    duration=scene.duration,
+                    output_path=output_path,
+                    progress_callback=progress_callback,
+                )
+                if result and result.exists():
+                    motion_output.unlink(missing_ok=True)
+            else:
+                status_placeholder.error("Motion generation failed")
+                result = None
 
         if result and result.exists():
             scenes[scene_index].video_path = result
@@ -2384,6 +2425,7 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                 AnimationType.VEO: "Veo",
                 AnimationType.ATLASCLOUD: "AtlasCloud",
                 AnimationType.SEEDANCE: "Seedance",
+                AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync",
             }
             anim_type_name = anim_type_names.get(anim_type, "unknown")
 
@@ -2506,6 +2548,50 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                         resolution="720p",
                         progress_callback=progress_callback,
                     )
+
+                elif anim_type == AnimationType.SEEDANCE_LIPSYNC:
+                    # Two-step workflow: Seedance motion → AtlasCloud lip sync
+                    if not audio_path or audio_path == "demo_mode":
+                        st.write(f"⚠️ Scene {scene.index + 1}: Skipped - no audio for lip sync")
+                        continue
+
+                    st.write("Step 1: Generating motion with Seedance Pro...")
+                    if seedance_animator is None:
+                        seedance_animator = SeedanceAnimator()
+
+                    motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+                    target_duration = min(10, max(2, int(scene.duration)))  # Kling lipsync max 10s
+
+                    # Generate motion video first (temp file)
+                    motion_output = output_path.with_suffix(".motion.mp4")
+                    motion_result = seedance_animator.animate_scene(
+                        image_path=Path(scene.image_path),
+                        prompt=motion_prompt,
+                        output_path=motion_output,
+                        duration_seconds=target_duration,
+                        resolution="720p",
+                        progress_callback=progress_callback,
+                    )
+
+                    if motion_result and motion_result.exists():
+                        st.write("Step 2: Applying lip sync with AtlasCloud...")
+                        lipsync_animator = AtlasCloudLipsyncAnimator(model="kling")
+
+                        result = lipsync_animator.apply_lipsync_to_scene(
+                            video_path=motion_result,
+                            audio_path=Path(audio_path),
+                            start_time=scene.start_time,
+                            duration=scene.duration,
+                            output_path=output_path,
+                            progress_callback=progress_callback,
+                        )
+
+                        # Clean up temp motion file if lip sync succeeded
+                        if result and result.exists():
+                            motion_output.unlink(missing_ok=True)
+                    else:
+                        st.write(f"❌ Scene {scene.index + 1}: Motion generation failed")
+                        result = None
 
                 if result and result.exists():
                     # Update scene with video path directly on the scene object
