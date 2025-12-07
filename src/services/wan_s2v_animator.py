@@ -67,8 +67,9 @@ class WanS2VAnimator:
                 f.write(chunk)
         return output_path
 
-    # Max segment duration at 12 FPS with 120 frames
-    MAX_SEGMENT_DURATION = 10.0
+    # Max segment duration at 16 FPS with 120 frames = 7.5 seconds
+    # Using 16 FPS for smooth lip sync quality
+    MAX_SEGMENT_DURATION = 7.5
 
     def animate_scene(
         self,
@@ -167,12 +168,16 @@ class WanS2VAnimator:
 
                 # Calculate frames based on duration
                 # Max is 120 frames, must be multiple of 4
-                # At 12 FPS we get max 10 seconds (120/12)
-                target_fps = 12  # Lower FPS = longer video
+                # At 16 FPS we get max 7.5 seconds (120/16)
+                # Using 16 FPS for smooth lip sync quality
+                target_fps = 16
                 target_frames = min(120, max(40, int(duration * target_fps)))
                 # Round to nearest multiple of 4
                 target_frames = (target_frames // 4) * 4
                 target_frames = max(40, min(120, target_frames))
+
+                expected_duration = target_frames / target_fps
+                print(f"[Wan S2V] Requesting {target_frames} frames at {target_fps} FPS = {expected_duration:.1f}s (scene duration: {duration:.1f}s)")
 
                 result = fal.subscribe(
                     self.S2V_ENDPOINT,
@@ -197,6 +202,19 @@ class WanS2VAnimator:
                 if result and "video" in result:
                     result_url = result["video"]["url"]
                     self._download_video(result_url, output_path)
+
+                    # Log actual video duration for debugging
+                    try:
+                        import subprocess
+                        probe = subprocess.run(
+                            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                             "-of", "default=noprint_wrappers=1:nokey=1", str(output_path)],
+                            capture_output=True, text=True
+                        )
+                        actual_dur = float(probe.stdout.strip()) if probe.stdout.strip() else 0
+                        print(f"[Wan S2V] Actual video duration: {actual_dur:.2f}s (requested: {duration:.1f}s audio)")
+                    except Exception:
+                        pass
 
                     if progress_callback:
                         progress_callback("Animation complete!", 1.0)

@@ -1785,12 +1785,12 @@ def render_scene_card(state, scene: Scene) -> None:
                 anim_dur = min(10, max(2, int(scene_dur)))
                 st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, Kling: 2-10s)")
             elif new_anim_type == AnimationType.WAN_S2V:
-                # Wan S2V supports video chaining for long scenes (10s segments)
-                num_segments = int(scene_dur / 10) + (1 if scene_dur % 10 > 0 else 0)
+                # Wan S2V supports video chaining for long scenes (7.5s segments @ 16fps)
+                num_segments = int(scene_dur / 7.5) + (1 if scene_dur % 7.5 > 0 else 0)
                 if num_segments > 1:
                     st.caption(f"Duration: {scene_dur:.1f}s ({num_segments} segments, chained)")
                 else:
-                    st.caption(f"Duration: {scene_dur:.1f}s (Wan S2V @ 12fps)")
+                    st.caption(f"Duration: {scene_dur:.1f}s (Wan S2V @ 16fps)")
             elif new_anim_type == AnimationType.ATLASCLOUD:
                 anim_dur = 5 if scene_dur < 7.5 else 10
                 st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, AtlasCloud: 5 or 10s)")
