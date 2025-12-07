@@ -1785,8 +1785,12 @@ def render_scene_card(state, scene: Scene) -> None:
                 anim_dur = min(10, max(2, int(scene_dur)))
                 st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, Kling: 2-10s)")
             elif new_anim_type == AnimationType.WAN_S2V:
-                # Wan S2V supports variable length videos
-                st.caption(f"Duration: {scene_dur:.1f}s (Wan S2V: full motion + lip sync)")
+                # Wan S2V supports video chaining for long scenes (10s segments)
+                num_segments = int(scene_dur / 10) + (1 if scene_dur % 10 > 0 else 0)
+                if num_segments > 1:
+                    st.caption(f"Duration: {scene_dur:.1f}s ({num_segments} segments, chained)")
+                else:
+                    st.caption(f"Duration: {scene_dur:.1f}s (Wan S2V @ 12fps)")
             elif new_anim_type == AnimationType.ATLASCLOUD:
                 anim_dur = 5 if scene_dur < 7.5 else 10
                 st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, AtlasCloud: 5 or 10s)")
@@ -2491,6 +2495,7 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                 AnimationType.ATLASCLOUD: "AtlasCloud",
                 AnimationType.SEEDANCE: "Seedance",
                 AnimationType.KLING: "Kling Lip Sync",
+                AnimationType.WAN_S2V: "Wan S2V",
                 AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync",
             }
             anim_type_name = anim_type_names.get(anim_type, "unknown")
