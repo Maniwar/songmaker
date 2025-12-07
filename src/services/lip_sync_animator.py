@@ -122,18 +122,87 @@ class Wan2S2VAnimator:
                 logger.info("Gradio client connected")
 
                 if progress_callback:
-                    progress_callback("Generating lip-sync animation (this may take 10-20 min)...", 0.3)
+                    progress_callback("Submitting to Wan2.2-S2V queue...", 0.3)
 
-                # Call the Wan2.2-S2V API - synchronous call
+                # Call the Wan2.2-S2V API using submit() for queue status
                 # API expects: ref_img, audio, resolution
                 logger.info(f"Calling Wan2.2-S2V API with image={image_path}, resolution={resolution}")
                 api_start = time.time()
-                result = client.predict(
+
+                # Use submit() to get queue status updates
+                job = client.submit(
                     ref_img=handle_file(str(image_path)),
                     audio=handle_file(str(audio_clip_path)),
                     resolution=resolution,
                     api_name="/predict"
                 )
+
+                # Monitor job with queue status updates
+                max_wait_seconds = 3600  # 1 hour max wait
+                max_queue_eta = 7200  # Fail if queue ETA > 2 hours
+                last_status_update = 0.0
+
+                while not job.done():
+                    elapsed = time.time() - api_start
+
+                    # Check timeout
+                    if elapsed > max_wait_seconds:
+                        logger.error(f"Wan2.2-S2V timed out after {_format_elapsed(elapsed)}")
+                        if progress_callback:
+                            progress_callback(f"Timed out after {_format_elapsed(elapsed)}", 0.0)
+                        job.cancel()
+                        return None
+
+                    # Get queue status
+                    try:
+                        status = job.status()
+                        if hasattr(status, 'code'):
+                            status_name = status.code.name if hasattr(status.code, 'name') else str(status.code)
+
+                            if status_name == 'IN_QUEUE':
+                                queue_pos = getattr(status, 'rank', 0)
+                                queue_size = getattr(status, 'queue_size', 0)
+                                eta_seconds = getattr(status, 'eta', 0) or 0
+
+                                # Fail early if queue is too long
+                                if eta_seconds > max_queue_eta:
+                                    eta_hours = eta_seconds / 3600
+                                    logger.error(f"Queue too long: {queue_pos}/{queue_size}, ETA {eta_hours:.1f}h")
+                                    if progress_callback:
+                                        progress_callback(
+                                            f"Queue too long ({queue_pos}/{queue_size}, ~{eta_hours:.1f}h wait). "
+                                            f"Use Seedance/AtlasCloud instead.", 0.0
+                                        )
+                                    job.cancel()
+                                    return None
+
+                                # Update progress with queue info (every 15 seconds)
+                                if time.time() - last_status_update > 15:
+                                    if eta_seconds > 0:
+                                        eta_min = eta_seconds / 60
+                                        msg = f"In queue: {queue_pos}/{queue_size} (~{eta_min:.0f}min wait)"
+                                    else:
+                                        msg = f"In queue: position {queue_pos} of {queue_size}"
+                                    logger.info(msg)
+                                    if progress_callback:
+                                        progress_callback(msg, 0.35)
+                                    last_status_update = time.time()
+
+                            elif status_name == 'PROCESSING':
+                                if time.time() - last_status_update > 10:
+                                    msg = f"Processing... ({_format_elapsed(elapsed)})"
+                                    logger.info(msg)
+                                    if progress_callback:
+                                        progress_callback(msg, 0.7)
+                                    last_status_update = time.time()
+
+                    except Exception as status_error:
+                        logger.debug(f"Status check error (non-fatal): {status_error}")
+
+                    time.sleep(5)
+
+                # Get result
+                result = job.result()
                 elapsed = time.time() - api_start
                 logger.info(f"API call completed in {_format_elapsed(elapsed)}")
                 logger.info(f"API result type: {type(result)}, value: {result}")
