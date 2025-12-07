@@ -74,6 +74,7 @@ class WanS2VAnimator:
         start_time: float,
         duration: float,
         output_path: Path,
+        prompt: Optional[str] = None,
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> Optional[Path]:
         """
@@ -85,11 +86,15 @@ class WanS2VAnimator:
             start_time: Start time in the audio (seconds)
             duration: Duration of the scene (seconds)
             output_path: Path to save the output video
+            prompt: Motion/action prompt for the video (required by API)
             progress_callback: Optional callback for progress updates
 
         Returns:
             Path to the generated video, or None if generation failed
         """
+        # Default prompt if none provided
+        if not prompt:
+            prompt = "A person speaking and moving naturally"
         if progress_callback:
             progress_callback("Preparing audio clip...", 0.1)
 
@@ -121,6 +126,7 @@ class WanS2VAnimator:
                 result = fal.subscribe(
                     self.S2V_ENDPOINT,
                     arguments={
+                        "prompt": prompt,
                         "image_url": image_url,
                         "audio_url": audio_url,
                     },
@@ -205,12 +211,16 @@ class WanS2VAnimator:
                     overall = (i + prog) / total
                     progress_callback(f"Scene {scene.index + 1}: {msg}", overall)
 
+            # Get motion prompt from scene
+            motion_prompt = getattr(scene, 'motion_prompt', None) or getattr(scene, 'visual_prompt', None)
+
             result = self.animate_scene(
                 image_path=Path(scene.image_path),
                 audio_path=audio_path,
                 start_time=scene.start_time,
                 duration=scene.duration,
                 output_path=output_path,
+                prompt=motion_prompt,
                 progress_callback=scene_progress,
             )
 

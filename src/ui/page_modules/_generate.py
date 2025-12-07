@@ -20,6 +20,7 @@ from src.services.veo_animator import VeoAnimator, check_veo_available
 from src.services.atlascloud_animator import AtlasCloudAnimator, check_atlascloud_available
 from src.services.seedance_animator import SeedanceAnimator, check_seedance_available
 from src.services.kling_animator import KlingAnimator, check_kling_available
+from src.services.wan_s2v_animator import WanS2VAnimator, check_wan_s2v_available
 from src.services.animation_chainer import PromptAnimationChainer, VeoAnimationChainer
 from src.ui.components.state import get_state, update_state, advance_step, go_to_step, save_scene_metadata
 from src.models.schemas import WorkflowStep, Scene, KenBurnsEffect, Word, AnimationType
@@ -1414,6 +1415,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
         AnimationType.ATLASCLOUD: "AtlasCloud (PAID)",
         AnimationType.SEEDANCE: "Seedance Pro (PAID)",
         AnimationType.KLING: "Kling Lip Sync (PAID)",
+        AnimationType.WAN_S2V: "Wan S2V (PAID)",
         AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync (PAID)",
     }
     anim_type_label = anim_type_labels.get(animation_type, "animation")
@@ -1515,6 +1517,25 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
                 output_path=output_path,
                 resolution="720p",
                 use_i2v=False,  # Use static video as base (cheaper)
+                progress_callback=progress_callback,
+            )
+
+        elif animation_type == AnimationType.WAN_S2V:
+            # Wan 2.2 S2V via fal.ai - full motion + lip sync in one step
+            if not audio_path or audio_path == "demo_mode":
+                status_placeholder.error("Audio required for Wan S2V animation")
+                return
+
+            status_placeholder.info("Generating Wan S2V animation (motion + lip sync)...")
+            animator = WanS2VAnimator()
+            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                audio_path=Path(audio_path),
+                start_time=scene.start_time,
+                duration=scene.duration,
+                output_path=output_path,
+                prompt=motion_prompt,
                 progress_callback=progress_callback,
             )
 
@@ -1664,6 +1685,7 @@ def render_scene_card(state, scene: Scene) -> None:
             "AtlasCloud (PAID)": AnimationType.ATLASCLOUD,
             "Seedance (PAID)": AnimationType.SEEDANCE,
             "Kling Lip Sync (PAID)": AnimationType.KLING,
+            "Wan S2V (PAID)": AnimationType.WAN_S2V,
             "Seedance+LipSync (PAID)": AnimationType.SEEDANCE_LIPSYNC,
         }
         anim_labels = list(anim_options.keys())
@@ -1679,8 +1701,8 @@ def render_scene_card(state, scene: Scene) -> None:
         )
         new_anim_type = anim_options[selected_anim_label]
 
-        # Show motion prompt input if prompt-based animation is selected (Prompt, Veo, AtlasCloud, Seedance, or Seedance+LipSync)
-        if new_anim_type in (AnimationType.PROMPT, AnimationType.VEO, AnimationType.ATLASCLOUD, AnimationType.SEEDANCE, AnimationType.SEEDANCE_LIPSYNC):
+        # Show motion prompt input if prompt-based animation is selected
+        if new_anim_type in (AnimationType.PROMPT, AnimationType.VEO, AnimationType.ATLASCLOUD, AnimationType.SEEDANCE, AnimationType.WAN_S2V, AnimationType.SEEDANCE_LIPSYNC):
             widget_key = f"motion_prompt_{scene.index}"
             ai_result_key = f"_ai_motion_result_{scene.index}"
             scene_motion_prompt = getattr(scene, 'motion_prompt', None)
@@ -1762,6 +1784,9 @@ def render_scene_card(state, scene: Scene) -> None:
             elif new_anim_type == AnimationType.KLING:
                 anim_dur = min(10, max(2, int(scene_dur)))
                 st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, Kling: 2-10s)")
+            elif new_anim_type == AnimationType.WAN_S2V:
+                # Wan S2V supports variable length videos
+                st.caption(f"Duration: {scene_dur:.1f}s (Wan S2V: full motion + lip sync)")
             elif new_anim_type == AnimationType.ATLASCLOUD:
                 anim_dur = 5 if scene_dur < 7.5 else 10
                 st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, AtlasCloud: 5 or 10s)")
@@ -1788,6 +1813,7 @@ def render_scene_card(state, scene: Scene) -> None:
                     AnimationType.ATLASCLOUD: "AtlasCloud",
                     AnimationType.SEEDANCE: "Seedance",
                     AnimationType.KLING: "Kling Lip Sync",
+                    AnimationType.WAN_S2V: "Wan S2V",
                     AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync",
                 }
                 anim_type_name = anim_type_names.get(new_anim_type, "Animation")
@@ -2606,6 +2632,25 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                         output_path=output_path,
                         resolution="720p",
                         use_i2v=False,  # Use static video as base (cheaper)
+                        progress_callback=progress_callback,
+                    )
+
+                elif anim_type == AnimationType.WAN_S2V:
+                    # Wan 2.2 S2V via fal.ai - full motion + lip sync in one step
+                    if not audio_path or audio_path == "demo_mode":
+                        st.write(f"⚠️ Scene {scene.index + 1}: Skipped - no audio for Wan S2V")
+                        continue
+
+                    st.write("Using Wan S2V (PAID, motion + lip sync via fal.ai)")
+                    wan_s2v_animator = WanS2VAnimator()
+                    motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+                    result = wan_s2v_animator.animate_scene(
+                        image_path=Path(scene.image_path),
+                        audio_path=Path(audio_path),
+                        start_time=scene.start_time,
+                        duration=scene.duration,
+                        output_path=output_path,
+                        prompt=motion_prompt,
                         progress_callback=progress_callback,
                     )
 
