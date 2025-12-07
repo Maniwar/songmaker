@@ -2683,23 +2683,29 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                         st.write(f"⚠️ Scene {scene.index + 1}: Skipped - no audio for lip sync")
                         continue
 
-                    st.write("Step 1: Generating motion with Seedance Pro...")
-                    if seedance_animator is None:
-                        seedance_animator = SeedanceAnimator()
-
                     motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
                     target_duration = min(10, max(2, int(scene.duration)))  # Kling lipsync max 10s
 
-                    # Generate motion video first (temp file)
+                    # Check if motion file already exists (resume support)
                     motion_output = output_path.with_suffix(".motion.mp4")
-                    motion_result = seedance_animator.animate_scene(
-                        image_path=Path(scene.image_path),
-                        prompt=motion_prompt,
-                        output_path=motion_output,
-                        duration_seconds=target_duration,
-                        resolution="720p",
-                        progress_callback=progress_callback,
-                    )
+                    motion_result = None
+
+                    if motion_output.exists():
+                        st.write("Step 1: ✅ Motion video already exists, resuming from Step 2...")
+                        motion_result = motion_output
+                    else:
+                        st.write("Step 1: Generating motion with Seedance Pro...")
+                        if seedance_animator is None:
+                            seedance_animator = SeedanceAnimator()
+
+                        motion_result = seedance_animator.animate_scene(
+                            image_path=Path(scene.image_path),
+                            prompt=motion_prompt,
+                            output_path=motion_output,
+                            duration_seconds=target_duration,
+                            resolution="720p",
+                            progress_callback=progress_callback,
+                        )
 
                     if motion_result and motion_result.exists():
                         st.write("Step 2: Applying lip sync with Kling (fal.ai)...")
