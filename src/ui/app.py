@@ -1,6 +1,17 @@
 """Main Streamlit application for Songmaker."""
 
+import logging
 import streamlit as st
+
+# Configure logging to show INFO level for our services
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+# Reduce noise from other loggers
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("gradio_client").setLevel(logging.WARNING)
 
 from src.config import config
 from src.models.schemas import WorkflowStep

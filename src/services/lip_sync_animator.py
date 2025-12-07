@@ -5,9 +5,9 @@ Backends:
 - kling: Paid Kling AI via fal.ai (fast, ~1-2 min/scene, ~$0.10/5s)
 """
 
+import logging
 import shutil
 import tempfile
-import threading
 import time
 from pathlib import Path
 from typing import Callable, Literal, Optional
@@ -15,6 +15,8 @@ from typing import Callable, Literal, Optional
 from pydub import AudioSegment
 
 from src.config import Config, config as default_config
+
+logger = logging.getLogger(__name__)
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -24,6 +26,7 @@ def _format_elapsed(seconds: float) -> str:
     if hours > 0:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
+
 
 # Type for lip sync backend
 LipSyncBackend = Literal["wan2s2v", "kling"]
@@ -50,23 +53,14 @@ class Wan2S2VAnimator:
     # Hugging Face Space URL for Wan2.2-S2V
     SPACE_URL = "Wan-AI/Wan2.2-S2V"
 
-    # Timeout per attempt in seconds (30 minutes - generous for busy servers)
-    DEFAULT_TIMEOUT_PER_ATTEMPT = 1800
-
-    # Maximum retries before giving up
-    MAX_RETRIES = 3
-
-    def __init__(self, timeout: int = None, max_retries: int = None):
+    def __init__(self):
         self._client = None
-        self.timeout = timeout or self.DEFAULT_TIMEOUT_PER_ATTEMPT
-        self.max_retries = max_retries or self.MAX_RETRIES
 
     def _get_client(self):
-        """Lazy load Gradio client with timeout settings."""
+        """Lazy load Gradio client."""
         if self._client is None:
             from gradio_client import Client
 
-            # Create client with longer timeout for slow HF Spaces
             self._client = Client(self.SPACE_URL)
         return self._client
 
@@ -111,123 +105,76 @@ class Wan2S2VAnimator:
 
             try:
                 # Extract audio segment
+                logger.info(f"Extracting audio segment: {start_time:.2f}s to {start_time + duration:.2f}s")
                 audio = AudioSegment.from_file(str(audio_path))
                 start_ms = int(start_time * 1000)
                 end_ms = int((start_time + duration) * 1000)
                 clip = audio[start_ms:end_ms]
                 clip.export(str(audio_clip_path), format="wav")
+                logger.info(f"Audio clip exported to: {audio_clip_path}")
 
                 if progress_callback:
                     progress_callback("Connecting to Wan2.2-S2V...", 0.2)
 
                 # Get the Gradio client
+                logger.info("Getting Gradio client for Wan2.2-S2V...")
                 client = self._get_client()
+                logger.info("Gradio client connected")
 
                 if progress_callback:
-                    progress_callback("Generating lip-sync animation...", 0.3)
+                    progress_callback("Generating lip-sync animation (this may take 10-20 min)...", 0.3)
 
-                # Call the Wan2.2-S2V API with elapsed time tracking and retry logic
+                # Call the Wan2.2-S2V API - synchronous call
                 # API expects: ref_img, audio, resolution
-                result = None
-                last_error = None
+                logger.info(f"Calling Wan2.2-S2V API with image={image_path}, resolution={resolution}")
+                api_start = time.time()
+                result = client.predict(
+                    ref_img=handle_file(str(image_path)),
+                    audio=handle_file(str(audio_clip_path)),
+                    resolution=resolution,
+                    api_name="/predict"
+                )
+                elapsed = time.time() - api_start
+                logger.info(f"API call completed in {_format_elapsed(elapsed)}")
+                logger.info(f"API result type: {type(result)}, value: {result}")
 
-                for attempt in range(self.max_retries):
-                    result_holder = {"result": None, "error": None, "done": False}
-                    start_time_api = time.time()
-
-                    def call_api():
-                        try:
-                            result_holder["result"] = client.predict(
-                                ref_img=handle_file(str(image_path)),
-                                audio=handle_file(str(audio_clip_path)),
-                                resolution=resolution,
-                                api_name="/predict"
-                            )
-                        except Exception as e:
-                            result_holder["error"] = e
-                        finally:
-                            result_holder["done"] = True
-
-                    # Start API call in background thread
-                    api_thread = threading.Thread(target=call_api, daemon=True)
-                    api_thread.start()
-
-                    # Show elapsed time while waiting (with timeout)
-                    timed_out = False
-                    while not result_holder["done"]:
-                        elapsed = time.time() - start_time_api
-                        if elapsed > self.timeout:
-                            timed_out = True
-                            break
-                        if progress_callback:
-                            retry_info = f" (attempt {attempt + 1}/{self.max_retries})" if attempt > 0 else ""
-                            progress_callback(
-                                f"Generating lip-sync... ({_format_elapsed(elapsed)} elapsed){retry_info}",
-                                min(0.3 + (elapsed / 1200) * 0.5, 0.8)
-                            )
-                        time.sleep(5)
-
-                    if timed_out:
-                        elapsed = time.time() - start_time_api
-                        if progress_callback:
-                            progress_callback(
-                                f"Timeout after {_format_elapsed(elapsed)}, retrying ({attempt + 2}/{self.max_retries})...",
-                                0.3
-                            )
-                        # Reset client for next attempt (fresh connection)
-                        self._client = None
-                        client = self._get_client()
-                        last_error = TimeoutError(f"Timed out after {_format_elapsed(elapsed)}")
-                        continue
-
-                    # Check for errors
-                    if result_holder["error"]:
-                        last_error = result_holder["error"]
-                        if progress_callback:
-                            progress_callback(
-                                f"Error: {str(last_error)[:50]}, retrying ({attempt + 2}/{self.max_retries})...",
-                                0.3
-                            )
-                        # Reset client for next attempt
-                        self._client = None
-                        client = self._get_client()
-                        continue
-
-                    # Success!
-                    result = result_holder["result"]
-                    elapsed_total = time.time() - start_time_api
-                    if progress_callback:
-                        progress_callback(f"Processing result... (took {_format_elapsed(elapsed_total)})", 0.9)
-                    break
-
-                # If all retries failed
-                if result is None and last_error:
-                    raise last_error
+                if progress_callback:
+                    progress_callback(f"Processing result... (took {_format_elapsed(elapsed)})", 0.9)
 
                 # Result is a dict with 'video' and 'subtitles' keys
                 # The video value is a filepath string
                 video_path = None
                 if isinstance(result, dict):
                     video_path = result.get('video')
+                    logger.info(f"Extracted video path from dict: {video_path}")
                 elif isinstance(result, str):
                     video_path = result
+                    logger.info(f"Result is string path: {video_path}")
 
-                if video_path and Path(video_path).exists():
-                    # Copy to output path
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy(video_path, output_path)
+                if video_path:
+                    video_exists = Path(video_path).exists()
+                    logger.info(f"Video path exists: {video_exists}")
+                    if video_exists:
+                        # Copy to output path
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy(video_path, output_path)
+                        logger.info(f"Video copied to: {output_path}")
 
-                    if progress_callback:
-                        progress_callback("Animation complete!", 1.0)
+                        if progress_callback:
+                            progress_callback("Animation complete!", 1.0)
 
-                    return output_path
+                        return output_path
+                    else:
+                        logger.error(f"Video file does not exist: {video_path}")
+                        if progress_callback:
+                            progress_callback("Video file not found", 0.0)
                 else:
-                    print(f"Lip sync result: {result}")
+                    logger.error(f"No video path in result: {result}")
                     if progress_callback:
                         progress_callback("No video generated", 0.0)
 
             except Exception as e:
-                print(f"Lip sync animation failed: {e}")
+                logger.error(f"Lip sync animation failed: {e}", exc_info=True)
                 if progress_callback:
                     progress_callback(f"Animation failed: {e}", 0.0)
                 return None
