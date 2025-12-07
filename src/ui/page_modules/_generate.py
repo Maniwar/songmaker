@@ -2447,7 +2447,16 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
     ]
 
     if not pending_scenes:
-        st.info("No scenes need animation!")
+        # Debug: show why no scenes need animation
+        scenes_with_animation = [s for s in scenes if getattr(s, 'animation_type', AnimationType.NONE) != AnimationType.NONE]
+        if scenes_with_animation:
+            already_done = [s for s in scenes_with_animation if getattr(s, 'video_path', None) and Path(s.video_path).exists()]
+            if already_done:
+                st.info(f"All {len(already_done)} animated scenes already have videos. Delete the animation files to regenerate.")
+            else:
+                st.info("No scenes need animation!")
+        else:
+            st.info("No scenes have animation types set. Select an animation type for scenes you want to animate.")
         return
 
     # Count by type
