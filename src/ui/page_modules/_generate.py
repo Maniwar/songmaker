@@ -2769,275 +2769,133 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
         status_label += f" ({', '.join(type_parts)})"
 
     with st.status(f"{status_label}...", expanded=True) as status:
-        st.write(f"Resolution: {resolution}")
-
-        # Create animators lazily
-        lip_sync_animator = None
-        prompt_animator = None
-        veo_animator = None
-        atlascloud_animator = None
-        seedance_animator = None
+        parallel_mode = max_workers > 1
+        if parallel_mode:
+            st.write(f"Resolution: {resolution} | Parallel jobs: {max_workers}")
+        else:
+            st.write(f"Resolution: {resolution} | Sequential mode")
 
         progress_bar = st.progress(0.0, text="Starting animations...")
-        last_error_msg = None  # Track last error message for display
+        last_error_msg = None
+
+        # Build list of tasks to execute
+        tasks = []
+        for scene in pending_scenes:
+            output_path = animations_dir / f"animated_scene_{scene.index:03d}.mp4"
+            tasks.append((scene, output_path))
 
         success_count = 0
-        for idx, scene in enumerate(pending_scenes):
-            anim_type = getattr(scene, 'animation_type', AnimationType.LIP_SYNC)
-            anim_type_names = {
-                AnimationType.LIP_SYNC: "lip-sync",
-                AnimationType.PROMPT: "prompt",
-                AnimationType.VEO: "Veo",
-                AnimationType.ATLASCLOUD: "AtlasCloud",
-                AnimationType.SEEDANCE: "Seedance",
-                AnimationType.KLING: "Kling Lip Sync",
-                AnimationType.WAN_S2V: "Wan S2V",
-                AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync",
-            }
-            anim_type_name = anim_type_names.get(anim_type, "unknown")
+        results_by_scene = {}  # scene.index -> result dict
 
-            progress_bar.progress(
-                idx / len(pending_scenes),
-                text=f"Animating scene {scene.index + 1} ({anim_type_name}) ({idx + 1}/{len(pending_scenes)})..."
-            )
+        if parallel_mode and len(tasks) > 1:
+            # PARALLEL EXECUTION using ThreadPoolExecutor
+            st.write(f"Launching {len(tasks)} animations in parallel...")
 
-            output_path = animations_dir / f"animated_scene_{scene.index:03d}.mp4"
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks
+                futures = {
+                    executor.submit(
+                        _animate_single_scene_worker,
+                        scene,
+                        audio_path,
+                        output_path,
+                        resolution,
+                    ): scene.index
+                    for scene, output_path in tasks
+                }
 
-            # Track progress messages and last shown message
-            error_msg_holder = {"msg": None}
-            last_shown_msg = {"msg": None}
+                # Process results as they complete
+                completed_count = 0
+                for future in as_completed(futures):
+                    scene_index = futures[future]
+                    completed_count += 1
 
-            def progress_callback(msg: str, prog: float):
-                # Show all progress messages - user wants to see elapsed time
-                st.write(f"  {msg}")
-                last_shown_msg["msg"] = msg
-
-                # Capture error messages (progress 0.0 usually indicates error)
-                if prog == 0.0 and ("failed" in msg.lower() or "error" in msg.lower() or
-                                   "exceeded" in msg.lower() or "queue too long" in msg.lower()):
-                    error_msg_holder["msg"] = msg
-
-            try:
-                result = None
-
-                if anim_type == AnimationType.LIP_SYNC:
-                    # Lip sync requires audio
-                    if not audio_path or audio_path == "demo_mode":
-                        st.write(f"⚠️ Scene {scene.index + 1}: Skipped - no audio for lip sync")
-                        continue
-
-                    if lip_sync_animator is None:
-                        st.write("Using Wan2.2-S2V for lip-sync (FREE, cloud-based)")
-                        lip_sync_animator = LipSyncAnimator()
-
-                    result = lip_sync_animator.animate_scene(
-                        image_path=Path(scene.image_path),
-                        audio_path=Path(audio_path),
-                        start_time=scene.start_time,
-                        duration=scene.duration,
-                        output_path=output_path,
-                        resolution=resolution,
-                        progress_callback=progress_callback,
+                    progress_bar.progress(
+                        completed_count / len(tasks),
+                        text=f"Completed {completed_count}/{len(tasks)} animations..."
                     )
 
-                elif anim_type == AnimationType.PROMPT:
-                    if prompt_animator is None:
-                        st.write("Using Wan2.2-TI2V-5B for prompt animation (FREE, cloud-based)")
-                        # Use chainer which handles long scenes by generating multiple
-                        # segments and stitching them together
-                        prompt_animator = PromptAnimationChainer()
+                    try:
+                        result = future.result()
+                        results_by_scene[scene_index] = result
+                    except Exception as e:
+                        results_by_scene[scene_index] = {
+                            "scene_index": scene_index,
+                            "success": False,
+                            "result_path": None,
+                            "messages": [f"Thread error: {str(e)[:100]}"],
+                            "error": str(e)[:100],
+                        }
 
-                    motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            # Display all results in scene order
+            st.write("---")
+            st.write("**Results:**")
+            for scene, _ in tasks:
+                result = results_by_scene.get(scene.index, {})
+                scene_label = f"Scene {scene.index + 1}"
 
-                    # Chainer handles scenes of any length:
-                    # - Short scenes (<=5s): generates single segment
-                    # - Long scenes (>5s): chains multiple segments using last frame
-                    result = prompt_animator.animate_scene(
-                        image_path=Path(scene.image_path),
-                        prompt=motion_prompt,
-                        output_path=output_path,
-                        duration_seconds=scene.duration,  # Request exact duration
-                        quality_preset="fast",  # 320x576, 8 steps - reliable for free tier
-                        progress_callback=progress_callback,
-                    )
+                # Show messages for this scene
+                for msg in result.get("messages", []):
+                    st.write(f"  [{scene_label}] {msg}")
 
-                elif anim_type == AnimationType.VEO:
-                    if veo_animator is None:
-                        st.write("Using Google Veo 3.1 (PAID, high-quality)")
-                        # Use chainer which handles long scenes by generating multiple
-                        # segments and stitching them together
-                        veo_animator = VeoAnimationChainer()
+                if result.get("success"):
+                    scene.video_path = result.get("result_path")
+                    scene.animated = True
+                    success_count += 1
+                    st.write(f"✅ {scene_label} animated successfully")
+                elif result.get("skipped"):
+                    st.write(f"⚠️ {scene_label}: {result.get('error', 'Skipped')}")
+                else:
+                    error = result.get("error", "Unknown error")
+                    st.write(f"❌ {scene_label}: {error}")
+                    last_error_msg = error
 
-                    motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+        else:
+            # SEQUENTIAL EXECUTION (max_workers=1 or single task)
+            for idx, (scene, output_path) in enumerate(tasks):
+                anim_type = getattr(scene, 'animation_type', AnimationType.LIP_SYNC)
+                anim_type_names = {
+                    AnimationType.LIP_SYNC: "lip-sync",
+                    AnimationType.PROMPT: "prompt",
+                    AnimationType.VEO: "Veo",
+                    AnimationType.ATLASCLOUD: "AtlasCloud",
+                    AnimationType.SEEDANCE: "Seedance",
+                    AnimationType.KLING: "Kling Lip Sync",
+                    AnimationType.WAN_S2V: "Wan S2V",
+                    AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync",
+                }
+                anim_type_name = anim_type_names.get(anim_type, "unknown")
 
-                    # Chainer handles scenes of any length:
-                    # - Short scenes (<=8s): generates single segment
-                    # - Long scenes (>8s): chains multiple segments using last frame
-                    result = veo_animator.animate_scene(
-                        image_path=Path(scene.image_path),
-                        prompt=motion_prompt,
-                        output_path=output_path,
-                        duration_seconds=scene.duration,  # Request exact duration
-                        resolution="720p",  # Default to 720p for speed
-                        progress_callback=progress_callback,
-                    )
+                progress_bar.progress(
+                    idx / len(tasks),
+                    text=f"Animating scene {scene.index + 1} ({anim_type_name}) ({idx + 1}/{len(tasks)})..."
+                )
 
-                elif anim_type == AnimationType.ATLASCLOUD:
-                    if atlascloud_animator is None:
-                        st.write("Using AtlasCloud Wan 2.5 (PAID, no GPU limits)")
-                        atlascloud_animator = AtlasCloudAnimator()
+                st.write(f"**Scene {scene.index + 1}** ({anim_type_name}):")
 
-                    motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+                # Use the worker function but show messages in real-time
+                result = _animate_single_scene_worker(
+                    scene,
+                    audio_path,
+                    output_path,
+                    resolution,
+                )
 
-                    # AtlasCloud supports 5 or 10 second durations
-                    result = atlascloud_animator.animate_scene(
-                        image_path=Path(scene.image_path),
-                        prompt=motion_prompt,
-                        output_path=output_path,
-                        duration_seconds=5 if scene.duration < 7.5 else 10,
-                        resolution="720p",
-                        progress_callback=progress_callback,
-                    )
+                # Display messages
+                for msg in result.get("messages", []):
+                    st.write(f"  {msg}")
 
-                elif anim_type == AnimationType.SEEDANCE:
-                    if seedance_animator is None:
-                        st.write("Using Seedance Pro (PAID, up to 12s)")
-                        seedance_animator = SeedanceAnimator()
-
-                    motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
-
-                    # Seedance supports 2-12 second durations
-                    target_duration = min(12, max(2, int(scene.duration)))
-                    result = seedance_animator.animate_scene(
-                        image_path=Path(scene.image_path),
-                        prompt=motion_prompt,
-                        output_path=output_path,
-                        duration_seconds=target_duration,
-                        resolution="720p",
-                        progress_callback=progress_callback,
-                    )
-
-                elif anim_type == AnimationType.KLING:
-                    # Kling AI image-to-video with lip sync via fal.ai
-                    if not audio_path or audio_path == "demo_mode":
-                        st.write(f"⚠️ Scene {scene.index + 1}: Skipped - no audio for Kling lip sync")
-                        continue
-
-                    st.write("Using Kling (PAID, lip sync via fal.ai)")
-                    kling_animator = KlingAnimator()
-                    result = kling_animator.animate_scene(
-                        image_path=Path(scene.image_path),
-                        audio_path=Path(audio_path),
-                        start_time=scene.start_time,
-                        duration=scene.duration,
-                        output_path=output_path,
-                        resolution="720p",
-                        use_i2v=False,  # Use static video as base (cheaper)
-                        progress_callback=progress_callback,
-                    )
-
-                elif anim_type == AnimationType.WAN_S2V:
-                    # Wan 2.2 S2V via fal.ai - full motion + lip sync in one step
-                    if not audio_path or audio_path == "demo_mode":
-                        st.write(f"⚠️ Scene {scene.index + 1}: Skipped - no audio for Wan S2V")
-                        continue
-
-                    st.write("Using Wan S2V (PAID, motion + lip sync via fal.ai)")
-                    wan_s2v_animator = WanS2VAnimator()
-                    motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
-                    result = wan_s2v_animator.animate_scene(
-                        image_path=Path(scene.image_path),
-                        audio_path=Path(audio_path),
-                        start_time=scene.start_time,
-                        duration=scene.duration,
-                        output_path=output_path,
-                        prompt=motion_prompt,
-                        progress_callback=progress_callback,
-                    )
-
-                elif anim_type == AnimationType.SEEDANCE_LIPSYNC:
-                    # Two-step workflow: Seedance motion → Kling lip sync
-                    if not audio_path or audio_path == "demo_mode":
-                        st.write(f"⚠️ Scene {scene.index + 1}: Skipped - no audio for lip sync")
-                        continue
-
-                    motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
-                    target_duration = min(10, max(2, int(scene.duration)))  # Kling lipsync max 10s
-
-                    # Check if motion file already exists (resume support)
-                    motion_output = output_path.with_suffix(".motion.mp4")
-                    motion_result = None
-
-                    if motion_output.exists():
-                        st.write("Step 1: ✅ Motion video already exists, resuming from Step 2...")
-                        motion_result = motion_output
-                    else:
-                        st.write("Step 1: Generating motion with Seedance Pro...")
-                        if seedance_animator is None:
-                            seedance_animator = SeedanceAnimator()
-
-                        motion_result = seedance_animator.animate_scene(
-                            image_path=Path(scene.image_path),
-                            prompt=motion_prompt,
-                            output_path=motion_output,
-                            duration_seconds=target_duration,
-                            resolution="720p",
-                            progress_callback=progress_callback,
-                        )
-
-                    if motion_result and motion_result.exists():
-                        st.write("Step 2: Applying lip sync with Kling (fal.ai)...")
-                        lipsync_animator = KlingAnimator()
-
-                        result = lipsync_animator.apply_lipsync_to_video(
-                            video_path=motion_result,
-                            audio_path=Path(audio_path),
-                            start_time=scene.start_time,
-                            duration=scene.duration,
-                            output_path=output_path,
-                            progress_callback=progress_callback,
-                        )
-
-                        if result and result.exists():
-                            # Lip sync succeeded - clean up temp motion file
-                            motion_output.unlink(missing_ok=True)
-                        else:
-                            # Lip sync failed - use motion video as fallback
-                            st.write(f"⚠️ Scene {scene.index + 1}: Lip sync failed, using motion video")
-                            import shutil
-                            shutil.move(str(motion_output), str(output_path))
-                            result = output_path
-                    else:
-                        st.write(f"❌ Scene {scene.index + 1}: Motion generation failed")
-                        result = None
-
-                if result and result.exists():
-                    # Update scene with video path directly on the scene object
-                    # (scene is a reference to the object in scenes list)
-                    scene.video_path = result
-                    scene.animated = True  # Mark as animated so UI shows video
+                if result.get("success"):
+                    scene.video_path = result.get("result_path")
+                    scene.animated = True
                     success_count += 1
                     st.write(f"✅ Scene {scene.index + 1} animated successfully")
+                elif result.get("skipped"):
+                    st.write(f"⚠️ Scene {scene.index + 1}: {result.get('error', 'Skipped')}")
                 else:
-                    # Show error message if captured
-                    if error_msg_holder["msg"]:
-                        st.write(f"❌ Scene {scene.index + 1}: {error_msg_holder['msg']}")
-                        last_error_msg = error_msg_holder["msg"]
-                    else:
-                        st.write(f"❌ Scene {scene.index + 1} animation failed")
-
-            except Exception as e:
-                error_str = str(e)
-                # Provide user-friendly error messages
-                if "GPU quota" in error_str or "exceeded" in error_str.lower():
-                    import re
-                    time_match = re.search(r"Try again in (\d+:\d+:\d+)", error_str)
-                    wait_time = time_match.group(1) if time_match else "~24 hours"
-                    user_msg = f"HuggingFace GPU quota exceeded. Try again in {wait_time}."
-                    last_error_msg = user_msg
-                else:
-                    user_msg = str(e)[:100]
-                st.write(f"❌ Scene {scene.index + 1} error: {user_msg}")
+                    error = result.get("error", "Unknown error")
+                    st.write(f"❌ Scene {scene.index + 1}: {error}")
+                    last_error_msg = error
 
         progress_bar.progress(1.0, text="Done!")
         update_state(scenes=scenes)
