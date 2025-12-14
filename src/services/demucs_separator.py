@@ -52,13 +52,18 @@ class DemucsVocalSeparator:
         self._device = None
 
     def _get_device(self) -> str:
-        """Auto-detect best device for Demucs."""
+        """Auto-detect best device for Demucs.
+
+        Note: MPS support in Demucs/torchaudio is unreliable,
+        so we only use CUDA or CPU.
+        """
         try:
             import torch
             if torch.cuda.is_available():
                 return "cuda"
-            elif torch.backends.mps.is_available():
-                return "mps"
+            # MPS is not reliably supported by Demucs/torchaudio
+            # elif torch.backends.mps.is_available():
+            #     return "mps"
         except (ImportError, AttributeError):
             pass
         return "cpu"

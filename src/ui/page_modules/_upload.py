@@ -152,6 +152,17 @@ def render_upload_page() -> None:
         )
         selected_backend = backend_options[selected_label]
 
+        # Demucs vocal separation toggle (only for WhisperX)
+        use_demucs = False
+        if selected_backend == "whisperx":
+            use_demucs = st.checkbox(
+                "Use Demucs vocal separation",
+                value=config.use_demucs,
+                help="Separate vocals from instruments before transcription. "
+                     "Improves accuracy for songs with heavy instrumentation. "
+                     "Requires 'pip install demucs' (adds ~1-2 min processing time).",
+            )
+
         # Process audio button
         if st.button("Process Audio", type="primary"):
             processor = AudioProcessor(backend=selected_backend)
@@ -175,6 +186,7 @@ def render_upload_page() -> None:
                         progress_callback=progress_callback,
                         lyrics_hint=lyrics_for_transcription if lyrics_for_transcription else None,
                         language="en",  # Most Suno songs are English
+                        use_demucs=use_demucs,
                     )
 
                 # Update state

@@ -48,7 +48,7 @@ def render_visual_page() -> None:
     total_duration = state.transcript.duration
     default_num_scenes = max(4, int(total_duration / 15))  # ~4 scenes per minute
     min_scenes = max(4, int(total_duration / 30))  # Minimum ~2 per minute
-    max_scenes = min(30, int(total_duration / 5))  # Maximum ~12 per minute
+    max_scenes = min(100, int(total_duration / 3))  # Maximum ~20 per minute
 
     # Get visual messages from state or initialize
     visual_messages = getattr(state, 'visual_messages', [])

@@ -1,6 +1,7 @@
 """Visual Style Agent for collaborative visual style and scene prompt development."""
 
 import logging
+import time
 from typing import Optional
 
 import anthropic
@@ -149,7 +150,18 @@ class VisualStyleAgent:
                 f"Scene {i+1} ({start_time:.1f}s - {end_time:.1f}s): \"{lyrics_segment[:60]}{'...' if len(lyrics_segment) > 60 else ''}\""
             )
 
-        self._scene_info_text = f"""## Scene Breakdown ({self._num_scenes} scenes total)
+        # For large scene counts, show only summary + first/last few scenes to save tokens
+        if self._num_scenes > 30:
+            preview_lines = scene_lines[:5] + [f"... (scenes 6-{self._num_scenes - 5} omitted for brevity) ..."] + scene_lines[-5:]
+            self._scene_info_text = f"""## Scene Breakdown ({self._num_scenes} scenes total)
+Song duration: {total_duration:.1f} seconds
+Each scene: ~{scene_duration:.1f} seconds
+
+NOTE: With {self._num_scenes} scenes, showing preview only. Full timing will be provided during extraction.
+
+""" + "\n".join(preview_lines)
+        else:
+            self._scene_info_text = f"""## Scene Breakdown ({self._num_scenes} scenes total)
 Song duration: {total_duration:.1f} seconds
 Each scene: ~{scene_duration:.1f} seconds
 
@@ -208,7 +220,18 @@ Each scene: ~{scene_duration:.1f} seconds
                 f"Scene {i+1} ({start_time:.1f}s - {end_time:.1f}s): \"{lyrics_segment[:60]}{'...' if len(lyrics_segment) > 60 else ''}\""
             )
 
-        self._scene_info_text = f"""## Scene Breakdown ({self._num_scenes} scenes total)
+        # For large scene counts, show only summary + first/last few scenes to save tokens
+        if self._num_scenes > 30:
+            preview_lines = scene_lines[:5] + [f"... (scenes 6-{self._num_scenes - 5} omitted for brevity) ..."] + scene_lines[-5:]
+            self._scene_info_text = f"""## Scene Breakdown ({self._num_scenes} scenes total)
+Song duration: {total_duration:.1f} seconds
+Each scene: ~{scene_duration:.1f} seconds
+
+NOTE: With {self._num_scenes} scenes, showing preview only. Full timing will be provided during extraction.
+
+""" + "\n".join(preview_lines)
+        else:
+            self._scene_info_text = f"""## Scene Breakdown ({self._num_scenes} scenes total)
 Song duration: {total_duration:.1f} seconds
 Each scene: ~{scene_duration:.1f} seconds
 
@@ -276,13 +299,27 @@ User's message: {user_message}"""
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": full_user_message})
 
-        # Send to Claude with dynamic system prompt
-        response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
-            max_tokens=8192,  # Increased to handle 20+ scene descriptions
-            system=self._get_system_prompt(),
-            messages=self.conversation_history,
-        )
+        # Send to Claude with dynamic system prompt (with retry for overload)
+        max_retries = 5
+        base_delay = 2  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                response = client.messages.create(
+                    model="claude-sonnet-4-5-20250929",
+                    max_tokens=8192,  # Increased to handle 20+ scene descriptions
+                    system=self._get_system_prompt(),
+                    messages=self.conversation_history,
+                )
+                break  # Success, exit retry loop
+            except anthropic.OverloadedError as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"Anthropic API overloaded, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Anthropic API overloaded after {max_retries} attempts")
+                    raise
 
         assistant_message = response.content[0].text
 

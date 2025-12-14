@@ -7,30 +7,30 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables (override=True to ensure .env takes precedence)
+load_dotenv(override=True)
 
 
 def _get_default_whisper_device() -> str:
     """Auto-detect the best device for WhisperX.
 
     Priority:
-    1. WHISPER_DEVICE env var if set
-    2. MPS on Apple Silicon (macOS with M-series chips)
-    3. CUDA if available
-    4. CPU as fallback
+    1. WHISPER_DEVICE env var if set (mps is translated to cpu)
+    2. CUDA if available
+    3. CPU as fallback
+
+    Note: WhisperX uses CTranslate2/faster-whisper which only accepts "cpu" or "cuda".
+    On Apple Silicon, "cpu" automatically uses the Accelerate framework for speed.
+    If WHISPER_DEVICE=mps is set, we translate it to "cpu" since CTranslate2
+    doesn't accept "mps" as a device string.
     """
     env_device = os.getenv("WHISPER_DEVICE")
     if env_device:
+        # CTranslate2 doesn't accept "mps" - translate to "cpu"
+        # (Apple Silicon acceleration via Accelerate framework is automatic with "cpu")
+        if env_device.lower() == "mps":
+            return "cpu"
         return env_device
-
-    # Try MPS (Apple Silicon)
-    try:
-        import torch
-        if torch.backends.mps.is_available():
-            return "mps"
-    except (ImportError, AttributeError):
-        pass
 
     # Try CUDA
     try:
