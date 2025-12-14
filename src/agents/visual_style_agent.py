@@ -401,13 +401,31 @@ User's message: {user_message}"""
             "has_content": len(self.conversation_history) > 0,
         }
 
+    # Batch size for scene extraction (to avoid token limits)
+    SCENE_BATCH_SIZE = 25
+
     def extract_visual_plan(self) -> Optional[VisualPlan]:
         """
         Extract a structured VisualPlan from the conversation.
 
+        For large scene counts (>25), uses batched extraction to avoid token limits.
+        Each batch maintains consistency by referencing previous scene prompts.
+
         Returns:
             VisualPlan if extraction successful, None otherwise
         """
+        import json
+        import re
+
+        # For small scene counts, use single extraction
+        if self._num_scenes <= self.SCENE_BATCH_SIZE:
+            return self._extract_single_batch()
+
+        # For large scene counts, use batched extraction
+        return self._extract_batched()
+
+    def _extract_single_batch(self) -> Optional[VisualPlan]:
+        """Extract visual plan in a single API call (for ≤25 scenes)."""
         import json
         import re
 
@@ -442,11 +460,11 @@ RULES:
         messages = self.conversation_history.copy()
         messages.append({"role": "user", "content": extraction_prompt})
 
-        logger.info(f"Extracting visual plan for {self._num_scenes} scenes...")
+        logger.info(f"Extracting visual plan for {self._num_scenes} scenes (single batch)...")
 
         response = client.messages.create(
             model="claude-sonnet-4-5-20250929",
-            max_tokens=16384,  # Increased for many scenes (20+ scenes)
+            max_tokens=16384,
             system="You are a JSON extraction assistant. Return only valid JSON, no markdown formatting, no explanation text. Be concise with visual_prompt (1-2 sentences each).",
             messages=messages,
         )
@@ -454,104 +472,272 @@ RULES:
         response_text = response.content[0].text.strip()
         logger.debug(f"Extraction response (first 500 chars): {response_text[:500]}")
 
-        def try_parse_plan(data: dict) -> Optional[VisualPlan]:
-            """Try to create VisualPlan with fallbacks for missing fields."""
-            # Ensure required fields have values
-            if "visual_world" not in data or not data["visual_world"]:
-                logger.warning("Missing visual_world, using default")
-                data["visual_world"] = "Cinematic visual style"
-            if "character_description" not in data or not data["character_description"]:
-                logger.warning("Missing character_description, using default")
-                data["character_description"] = "Main character"
-            if "cinematography_style" not in data or not data["cinematography_style"]:
-                logger.warning("Missing cinematography_style, using default")
-                data["cinematography_style"] = "Cinematic film style"
+        return self._parse_full_plan(response_text)
 
-            # Parse scene prompts
-            scene_prompts = []
-            for sp_data in data.get("scene_prompts", []):
-                try:
-                    # Convert effect string to enum
-                    effect_str = sp_data.get("effect", "zoom_in").lower()
-                    effect_map = {
-                        "zoom_in": KenBurnsEffect.ZOOM_IN,
-                        "zoom_out": KenBurnsEffect.ZOOM_OUT,
-                        "pan_left": KenBurnsEffect.PAN_LEFT,
-                        "pan_right": KenBurnsEffect.PAN_RIGHT,
-                        "pan_up": KenBurnsEffect.PAN_UP,
-                        "pan_down": KenBurnsEffect.PAN_DOWN,
-                    }
-                    effect = effect_map.get(effect_str, KenBurnsEffect.ZOOM_IN)
+    def _extract_batched(self) -> Optional[VisualPlan]:
+        """Extract visual plan in batches (for >25 scenes)."""
+        import json
+        import time
 
-                    scene_prompts.append(ScenePrompt(
-                        index=sp_data.get("index", len(scene_prompts)),
-                        start_time=sp_data.get("start_time", 0.0),
-                        end_time=sp_data.get("end_time", 8.0),
-                        lyrics_segment=sp_data.get("lyrics_segment", ""),
-                        visual_prompt=sp_data.get("visual_prompt", ""),
-                        mood=sp_data.get("mood", "neutral"),
-                        effect=effect,
-                        user_notes=sp_data.get("user_notes"),
-                    ))
-                except Exception as e:
-                    logger.error(f"Error parsing scene prompt {sp_data}: {e}")
-                    continue
+        client = self._get_client()
+        num_batches = (self._num_scenes + self.SCENE_BATCH_SIZE - 1) // self.SCENE_BATCH_SIZE
 
-            logger.info(f"Parsed {len(scene_prompts)} scene prompts (expected {self._num_scenes})")
+        logger.info(f"Extracting visual plan for {self._num_scenes} scenes in {num_batches} batches...")
 
+        # First batch: Extract style info + first batch of scenes
+        first_batch_segments = self._scene_segments[:self.SCENE_BATCH_SIZE]
+        first_batch_info = json.dumps(first_batch_segments, indent=2)
+
+        first_prompt = f"""Based on our conversation, extract the visual plan as JSON.
+
+This song has {self._num_scenes} scenes total. We'll extract them in batches.
+This is BATCH 1 of {num_batches} - extract the visual style AND scenes 1-{len(first_batch_segments)}.
+
+Scene timings for this batch:
+{first_batch_info}
+
+Return ONLY valid JSON:
+{{
+  "visual_world": "setting description",
+  "character_description": "character appearance",
+  "cinematography_style": "style description",
+  "color_palette": "colors or null",
+  "scene_prompts": [
+    {{"index": 0, "start_time": X, "end_time": Y, "lyrics_segment": "...", "visual_prompt": "concise but specific image prompt (1-2 sentences)", "mood": "mood", "effect": "zoom_in"}}
+  ]
+}}
+
+RULES:
+1. Create {len(first_batch_segments)} scene_prompts for this batch (scenes 1-{len(first_batch_segments)})
+2. Use EXACT start_time/end_time from timings above
+3. visual_prompt: concise (1-2 sentences) but specific for AI image generation
+4. effect: zoom_in, zoom_out, pan_left, pan_right, pan_up, or pan_down
+5. NO markdown, NO explanation - ONLY the JSON object"""
+
+        messages = self.conversation_history.copy()
+        messages.append({"role": "user", "content": first_prompt})
+
+        # First batch with retry logic
+        first_response = self._call_with_retry(
+            client, messages,
+            "You are a JSON extraction assistant. Return only valid JSON, no markdown formatting, no explanation text. Be concise with visual_prompt (1-2 sentences each)."
+        )
+
+        if not first_response:
+            logger.error("First batch extraction failed")
+            return None
+
+        # Parse first batch to get style info and initial scenes
+        first_data = self._parse_json_response(first_response)
+        if not first_data:
+            logger.error("Failed to parse first batch JSON")
+            return None
+
+        # Extract style info
+        visual_world = first_data.get("visual_world", "Cinematic visual style")
+        character_description = first_data.get("character_description", "Main character")
+        cinematography_style = first_data.get("cinematography_style", "Cinematic film style")
+        color_palette = first_data.get("color_palette")
+
+        # Collect all scene prompts
+        all_scene_prompts = first_data.get("scene_prompts", [])
+        logger.info(f"Batch 1: extracted {len(all_scene_prompts)} scenes")
+
+        # Subsequent batches: Extract remaining scenes
+        for batch_idx in range(1, num_batches):
+            start_idx = batch_idx * self.SCENE_BATCH_SIZE
+            end_idx = min(start_idx + self.SCENE_BATCH_SIZE, self._num_scenes)
+            batch_segments = self._scene_segments[start_idx:end_idx]
+            batch_info = json.dumps(batch_segments, indent=2)
+
+            # Get last few scenes from previous batch for context
+            prev_scenes_context = all_scene_prompts[-3:] if len(all_scene_prompts) >= 3 else all_scene_prompts
+            prev_context_str = json.dumps(prev_scenes_context, indent=2)
+
+            batch_prompt = f"""Continue extracting scene prompts for the music video.
+
+BATCH {batch_idx + 1} of {num_batches} - scenes {start_idx + 1}-{end_idx} of {self._num_scenes}.
+
+Visual style (maintain consistency):
+- Visual World: {visual_world}
+- Character: {character_description}
+- Cinematography: {cinematography_style}
+
+Previous scenes for reference (maintain visual continuity):
+{prev_context_str}
+
+Scene timings for THIS BATCH:
+{batch_info}
+
+Return ONLY a JSON array of scene_prompts for scenes {start_idx + 1}-{end_idx}:
+[
+  {{"index": {start_idx}, "start_time": X, "end_time": Y, "lyrics_segment": "...", "visual_prompt": "...", "mood": "...", "effect": "zoom_in"}}
+]
+
+RULES:
+1. Create EXACTLY {len(batch_segments)} scene prompts (indices {start_idx}-{end_idx - 1})
+2. Use EXACT start_time/end_time from timings above
+3. Maintain visual consistency with previous scenes
+4. effect: zoom_in, zoom_out, pan_left, pan_right, pan_up, or pan_down
+5. NO markdown, NO explanation - ONLY the JSON array"""
+
+            batch_messages = [{"role": "user", "content": batch_prompt}]
+
+            batch_response = self._call_with_retry(
+                client, batch_messages,
+                f"You are extracting scene prompts for a music video. Maintain consistency with: {visual_world}. Return only a JSON array."
+            )
+
+            if batch_response:
+                batch_scenes = self._parse_json_response(batch_response)
+                if isinstance(batch_scenes, list):
+                    all_scene_prompts.extend(batch_scenes)
+                    logger.info(f"Batch {batch_idx + 1}: extracted {len(batch_scenes)} scenes (total: {len(all_scene_prompts)})")
+                elif isinstance(batch_scenes, dict) and "scene_prompts" in batch_scenes:
+                    all_scene_prompts.extend(batch_scenes["scene_prompts"])
+                    logger.info(f"Batch {batch_idx + 1}: extracted {len(batch_scenes['scene_prompts'])} scenes (total: {len(all_scene_prompts)})")
+                else:
+                    logger.warning(f"Batch {batch_idx + 1}: unexpected response format")
+            else:
+                logger.warning(f"Batch {batch_idx + 1} failed, continuing with partial results")
+
+            # Small delay between batches to avoid rate limiting
+            time.sleep(0.5)
+
+        logger.info(f"Batched extraction complete: {len(all_scene_prompts)} scenes extracted")
+
+        # Build final plan data
+        plan_data = {
+            "visual_world": visual_world,
+            "character_description": character_description,
+            "cinematography_style": cinematography_style,
+            "color_palette": color_palette,
+            "scene_prompts": all_scene_prompts,
+        }
+
+        return self._build_visual_plan(plan_data)
+
+    def _call_with_retry(self, client, messages: list, system: str, max_retries: int = 3) -> Optional[str]:
+        """Call Claude API with retry logic for overload errors."""
+        import time
+
+        for attempt in range(max_retries):
             try:
-                return VisualPlan(
-                    visual_world=data["visual_world"],
-                    character_description=data["character_description"],
-                    cinematography_style=data["cinematography_style"],
-                    color_palette=data.get("color_palette"),
-                    scene_prompts=scene_prompts,
+                response = client.messages.create(
+                    model="claude-sonnet-4-5-20250929",
+                    max_tokens=8192,
+                    system=system,
+                    messages=messages,
                 )
+                return response.content[0].text.strip()
+            except anthropic.OverloadedError:
+                if attempt < max_retries - 1:
+                    delay = 2 * (2 ** attempt)
+                    logger.warning(f"API overloaded, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"API overloaded after {max_retries} attempts")
+                    return None
             except Exception as e:
-                logger.error(f"VisualPlan validation error: {e}")
+                logger.error(f"API call failed: {e}")
                 return None
+        return None
 
-        # Try to extract JSON from various formats
+    def _parse_json_response(self, response_text: str) -> Optional[dict | list]:
+        """Parse JSON from API response, handling various formats."""
+        import json
+        import re
+
+        # Try direct parse
         try:
-            # First, try direct parse
-            plan_data = json.loads(response_text)
-            logger.info("Successfully parsed JSON directly")
-            result = try_parse_plan(plan_data)
-            if result:
-                logger.info("Visual plan extraction successful")
-                return result
-        except json.JSONDecodeError as e:
-            logger.debug(f"Direct JSON parse failed: {e}")
+            return json.loads(response_text)
+        except json.JSONDecodeError:
+            pass
 
-        # Try to find JSON in markdown code block
+        # Try markdown code block
         json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
         if json_match:
             try:
-                plan_data = json.loads(json_match.group(1))
-                logger.info("Successfully parsed JSON from markdown code block")
-                result = try_parse_plan(plan_data)
-                if result:
-                    logger.info("Visual plan extraction successful")
-                    return result
-            except json.JSONDecodeError as e:
-                logger.debug(f"Markdown JSON parse failed: {e}")
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                pass
 
-        # Try to find JSON object in text
-        json_match = re.search(r'\{[\s\S]*\}', response_text)
-        if json_match:
-            try:
-                plan_data = json.loads(json_match.group(0))
-                logger.info("Successfully parsed JSON from text extraction")
-                result = try_parse_plan(plan_data)
-                if result:
-                    logger.info("Visual plan extraction successful")
-                    return result
-            except json.JSONDecodeError as e:
-                logger.debug(f"Text extraction JSON parse failed: {e}")
+        # Try to find JSON object or array in text
+        for pattern in [r'\[[\s\S]*\]', r'\{[\s\S]*\}']:
+            json_match = re.search(pattern, response_text)
+            if json_match:
+                try:
+                    return json.loads(json_match.group(0))
+                except json.JSONDecodeError:
+                    pass
 
-        # All parsing attempts failed
-        logger.error(f"Failed to extract visual plan. Response text: {response_text[:1000]}")
+        logger.debug(f"Failed to parse JSON from: {response_text[:200]}...")
         return None
+
+    def _parse_full_plan(self, response_text: str) -> Optional[VisualPlan]:
+        """Parse a complete visual plan from response text."""
+        plan_data = self._parse_json_response(response_text)
+        if not plan_data or not isinstance(plan_data, dict):
+            logger.error("Failed to parse visual plan JSON")
+            return None
+        return self._build_visual_plan(plan_data)
+
+    def _build_visual_plan(self, data: dict) -> Optional[VisualPlan]:
+        """Build a VisualPlan from parsed JSON data."""
+        # Ensure required fields have values
+        if "visual_world" not in data or not data["visual_world"]:
+            logger.warning("Missing visual_world, using default")
+            data["visual_world"] = "Cinematic visual style"
+        if "character_description" not in data or not data["character_description"]:
+            logger.warning("Missing character_description, using default")
+            data["character_description"] = "Main character"
+        if "cinematography_style" not in data or not data["cinematography_style"]:
+            logger.warning("Missing cinematography_style, using default")
+            data["cinematography_style"] = "Cinematic film style"
+
+        # Parse scene prompts
+        scene_prompts = []
+        for sp_data in data.get("scene_prompts", []):
+            try:
+                # Convert effect string to enum
+                effect_str = sp_data.get("effect", "zoom_in").lower()
+                effect_map = {
+                    "zoom_in": KenBurnsEffect.ZOOM_IN,
+                    "zoom_out": KenBurnsEffect.ZOOM_OUT,
+                    "pan_left": KenBurnsEffect.PAN_LEFT,
+                    "pan_right": KenBurnsEffect.PAN_RIGHT,
+                    "pan_up": KenBurnsEffect.PAN_UP,
+                    "pan_down": KenBurnsEffect.PAN_DOWN,
+                }
+                effect = effect_map.get(effect_str, KenBurnsEffect.ZOOM_IN)
+
+                scene_prompts.append(ScenePrompt(
+                    index=sp_data.get("index", len(scene_prompts)),
+                    start_time=sp_data.get("start_time", 0.0),
+                    end_time=sp_data.get("end_time", 8.0),
+                    lyrics_segment=sp_data.get("lyrics_segment", ""),
+                    visual_prompt=sp_data.get("visual_prompt", ""),
+                    mood=sp_data.get("mood", "neutral"),
+                    effect=effect,
+                    user_notes=sp_data.get("user_notes"),
+                ))
+            except Exception as e:
+                logger.error(f"Error parsing scene prompt {sp_data}: {e}")
+                continue
+
+        logger.info(f"Parsed {len(scene_prompts)} scene prompts (expected {self._num_scenes})")
+
+        try:
+            return VisualPlan(
+                visual_world=data["visual_world"],
+                character_description=data["character_description"],
+                cinematography_style=data["cinematography_style"],
+                color_palette=data.get("color_palette"),
+                scene_prompts=scene_prompts,
+            )
+        except Exception as e:
+            logger.error(f"VisualPlan validation error: {e}")
+            return None
 
     def reset(self) -> None:
         """Reset the conversation history."""

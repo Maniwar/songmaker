@@ -1,9 +1,11 @@
 """Video Generation page - Step 4 of the workflow."""
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+import threading
 
 import streamlit as st
 from pydub import AudioSegment
@@ -1224,7 +1226,7 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
             if wan_pending > 0 and not check_lip_sync_available():
                 st.warning("Lip sync/Prompt animation requires `gradio_client`. Install with: `pip install gradio_client`")
 
-            anim_col1, anim_col2, anim_col3 = st.columns([2, 1, 1])
+            anim_col1, anim_col2, anim_col3, anim_col4 = st.columns([2, 1, 1, 1])
             with anim_col1:
                 resolution = st.selectbox(
                     "Animation Resolution",
@@ -1234,11 +1236,20 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                     key="animation_resolution",
                 )
             with anim_col2:
-                if st.button("🎬 Generate Animations", type="primary"):
-                    generate_animations(state, resolution, is_demo_mode)
+                parallel_workers = st.slider(
+                    "Parallel Jobs",
+                    min_value=1,
+                    max_value=8,
+                    value=3,
+                    help="Number of animations to generate in parallel. Higher values are faster but use more API quota.",
+                    key="animation_parallel_workers",
+                )
             with anim_col3:
+                if st.button("🎬 Generate Animations", type="primary"):
+                    generate_animations(state, resolution, is_demo_mode, max_workers=parallel_workers)
+            with anim_col4:
                 if scenes_with_animation > 0:
-                    if st.button("🔄 Regenerate All Animations"):
+                    if st.button("🔄 Regenerate All"):
                         # Clear existing animations for all types
                         scenes = state.scenes
                         for s in scenes:
@@ -1246,7 +1257,7 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                             if anim_type not in (None, AnimationType.NONE):
                                 s.video_path = None
                         update_state(scenes=scenes)
-                        generate_animations(state, resolution, is_demo_mode)
+                        generate_animations(state, resolution, is_demo_mode, max_workers=parallel_workers)
 
         st.markdown("---")
 
@@ -2419,8 +2430,275 @@ def generate_single_animation(state, scene_index: int, resolution: str = "720P")
     st.rerun()
 
 
-def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = False) -> None:
-    """Generate animations for scenes marked for animation (respects animation type)."""
+def _animate_single_scene_worker(
+    scene,
+    audio_path: Optional[str],
+    output_path: Path,
+    resolution: str,
+) -> dict:
+    """
+    Thread-safe worker function to animate a single scene.
+
+    This function does NOT call st.write or any Streamlit functions.
+    All results are collected and returned for display by the main thread.
+
+    Returns:
+        dict with keys:
+            - scene_index: int
+            - success: bool
+            - result_path: Optional[Path]
+            - messages: list[str] - log messages for display
+            - error: Optional[str] - error message if failed
+    """
+    import shutil
+    import re
+
+    messages = []
+    anim_type = getattr(scene, 'animation_type', AnimationType.LIP_SYNC)
+
+    anim_type_names = {
+        AnimationType.LIP_SYNC: "lip-sync",
+        AnimationType.PROMPT: "prompt",
+        AnimationType.VEO: "Veo",
+        AnimationType.ATLASCLOUD: "AtlasCloud",
+        AnimationType.SEEDANCE: "Seedance",
+        AnimationType.KLING: "Kling Lip Sync",
+        AnimationType.WAN_S2V: "Wan S2V",
+        AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync",
+    }
+    anim_type_name = anim_type_names.get(anim_type, "unknown")
+
+    # Thread-safe progress callback that collects messages
+    def progress_callback(msg: str, prog: float):
+        messages.append(msg)
+
+    try:
+        result = None
+
+        if anim_type == AnimationType.LIP_SYNC:
+            if not audio_path or audio_path == "demo_mode":
+                return {
+                    "scene_index": scene.index,
+                    "success": False,
+                    "result_path": None,
+                    "messages": [f"Skipped - no audio for lip sync"],
+                    "error": "No audio",
+                    "skipped": True,
+                }
+
+            messages.append(f"Using Wan2.2-S2V for lip-sync (FREE)")
+            animator = LipSyncAnimator()
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                audio_path=Path(audio_path),
+                start_time=scene.start_time,
+                duration=scene.duration,
+                output_path=output_path,
+                resolution=resolution,
+                progress_callback=progress_callback,
+            )
+
+        elif anim_type == AnimationType.PROMPT:
+            messages.append(f"Using Wan2.2-TI2V-5B for prompt animation (FREE)")
+            animator = PromptAnimationChainer()
+            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=scene.duration,
+                quality_preset="fast",
+                progress_callback=progress_callback,
+            )
+
+        elif anim_type == AnimationType.VEO:
+            messages.append(f"Using Google Veo 3.1 (PAID)")
+            animator = VeoAnimationChainer()
+            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=scene.duration,
+                resolution="720p",
+                progress_callback=progress_callback,
+            )
+
+        elif anim_type == AnimationType.ATLASCLOUD:
+            messages.append(f"Using AtlasCloud Wan 2.5 (PAID)")
+            animator = AtlasCloudAnimator()
+            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=5 if scene.duration < 7.5 else 10,
+                resolution="720p",
+                progress_callback=progress_callback,
+            )
+
+        elif anim_type == AnimationType.SEEDANCE:
+            messages.append(f"Using Seedance Pro (PAID)")
+            animator = SeedanceAnimator()
+            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            target_duration = min(12, max(2, int(scene.duration)))
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=target_duration,
+                resolution="720p",
+                progress_callback=progress_callback,
+            )
+
+        elif anim_type == AnimationType.KLING:
+            if not audio_path or audio_path == "demo_mode":
+                return {
+                    "scene_index": scene.index,
+                    "success": False,
+                    "result_path": None,
+                    "messages": [f"Skipped - no audio for Kling lip sync"],
+                    "error": "No audio",
+                    "skipped": True,
+                }
+
+            messages.append(f"Using Kling (PAID, fal.ai)")
+            animator = KlingAnimator()
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                audio_path=Path(audio_path),
+                start_time=scene.start_time,
+                duration=scene.duration,
+                output_path=output_path,
+                resolution="720p",
+                use_i2v=False,
+                progress_callback=progress_callback,
+            )
+
+        elif anim_type == AnimationType.WAN_S2V:
+            if not audio_path or audio_path == "demo_mode":
+                return {
+                    "scene_index": scene.index,
+                    "success": False,
+                    "result_path": None,
+                    "messages": [f"Skipped - no audio for Wan S2V"],
+                    "error": "No audio",
+                    "skipped": True,
+                }
+
+            messages.append(f"Using Wan S2V (PAID, fal.ai)")
+            animator = WanS2VAnimator()
+            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                audio_path=Path(audio_path),
+                start_time=scene.start_time,
+                duration=scene.duration,
+                output_path=output_path,
+                prompt=motion_prompt,
+                progress_callback=progress_callback,
+            )
+
+        elif anim_type == AnimationType.SEEDANCE_LIPSYNC:
+            if not audio_path or audio_path == "demo_mode":
+                return {
+                    "scene_index": scene.index,
+                    "success": False,
+                    "result_path": None,
+                    "messages": [f"Skipped - no audio for lip sync"],
+                    "error": "No audio",
+                    "skipped": True,
+                }
+
+            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            target_duration = min(10, max(2, int(scene.duration)))
+
+            motion_output = output_path.with_suffix(".motion.mp4")
+            motion_result = None
+
+            if motion_output.exists():
+                messages.append(f"Step 1: ✅ Motion video exists, resuming...")
+                motion_result = motion_output
+            else:
+                messages.append(f"Step 1: Generating motion with Seedance Pro...")
+                seedance_animator = SeedanceAnimator()
+                motion_result = seedance_animator.animate_scene(
+                    image_path=Path(scene.image_path),
+                    prompt=motion_prompt,
+                    output_path=motion_output,
+                    duration_seconds=target_duration,
+                    resolution="720p",
+                    progress_callback=progress_callback,
+                )
+
+            if motion_result and motion_result.exists():
+                messages.append(f"Step 2: Applying lip sync with Kling...")
+                lipsync_animator = KlingAnimator()
+                result = lipsync_animator.apply_lipsync_to_video(
+                    video_path=motion_result,
+                    audio_path=Path(audio_path),
+                    start_time=scene.start_time,
+                    duration=scene.duration,
+                    output_path=output_path,
+                    progress_callback=progress_callback,
+                )
+
+                if result and result.exists():
+                    motion_output.unlink(missing_ok=True)
+                else:
+                    messages.append(f"Lip sync failed, using motion video as fallback")
+                    shutil.move(str(motion_output), str(output_path))
+                    result = output_path
+            else:
+                messages.append(f"Motion generation failed")
+                result = None
+
+        if result and result.exists():
+            messages.append(f"✅ Animated successfully")
+            return {
+                "scene_index": scene.index,
+                "success": True,
+                "result_path": result,
+                "messages": messages,
+                "error": None,
+            }
+        else:
+            return {
+                "scene_index": scene.index,
+                "success": False,
+                "result_path": None,
+                "messages": messages,
+                "error": "Animation failed",
+            }
+
+    except Exception as e:
+        error_str = str(e)
+        if "GPU quota" in error_str or "exceeded" in error_str.lower():
+            time_match = re.search(r"Try again in (\d+:\d+:\d+)", error_str)
+            wait_time = time_match.group(1) if time_match else "~24 hours"
+            user_msg = f"GPU quota exceeded. Try again in {wait_time}."
+        else:
+            user_msg = str(e)[:150]
+
+        messages.append(f"Error: {user_msg}")
+        return {
+            "scene_index": scene.index,
+            "success": False,
+            "result_path": None,
+            "messages": messages,
+            "error": user_msg,
+        }
+
+
+def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = False, max_workers: int = 3) -> None:
+    """Generate animations for scenes marked for animation (respects animation type).
+
+    Args:
+        state: Application state
+        resolution: Video resolution ("480P" or "720P")
+        is_demo_mode: Whether we're in demo mode (no real audio)
+        max_workers: Number of parallel animation jobs (1 = sequential)
+    """
     if is_demo_mode:
         st.warning("Animation generation is not available in demo mode. Please upload real audio.")
         return
