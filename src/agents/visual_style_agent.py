@@ -19,14 +19,27 @@ from src.models.schemas import (
 logger = logging.getLogger(__name__)
 
 
-def _build_system_prompt(num_scenes: int, scene_info: str) -> str:
-    """Build system prompt with scene count context."""
+def _build_system_prompt(num_scenes: int, scene_info: str, full_lyrics: str = "") -> str:
+    """Build system prompt with scene count context and full lyrics.
+
+    Args:
+        num_scenes: Number of scenes required for the song
+        scene_info: Pre-calculated scene breakdown with timing and lyrics segments
+        full_lyrics: The complete song lyrics for narrative context
+    """
+    lyrics_section = ""
+    if full_lyrics:
+        lyrics_section = f"""## Full Song Lyrics (for narrative context)
+{full_lyrics}
+
+"""
+
     return f"""You are a visual creative director for music videos. You're working with a user to develop the visual style for their song's music video.
 
 ## CRITICAL: Scene Count
 This song requires EXACTLY {num_scenes} scenes. You MUST create prompts for all {num_scenes} scenes.
 
-{scene_info}
+{lyrics_section}{scene_info}
 
 ## Your Goal
 Collaboratively develop:
@@ -238,8 +251,11 @@ Each scene: ~{scene_duration:.1f} seconds
 """ + "\n".join(scene_lines)
 
     def _get_system_prompt(self) -> str:
-        """Get the system prompt with current scene info."""
-        return _build_system_prompt(self._num_scenes, self._scene_info_text)
+        """Get the system prompt with current scene info and full lyrics."""
+        full_lyrics = ""
+        if self.lyrics and self.lyrics.lyrics:
+            full_lyrics = self.lyrics.lyrics
+        return _build_system_prompt(self._num_scenes, self._scene_info_text, full_lyrics)
 
     def _build_context(self) -> str:
         """Build context string from concept, lyrics, and transcript."""
