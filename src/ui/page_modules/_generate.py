@@ -1190,6 +1190,47 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
 
     st.markdown("---")
 
+    # Quick animation control - Apply to All Scenes
+    with st.expander("🎬 Quick Animation Control", expanded=False):
+        st.markdown("**Apply Animation Type to All Scenes**")
+        st.caption("Set all scenes to the same animation type at once.")
+
+        apply_col1, apply_col2 = st.columns([3, 1])
+
+        with apply_col1:
+            animation_options = {
+                "Static (Ken Burns only)": AnimationType.NONE,
+                "Lip Sync (FREE)": AnimationType.LIP_SYNC,
+                "Prompt Motion (FREE)": AnimationType.PROMPT,
+                "AtlasCloud (PAID)": AnimationType.ATLASCLOUD,
+                "Seedance Pro (PAID)": AnimationType.SEEDANCE,
+                "Veo 3.1 (PAID)": AnimationType.VEO,
+                "Kling Lip Sync (PAID)": AnimationType.KLING,
+                "Wan S2V (PAID)": AnimationType.WAN_S2V,
+                "Seedance+LipSync (PAID)": AnimationType.SEEDANCE_LIPSYNC,
+            }
+            selected_animation = st.selectbox(
+                "Animation Type",
+                options=list(animation_options.keys()),
+                index=0,
+                key="apply_all_animation_type",
+                label_visibility="collapsed",
+            )
+
+        with apply_col2:
+            if st.button("Apply to All", key="apply_all_animation_btn", type="primary"):
+                new_anim_type = animation_options[selected_animation]
+                scenes = list(state.scenes)
+                for scene in scenes:
+                    scene.animation_type = new_anim_type
+                    scene.animated = new_anim_type != AnimationType.NONE
+                    # Clear existing video path when changing animation type
+                    if hasattr(scene, 'video_path'):
+                        scene.video_path = None
+                update_state(scenes=scenes)
+                st.success(f"Applied '{selected_animation}' to all {len(scenes)} scenes!")
+                st.rerun()
+
     # Display storyboard grid
     render_storyboard_grid(state)
 
