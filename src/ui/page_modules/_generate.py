@@ -1221,12 +1221,30 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
             if st.button("Apply to All", key="apply_all_animation_btn", type="primary"):
                 new_anim_type = animation_options[selected_animation]
                 scenes = list(state.scenes)
+
+                # Map AnimationType to radio button label for session state sync
+                anim_type_to_label = {
+                    AnimationType.NONE: "Static",
+                    AnimationType.LIP_SYNC: "Lip Sync",
+                    AnimationType.PROMPT: "Prompt",
+                    AnimationType.VEO: "Veo 3.1 (PAID)",
+                    AnimationType.ATLASCLOUD: "AtlasCloud (PAID)",
+                    AnimationType.SEEDANCE: "Seedance (PAID)",
+                    AnimationType.KLING: "Kling Lip Sync (PAID)",
+                    AnimationType.WAN_S2V: "Wan S2V (PAID)",
+                    AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync (PAID)",
+                }
+                new_label = anim_type_to_label.get(new_anim_type, "Static")
+
                 for scene in scenes:
                     scene.animation_type = new_anim_type
                     scene.animated = new_anim_type != AnimationType.NONE
                     # Clear existing video path when changing animation type
                     if hasattr(scene, 'video_path'):
                         scene.video_path = None
+                    # Update session state for the radio button so it syncs
+                    st.session_state[f"anim_type_{scene.index}"] = new_label
+
                 update_state(scenes=scenes)
                 st.success(f"Applied '{selected_animation}' to all {len(scenes)} scenes!")
                 st.rerun()

@@ -248,6 +248,53 @@ Respond with ONLY the motion prompt, nothing else."""
 
         return None
 
+    def generate_scene_variations(
+        self,
+        prompt: str,
+        num_variations: int = 3,
+        style_prefix: Optional[str] = None,
+        character_description: Optional[str] = None,
+        visual_world: Optional[str] = None,
+        output_dir: Optional[Path] = None,
+        image_size: Optional[str] = None,
+    ) -> list[tuple[Image.Image, Optional[Path]]]:
+        """
+        Generate multiple variations of a scene image for user selection.
+
+        Args:
+            prompt: The scene description
+            num_variations: Number of variations to generate (default 3)
+            style_prefix: Optional style prefix for consistent visual style
+            character_description: Optional character description for consistency
+            visual_world: Optional visual world/setting for consistency
+            output_dir: Optional directory to save variations
+            image_size: Image size for Gemini models ("2K" or "4K")
+
+        Returns:
+            List of tuples (PIL Image, optional path) for each variation
+        """
+        variations = []
+
+        for i in range(num_variations):
+            output_path = None
+            if output_dir:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_path = output_dir / f"variation_{i:02d}.png"
+
+            image = self.generate_scene_image(
+                prompt=prompt,
+                style_prefix=style_prefix,
+                character_description=character_description,
+                visual_world=visual_world,
+                output_path=output_path,
+                image_size=image_size,
+            )
+
+            if image:
+                variations.append((image, output_path))
+
+        return variations
+
     def _create_placeholder_image(
         self, prompt: str, output_path: Optional[Path] = None
     ) -> Optional[Image.Image]:
