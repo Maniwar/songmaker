@@ -409,9 +409,12 @@ def _get_selected_scene_indices(state) -> list[int]:
     if not state.scenes:
         return []
 
+    # Get current generation for checkbox keys
+    gen = st.session_state.get("reanimate_checkbox_gen", 0)
+
     selected = []
     for scene in state.scenes:
-        checkbox_key = f"reanimate_select_{scene.index}"
+        checkbox_key = f"reanimate_select_{scene.index}_gen{gen}"
         if st.session_state.get(checkbox_key, False):
             selected.append(scene.index)
     return selected
@@ -421,15 +424,27 @@ def _clear_selected_scene_checkboxes(state) -> None:
     """Clear all scene selection checkboxes.
 
     Note: In Streamlit, you cannot modify session state for a widget key after
-    the widget has been rendered. Instead, we delete the key so when the widget
-    re-renders it uses its default value (False).
+    the widget has been rendered. Instead, we increment a generation counter
+    which changes the widget keys, effectively resetting them.
 
     Important: Caller should call st.rerun() after this if they want the UI to update.
     """
     if not state.scenes:
         return
 
+    # Increment the generation counter to reset checkbox keys
+    if "reanimate_checkbox_gen" not in st.session_state:
+        st.session_state.reanimate_checkbox_gen = 0
+    st.session_state.reanimate_checkbox_gen += 1
+
+    # Also delete old keys to clean up session state
     for scene in state.scenes:
+        # Delete keys from all previous generations
+        for gen in range(st.session_state.reanimate_checkbox_gen):
+            checkbox_key = f"reanimate_select_{scene.index}_gen{gen}"
+            if checkbox_key in st.session_state:
+                del st.session_state[checkbox_key]
+        # Also delete non-gen keys (legacy)
         checkbox_key = f"reanimate_select_{scene.index}"
         if checkbox_key in st.session_state:
             del st.session_state[checkbox_key]
@@ -1747,7 +1762,7 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                     st.success(f"Cleared {cleared_count} animations. Use individual Animate buttons or the mass animate feature to regenerate.")
                 else:
                     st.info("No existing animations to clear. Use individual Animate buttons to animate selected scenes.")
-                st.rerun()
+                st.rerun(scope="app")
         else:
             st.caption("Select scenes using checkboxes to enable bulk re-animation")
     with reanimate_col2:
@@ -2096,12 +2111,13 @@ def render_scene_card(state, scene: Scene) -> None:
         st.markdown(f"**Scene {scene.index + 1}**{status_icons}")
     with header_col2:
         # Checkbox for bulk re-animation selection
-        # Note: on_change triggers full page rerun so the bulk action button appears
+        # Uses generation counter to allow resetting after bulk operation
+        gen = st.session_state.get("reanimate_checkbox_gen", 0)
         def _on_select_change():
             st.rerun(scope="app")
         st.checkbox(
             "Select",
-            key=f"reanimate_select_{scene.index}",
+            key=f"reanimate_select_{scene.index}_gen{gen}",
             label_visibility="collapsed",
             help="Select for bulk re-animation",
             on_change=_on_select_change,
