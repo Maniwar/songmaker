@@ -1207,9 +1207,17 @@ class VideoGenerator:
                 gap = audio_duration - video_duration
 
                 if gap > 0.2:  # Significant gap to fill
+                    # Cap Ken Burns at 12 seconds max - anything more looks unnatural
+                    MAX_KB_DURATION = 12.0
+                    kb_duration = min(gap, MAX_KB_DURATION)
+                    fade_duration = gap - kb_duration if gap > MAX_KB_DURATION else 0
+
                     if progress_callback:
-                        progress_callback(f"Extending video by {gap:.1f}s with Ken Burns...", 0.65)
-                    logger.info(f"end_only mode: Video {video_duration:.1f}s, audio {audio_duration:.1f}s, extending by {gap:.1f}s")
+                        if fade_duration > 0:
+                            progress_callback(f"Extending by {kb_duration:.1f}s Ken Burns + {fade_duration:.1f}s fade...", 0.65)
+                        else:
+                            progress_callback(f"Extending video by {gap:.1f}s with Ken Burns...", 0.65)
+                    logger.info(f"end_only mode: Video {video_duration:.1f}s, audio {audio_duration:.1f}s, gap {gap:.1f}s (KB: {kb_duration:.1f}s, fade: {fade_duration:.1f}s)")
 
                     # Extract last frame and extend with Ken Burns
                     last_frame_path = temp_dir / "last_frame.png"
@@ -1219,22 +1227,43 @@ class VideoGenerator:
                     ]
                     subprocess.run(extract_cmd, check=True, capture_output=True)
 
-                    # Create Ken Burns extension clip
-                    extension_clip = temp_dir / "extension.mp4"
+                    extension_clips = []
+
+                    # Create Ken Burns extension clip (up to MAX_KB_DURATION)
+                    extension_clip = temp_dir / "extension_kb.mp4"
                     # Pick a reasonable Ken Burns effect for the end
                     end_effect = scenes[-1].effect if scenes and scenes[-1].effect else KenBurnsEffect.ZOOM_OUT
                     self.create_scene_clip(
                         image_path=last_frame_path,
-                        duration=gap + 0.1,  # Slight overlap for smooth concat
+                        duration=kb_duration + 0.1,  # Slight overlap for smooth concat
                         effect=end_effect,
                         output_path=extension_clip,
                         resolution=resolution,
                         fps=fps,
                     )
+                    extension_clips.append(extension_clip)
 
-                    # Concatenate original + extension
+                    # If there's remaining time, create a fade to black
+                    if fade_duration > 0.5:
+                        fade_clip = temp_dir / "extension_fade.mp4"
+                        res = resolution or self._default_resolution
+                        # Create a clip that holds the last frame then fades to black
+                        fade_cmd = [
+                            "ffmpeg", "-y",
+                            "-loop", "1", "-i", str(last_frame_path),
+                            "-t", str(fade_duration + 0.1),
+                            "-vf", f"scale={res[0]}:{res[1]}:force_original_aspect_ratio=decrease,pad={res[0]}:{res[1]}:(ow-iw)/2:(oh-ih)/2,fade=t=out:st=0:d={min(fade_duration, 3.0)}",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                            "-r", str(fps or self._default_fps),
+                            str(fade_clip)
+                        ]
+                        subprocess.run(fade_cmd, check=True, capture_output=True)
+                        extension_clips.append(fade_clip)
+
+                    # Concatenate original + extension(s)
                     video_extended = temp_dir / "video_extended.mp4"
-                    self.concatenate_clips([video_no_audio, extension_clip], video_extended, crossfade_duration=0)
+                    all_clips = [video_no_audio] + extension_clips
+                    self.concatenate_clips(all_clips, video_extended, crossfade_duration=0)
 
                     # Trim to exact audio duration
                     video_trimmed = temp_dir / "video_trimmed.mp4"
