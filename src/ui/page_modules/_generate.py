@@ -1063,6 +1063,28 @@ def render_prompt_review(state, is_demo_mode: bool) -> None:
             if new_show_lyrics != current_show_lyrics:
                 update_state(show_lyrics=new_show_lyrics)
 
+            # Extension mode for animated clips (advanced)
+            extension_options = {
+                "Ken Burns (all scenes)": "all",
+                "Ken Burns (end only)": "end_only",
+                "No Ken Burns": "none",
+            }
+            current_ext_mode = getattr(state, 'extension_mode', 'all')
+            ext_labels = list(extension_options.keys())
+            ext_values = list(extension_options.values())
+            ext_idx = ext_values.index(current_ext_mode) if current_ext_mode in ext_values else 0
+            new_ext_label = st.selectbox(
+                "Animation extension mode",
+                options=ext_labels,
+                index=ext_idx,
+                help="How to fill gaps when animations are shorter than scene duration. "
+                     "'End only' packs animations and adds Ken Burns at the end.",
+                key="extension_mode_prompt_review",
+            )
+            new_ext_mode = extension_options[new_ext_label]
+            if new_ext_mode != current_ext_mode:
+                update_state(extension_mode=new_ext_mode)
+
         # Image Generation Settings (full width)
         st.markdown("---")
         st.markdown("**Image Generation Settings**")
@@ -3595,6 +3617,7 @@ def generate_video_from_storyboard(state, crossfade: float, is_demo_mode: bool) 
                 progress_callback=video_progress_callback,
                 resolution=(res_info['width'], res_info['height']),
                 fps=fps,
+                extension_mode=getattr(state, 'extension_mode', 'all'),
             )
 
         update_state(final_video_path=str(output_path))

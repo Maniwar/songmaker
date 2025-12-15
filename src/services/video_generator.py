@@ -5,7 +5,13 @@ import platform
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
+
+# Extension mode for short animated clips
+# - "all": Use Ken Burns on all scenes that need extension (current behavior)
+# - "end_only": Pack animations back-to-back, Ken Burns at the end to fill remaining time
+# - "none": No Ken Burns on any animated scene (trim to animation duration)
+ExtensionMode = Literal["all", "end_only", "none"]
 
 logger = logging.getLogger(__name__)
 
@@ -834,7 +840,7 @@ class VideoGenerator:
 
         Args:
             video_path: Path to the animated video clip
-            target_duration: Target duration in seconds
+            target_duration: Target duration in seconds. If <= 0, use natural duration.
             output_path: Path for the output video
             resolution: Optional (width, height) tuple
             fps: Optional frames per second
@@ -860,9 +866,17 @@ class VideoGenerator:
 
         encoder_args = self._get_encoder_args(quality="fast")
 
+        # If target_duration <= 0, use natural duration (no extension)
+        use_natural_duration = target_duration <= 0
+        effective_target_duration = current_duration if use_natural_duration else target_duration
+
         # Check if we need to extend the video
-        needs_extension = current_duration > 0 and current_duration < target_duration - 0.05
-        pad_duration = target_duration - current_duration if needs_extension else 0
+        needs_extension = (
+            not use_natural_duration
+            and current_duration > 0
+            and current_duration < effective_target_duration - 0.05
+        )
+        pad_duration = effective_target_duration - current_duration if needs_extension else 0
 
         # If we need to extend and have a Ken Burns effect, use that instead of freeze frame
         if needs_extension and effect is not None and pad_duration > 0.1:
@@ -902,7 +916,7 @@ class VideoGenerator:
         # If video is shorter than target and no Ken Burns effect, pad with last frame
         # If video is longer, it will be trimmed by -t parameter
         # Account for crossfade pad in the total duration
-        effective_target = target_duration + crossfade_pad
+        effective_target = effective_target_duration + crossfade_pad
         if needs_extension:
             logger.warning(f"Video {pad_duration:.1f}s short, padding with freeze frame")
             filter_parts.append(f"tpad=stop_duration={pad_duration}:stop_mode=clone")
@@ -1057,6 +1071,7 @@ class VideoGenerator:
         progress_callback: Optional[Callable[[str, float], None]] = None,
         resolution: Optional[tuple[int, int]] = None,
         fps: Optional[int] = None,
+        extension_mode: ExtensionMode = "all",
     ) -> Path:
         """
         Generate a complete music video from scenes.
@@ -1069,6 +1084,11 @@ class VideoGenerator:
             progress_callback: Optional callback for progress updates
             resolution: Optional (width, height) tuple to override config
             fps: Optional frames per second to override config
+            extension_mode: How to extend short animated clips:
+                - "all": Ken Burns on all scenes that need extension (default)
+                - "end_only": Pack animations back-to-back at natural duration,
+                    then add Ken Burns at the very end to fill remaining time
+                - "none": No Ken Burns, animations play at natural duration (may be short)
 
         Returns:
             Path to the final video
@@ -1117,15 +1137,29 @@ class VideoGenerator:
                 if has_animation:
                     # Use the pre-generated animated video clip
                     # No crossfade padding needed since we disable crossfade for animated videos
-                    # Lip sync needs strict duration (exact timing with audio)
-                    # Prompt/VEO can use Ken Burns to extend short videos
                     is_lip_sync = getattr(scene, 'animation_type', None) == AnimationType.LIP_SYNC
-                    # Only use Ken Burns extension for non-lip-sync animations
-                    # Lip-sync must freeze frame to maintain audio timing
-                    extend_effect = None if is_lip_sync else scene.effect
+
+                    # Determine target duration and effect based on extension_mode:
+                    # - "all": Ken Burns on all scenes (default behavior)
+                    # - "end_only": Use natural duration, Ken Burns at the very end
+                    # - "none": Use natural duration, no Ken Burns
+                    # Lip-sync always uses freeze frame regardless of mode.
+                    if extension_mode in ("end_only", "none"):
+                        # Pack mode: use natural animation duration, no per-clip extension
+                        clip_target_duration = 0  # 0 = use natural duration
+                        extend_effect = None
+                    elif is_lip_sync:
+                        # Lip-sync must freeze frame to maintain audio timing
+                        clip_target_duration = scene.duration
+                        extend_effect = None
+                    else:
+                        # Default "all" mode: Ken Burns on each scene
+                        clip_target_duration = scene.duration
+                        extend_effect = scene.effect
+
                     self.prepare_animated_clip(
                         video_path=Path(scene.video_path),
-                        target_duration=scene.duration,
+                        target_duration=clip_target_duration,
                         output_path=clip_path,
                         resolution=resolution,
                         fps=fps,
@@ -1154,6 +1188,51 @@ class VideoGenerator:
             # Concatenate clips with crossfade transitions
             video_no_audio = temp_dir / "video_no_audio.mp4"
             self.concatenate_clips(clip_paths, video_no_audio, crossfade_duration=crossfade_duration)
+
+            # For "end_only" mode, check if we need Ken Burns padding at the end
+            if extension_mode == "end_only":
+                audio_duration = self._get_media_duration(audio_path)
+                video_duration = self._get_media_duration(video_no_audio)
+                gap = audio_duration - video_duration
+
+                if gap > 0.2:  # Significant gap to fill
+                    if progress_callback:
+                        progress_callback(f"Extending video by {gap:.1f}s with Ken Burns...", 0.65)
+                    logger.info(f"end_only mode: Video {video_duration:.1f}s, audio {audio_duration:.1f}s, extending by {gap:.1f}s")
+
+                    # Extract last frame and extend with Ken Burns
+                    last_frame_path = temp_dir / "last_frame.png"
+                    extract_cmd = [
+                        "ffmpeg", "-y", "-sseof", "-0.1", "-i", str(video_no_audio),
+                        "-vframes", "1", "-q:v", "2", str(last_frame_path)
+                    ]
+                    subprocess.run(extract_cmd, check=True, capture_output=True)
+
+                    # Create Ken Burns extension clip
+                    extension_clip = temp_dir / "extension.mp4"
+                    # Pick a reasonable Ken Burns effect for the end
+                    end_effect = scenes[-1].effect if scenes and scenes[-1].effect else KenBurnsEffect.ZOOM_OUT
+                    self.create_scene_clip(
+                        image_path=last_frame_path,
+                        duration=gap + 0.1,  # Slight overlap for smooth concat
+                        effect=end_effect,
+                        output_path=extension_clip,
+                        resolution=resolution,
+                        fps=fps,
+                    )
+
+                    # Concatenate original + extension
+                    video_extended = temp_dir / "video_extended.mp4"
+                    self.concatenate_clips([video_no_audio, extension_clip], video_extended, crossfade_duration=0)
+
+                    # Trim to exact audio duration
+                    video_trimmed = temp_dir / "video_trimmed.mp4"
+                    trim_cmd = [
+                        "ffmpeg", "-y", "-i", str(video_extended),
+                        "-t", str(audio_duration), "-c", "copy", str(video_trimmed)
+                    ]
+                    subprocess.run(trim_cmd, check=True, capture_output=True)
+                    video_no_audio = video_trimmed
 
             if progress_callback:
                 progress_callback("Adding audio...", 0.7)
