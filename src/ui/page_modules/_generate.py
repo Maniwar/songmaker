@@ -10,6 +10,7 @@ import threading
 
 import streamlit as st
 from pydub import AudioSegment
+import plotly.graph_objects as go
 
 from src.config import config
 from src.agents.visual_agent import VisualAgent
@@ -685,6 +686,453 @@ def _adjust_scene_timing(state, scene_index: int, new_start: float, new_end: flo
     update_state(scenes=scenes)
 
 
+# ============================================================================
+# Timeline View Functions - Scene Duration Adjustment
+# ============================================================================
+
+# Timeline constraints
+MIN_SCENE_DURATION = 2.0  # seconds
+MAX_SCENE_DURATION = 15.0  # seconds
+
+
+def _get_boundary_constraints(
+    scenes: list[Scene],
+    boundary_index: int,
+    min_dur: float = MIN_SCENE_DURATION,
+    max_dur: float = MAX_SCENE_DURATION
+) -> tuple[float, float]:
+    """
+    Calculate the valid range for a boundary position.
+
+    Args:
+        scenes: All scenes
+        boundary_index: Which boundary (0 = between scene 0 and 1)
+        min_dur: Minimum allowed scene duration
+        max_dur: Maximum allowed scene duration
+
+    Returns:
+        (min_time, max_time) tuple for the boundary
+    """
+    scene_before = scenes[boundary_index]
+    scene_after = scenes[boundary_index + 1]
+
+    # Minimum: scene_before must be at least min_dur
+    min_boundary = scene_before.start_time + min_dur
+
+    # Maximum: scene_after must be at least min_dur
+    max_boundary = scene_after.end_time - min_dur
+
+    # Also constrain by max duration
+    # scene_before can't exceed max_dur
+    min_boundary = max(min_boundary, scene_after.end_time - max_dur)
+    # scene_after can't exceed max_dur
+    max_boundary = min(max_boundary, scene_before.start_time + max_dur)
+
+    return (min_boundary, max_boundary)
+
+
+def _reassign_words_between_scenes(
+    state,
+    scene_before_idx: int,
+    scene_after_idx: int,
+    boundary_time: float
+) -> None:
+    """
+    Reassign words between two adjacent scenes based on boundary time.
+
+    Uses ORIGINAL word timestamps from transcript, not scaled positions.
+    Words are assigned based on midpoint rule.
+    """
+    if not state.transcript:
+        return
+
+    # Get all original words from transcript
+    all_words = state.transcript.all_words
+
+    scene_before = state.scenes[scene_before_idx]
+    scene_after = state.scenes[scene_after_idx]
+
+    # Determine the time range we're working with
+    range_start = scene_before.start_time
+    range_end = scene_after.end_time
+
+    # Find all words in this combined range (from original transcript)
+    words_in_range = []
+    for w in all_words:
+        # Word fully contained in range
+        if w.start >= range_start and w.end <= range_end:
+            words_in_range.append(w)
+        # Word overlaps start
+        elif w.start < range_start < w.end:
+            overlap = min(w.end, range_end) - range_start
+            if overlap > (w.end - w.start) * 0.5:
+                words_in_range.append(w)
+        # Word overlaps end
+        elif w.start < range_end < w.end:
+            overlap = range_end - max(w.start, range_start)
+            if overlap > (w.end - w.start) * 0.5:
+                words_in_range.append(w)
+
+    # Sort by start time
+    words_in_range.sort(key=lambda w: w.start)
+
+    # Split words at boundary using midpoint rule
+    words_before = []
+    words_after = []
+
+    for w in words_in_range:
+        midpoint = (w.start + w.end) / 2
+        # Create new Word objects to avoid modifying originals
+        new_word = Word(word=w.word, start=w.start, end=w.end)
+        if midpoint < boundary_time:
+            words_before.append(new_word)
+        else:
+            words_after.append(new_word)
+
+    # Update scenes
+    state.scenes[scene_before_idx].words = words_before
+    state.scenes[scene_after_idx].words = words_after
+
+
+def _preview_boundary_change(
+    state,
+    boundary_index: int,
+    new_boundary_time: float
+) -> dict:
+    """
+    Preview what will happen when a boundary is moved.
+
+    Returns dict with:
+        - words_moving_forward: Words that will move to next scene
+        - words_moving_backward: Words that will move to previous scene
+        - scene_before_new_duration: New duration of scene before boundary
+        - scene_after_new_duration: New duration of scene after boundary
+    """
+    scene_before = state.scenes[boundary_index]
+    scene_after = state.scenes[boundary_index + 1]
+    current_boundary = scene_before.end_time
+
+    # Calculate new durations
+    scene_before_new_duration = new_boundary_time - scene_before.start_time
+    scene_after_new_duration = scene_after.end_time - new_boundary_time
+
+    # Determine which words would move
+    words_moving_forward = []  # From scene_before to scene_after
+    words_moving_backward = []  # From scene_after to scene_before
+
+    if new_boundary_time < current_boundary:
+        # Boundary moved earlier - some words from scene_before move to scene_after
+        for w in scene_before.words:
+            midpoint = (w.start + w.end) / 2
+            if midpoint >= new_boundary_time:
+                words_moving_forward.append(w)
+    else:
+        # Boundary moved later - some words from scene_after move to scene_before
+        for w in scene_after.words:
+            midpoint = (w.start + w.end) / 2
+            if midpoint < new_boundary_time:
+                words_moving_backward.append(w)
+
+    return {
+        "words_moving_forward": words_moving_forward,
+        "words_moving_backward": words_moving_backward,
+        "scene_before_new_duration": scene_before_new_duration,
+        "scene_after_new_duration": scene_after_new_duration,
+    }
+
+
+def _apply_boundary_change(
+    state,
+    boundary_index: int,
+    new_boundary_time: float
+) -> None:
+    """
+    Apply a boundary change, reassigning words between scenes.
+
+    This updates:
+    1. scene[boundary_index].end_time
+    2. scene[boundary_index + 1].start_time
+    3. Reassigns words based on their timestamps
+    """
+    scenes = state.scenes
+
+    # Update scene boundaries
+    scenes[boundary_index].end_time = new_boundary_time
+    scenes[boundary_index + 1].start_time = new_boundary_time
+
+    # Reassign words
+    _reassign_words_between_scenes(state, boundary_index, boundary_index + 1, new_boundary_time)
+
+    # Check if scenes have animations that may need to be regenerated
+    scene_before = scenes[boundary_index]
+    scene_after = scenes[boundary_index + 1]
+
+    # Clear animation if duration changed significantly (animation won't match)
+    # We don't auto-clear but we could warn the user in the UI
+
+    update_state(scenes=scenes)
+
+
+def _reset_scene_boundaries_to_auto(state) -> None:
+    """
+    Recalculate all scene boundaries from scratch using VisualAgent.
+
+    This resets to the automatic boundary calculation based on
+    word gaps and target scene count.
+    """
+    if not state.transcript:
+        return
+
+    visual_agent = VisualAgent()
+
+    # Recalculate boundaries
+    boundaries = visual_agent.calculate_scene_boundaries(
+        duration=state.transcript.duration,
+        transcript=state.transcript,
+    )
+
+    # Update each scene's timing and words
+    scenes = state.scenes
+    for i, (start, end, words) in enumerate(boundaries):
+        if i < len(scenes):
+            scenes[i].start_time = start
+            scenes[i].end_time = end
+            scenes[i].words = words
+
+    update_state(scenes=scenes)
+
+
+# Mood color map for timeline visualization
+MOOD_COLORS = {
+    "happy": "#FFD700",
+    "joyful": "#FFD700",
+    "upbeat": "#FFA500",
+    "sad": "#4169E1",
+    "melancholic": "#4682B4",
+    "energetic": "#FF4500",
+    "exciting": "#FF6347",
+    "romantic": "#FF69B4",
+    "love": "#FF1493",
+    "dramatic": "#8B0000",
+    "intense": "#DC143C",
+    "peaceful": "#90EE90",
+    "calm": "#98FB98",
+    "dark": "#2F4F4F",
+    "mysterious": "#483D8B",
+    "hopeful": "#87CEEB",
+    "nostalgic": "#DEB887",
+    "angry": "#B22222",
+    "defiant": "#CD5C5C",
+}
+
+
+def _create_timeline_figure(scenes: list[Scene], audio_duration: float) -> go.Figure:
+    """
+    Create a Plotly Gantt-style figure showing all scenes.
+
+    Args:
+        scenes: List of Scene objects
+        audio_duration: Total song duration in seconds
+
+    Returns:
+        Plotly Figure object
+    """
+    fig = go.Figure()
+
+    for i, scene in enumerate(scenes):
+        # Get color based on mood
+        mood_lower = scene.mood.lower() if scene.mood else "default"
+        color = MOOD_COLORS.get(mood_lower, "#808080")
+
+        # Get lyrics preview (first few words)
+        lyrics_preview = " ".join(w.word for w in scene.words[:8])
+        if len(scene.words) > 8:
+            lyrics_preview += "..."
+
+        # Add scene bar
+        fig.add_trace(go.Bar(
+            x=[scene.duration],
+            y=[0],
+            orientation='h',
+            base=scene.start_time,
+            name=f"Scene {i+1}",
+            marker_color=color,
+            marker_line_color="white",
+            marker_line_width=1,
+            text=f"S{i+1}",
+            textposition="inside",
+            insidetextanchor="middle",
+            hovertemplate=(
+                f"<b>Scene {i+1}</b><br>"
+                f"Time: {scene.start_time:.1f}s - {scene.end_time:.1f}s<br>"
+                f"Duration: {scene.duration:.1f}s<br>"
+                f"Mood: {scene.mood}<br>"
+                f"Words: {len(scene.words)}<br>"
+                f"Lyrics: {lyrics_preview}<br>"
+                f"<extra></extra>"
+            ),
+        ))
+
+    # Layout
+    fig.update_layout(
+        barmode='stack',
+        showlegend=False,
+        height=100,
+        margin=dict(l=10, r=10, t=10, b=30),
+        xaxis=dict(
+            title="Time (seconds)",
+            range=[0, audio_duration],
+            tickformat=".0f",
+            gridcolor='rgba(128,128,128,0.3)',
+        ),
+        yaxis=dict(visible=False),
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='white', size=10),
+    )
+
+    return fig
+
+
+def _render_boundary_editor(state, boundary_index: int) -> None:
+    """Render the boundary editor UI for a selected boundary."""
+    scene_before = state.scenes[boundary_index]
+    scene_after = state.scenes[boundary_index + 1]
+    current_boundary = scene_before.end_time
+
+    # Get constraints
+    min_time, max_time = _get_boundary_constraints(state.scenes, boundary_index)
+
+    # Show current state
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(f"**Scene {boundary_index + 1}**")
+        st.caption(f"Current: {scene_before.duration:.1f}s | Words: {len(scene_before.words)}")
+    with col2:
+        st.markdown(f"**Scene {boundary_index + 2}**")
+        st.caption(f"Current: {scene_after.duration:.1f}s | Words: {len(scene_after.words)}")
+
+    # Boundary slider
+    new_boundary = st.slider(
+        f"Boundary position (seconds)",
+        min_value=float(min_time),
+        max_value=float(max_time),
+        value=float(current_boundary),
+        step=0.1,
+        key=f"boundary_slider_{boundary_index}",
+        help=f"Drag to adjust boundary between Scene {boundary_index + 1} and Scene {boundary_index + 2}"
+    )
+
+    # Show preview if changed
+    if abs(new_boundary - current_boundary) > 0.05:
+        preview = _preview_boundary_change(state, boundary_index, new_boundary)
+
+        st.markdown("**Preview Changes:**")
+
+        # Show duration changes with metrics
+        pcol1, pcol2 = st.columns(2)
+        with pcol1:
+            delta_before = preview["scene_before_new_duration"] - scene_before.duration
+            st.metric(
+                f"Scene {boundary_index + 1}",
+                f"{preview['scene_before_new_duration']:.1f}s",
+                delta=f"{delta_before:+.1f}s"
+            )
+        with pcol2:
+            delta_after = preview["scene_after_new_duration"] - scene_after.duration
+            st.metric(
+                f"Scene {boundary_index + 2}",
+                f"{preview['scene_after_new_duration']:.1f}s",
+                delta=f"{delta_after:+.1f}s"
+            )
+
+        # Show words moving
+        if preview["words_moving_forward"]:
+            words_text = " ".join(w.word for w in preview["words_moving_forward"])
+            st.caption(f"↗️ Words moving to Scene {boundary_index + 2}: _{words_text}_")
+        if preview["words_moving_backward"]:
+            words_text = " ".join(w.word for w in preview["words_moving_backward"])
+            st.caption(f"↙️ Words moving to Scene {boundary_index + 1}: _{words_text}_")
+
+        # Warning for scenes with animations
+        if scene_before.has_animation or scene_after.has_animation:
+            st.warning("One or both scenes have animations. Changing duration may require re-animation.")
+
+        # Apply button
+        if st.button("Apply Changes", type="primary", key=f"apply_boundary_{boundary_index}"):
+            _apply_boundary_change(state, boundary_index, new_boundary)
+            st.success("Boundary updated!")
+            st.rerun()
+
+
+def render_timeline_view(state) -> None:
+    """
+    Render the Timeline/Gantt view for scene boundary adjustment.
+
+    Shows all scenes on a horizontal timeline with their durations.
+    Allows selecting boundaries and adjusting them with sliders.
+    """
+    if not state.scenes:
+        st.info("No scenes to display. Generate prompts first.")
+        return
+
+    # Get audio duration from multiple sources (for backwards compatibility with older projects)
+    audio_duration = 0
+    if hasattr(state, 'audio_duration') and state.audio_duration > 0:
+        audio_duration = state.audio_duration
+    elif state.transcript and hasattr(state.transcript, 'duration') and state.transcript.duration > 0:
+        audio_duration = state.transcript.duration
+    elif state.scenes:
+        # Fall back to last scene's end time (works for older projects)
+        audio_duration = state.scenes[-1].end_time
+
+    if audio_duration <= 0:
+        st.warning("Audio duration not available.")
+        return
+
+    # Render the Plotly timeline
+    fig = _create_timeline_figure(state.scenes, audio_duration)
+    st.plotly_chart(fig, use_container_width=True, key="timeline_chart")
+
+    # Boundary selector
+    num_boundaries = len(state.scenes) - 1
+    if num_boundaries < 1:
+        st.info("Only one scene - no boundaries to adjust.")
+        return
+
+    st.markdown("**Adjust Scene Boundaries**")
+    st.caption("Select a boundary to adjust the timing between adjacent scenes. Words will be automatically reassigned based on their timestamps.")
+
+    # Create boundary labels
+    boundary_options = list(range(num_boundaries))
+    boundary_labels = {
+        i: f"Between Scene {i+1} and {i+2} (currently at {state.scenes[i].end_time:.1f}s)"
+        for i in boundary_options
+    }
+
+    selected_boundary = st.selectbox(
+        "Select boundary to adjust:",
+        options=boundary_options,
+        format_func=lambda x: boundary_labels[x],
+        key="timeline_boundary_selector",
+    )
+
+    if selected_boundary is not None:
+        st.markdown("---")
+        _render_boundary_editor(state, selected_boundary)
+
+    # Reset button
+    st.markdown("---")
+    reset_col1, reset_col2 = st.columns([1, 3])
+    with reset_col1:
+        if st.button("Reset All to Auto", type="secondary", key="reset_boundaries"):
+            _reset_scene_boundaries_to_auto(state)
+            st.success("Scene boundaries recalculated!")
+            st.rerun()
+    with reset_col2:
+        st.caption("Recalculate all boundaries using automatic detection based on word gaps.")
+
+
 # Resolution configurations
 RESOLUTION_OPTIONS = {
     "1080p": {"width": 1920, "height": 1080, "image_size": "2K"},
@@ -823,10 +1271,16 @@ def render_generate_page() -> None:
     storyboard_ready = getattr(state, 'storyboard_ready', False)
     project_dir = getattr(state, 'project_dir', None)
 
+    # For backwards compatibility: if scenes have images, treat as storyboard ready
+    has_images = state.scenes and any(
+        s.image_path and Path(s.image_path).exists() for s in state.scenes
+    )
+    effective_storyboard_ready = storyboard_ready or has_images
+
     # Workflow: Setup -> Prompt Review -> Image Generation -> Video
     if state.final_video_path:
         render_video_complete(state)
-    elif storyboard_ready and state.scenes:
+    elif effective_storyboard_ready and state.scenes:
         render_storyboard_view(state, is_demo_mode)
     elif prompts_ready and state.scenes:
         render_prompt_review(state, is_demo_mode)
@@ -1350,6 +1804,10 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
         if you're not satisfied with them, then proceed to create the video.
         """
     )
+
+    # Timeline view for adjusting scene durations
+    with st.expander("Timeline View - Adjust Scene Durations", expanded=False):
+        render_timeline_view(state)
 
     # Summary stats
     total_scenes = len(state.scenes)
