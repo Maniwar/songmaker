@@ -322,6 +322,8 @@ def _convert_visual_plan_to_scenes(visual_plan, state) -> list[Scene]:
                 mood=sp.mood,
                 effect=sp.effect,
                 words=words,
+                motion_prompt=sp.motion_prompt,  # LLM-generated motion prompt for animation
+                show_character=sp.show_character,  # Whether character appears in this scene
             ))
     else:
         # Fall back to auto-generating scenes based on transcript

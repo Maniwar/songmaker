@@ -45,6 +45,52 @@ def _sanitize_filename(name: str, max_length: int = 20) -> str:
     return sanitized.lower()[:max_length]
 
 
+def _get_motion_prompt(scene: Scene) -> str:
+    """
+    Get a proper short motion prompt for animation.
+
+    Motion prompts should be SHORT action descriptions (under 15 words),
+    NOT the full visual prompt which is verbose and meant for image generation.
+
+    Args:
+        scene: The scene to get motion prompt for
+
+    Returns:
+        A short motion/action prompt for animation
+    """
+    # Use the scene's motion_prompt if it exists and is not empty
+    if scene.motion_prompt and scene.motion_prompt.strip():
+        return scene.motion_prompt.strip()
+
+    # Generate a short default based on mood
+    mood = getattr(scene, 'mood', 'emotional')
+    mood_lower = mood.lower() if mood else 'emotional'
+
+    # Map moods to short action prompts
+    mood_prompts = {
+        'happy': 'moving joyfully to the music',
+        'joyful': 'dancing and moving with energy',
+        'sad': 'moving slowly with emotion',
+        'melancholy': 'swaying gently with sadness',
+        'energetic': 'moving energetically with rhythm',
+        'intense': 'moving with intensity and power',
+        'romantic': 'moving softly and tenderly',
+        'nostalgic': 'swaying gently with reflection',
+        'hopeful': 'moving with growing energy',
+        'dramatic': 'moving with dramatic expression',
+        'peaceful': 'swaying calmly and peacefully',
+        'angry': 'moving with forceful intensity',
+    }
+
+    # Find matching mood or use default
+    for key, prompt in mood_prompts.items():
+        if key in mood_lower:
+            return prompt
+
+    # Default short motion prompt
+    return 'moving naturally to the music'
+
+
 def _update_scene_lyrics(scene: Scene, new_lyrics: str) -> None:
     """
     Update a scene's lyrics, creating Word objects with proper timing.
@@ -234,6 +280,158 @@ def _redo_transcription(
 
     finally:
         processor.cleanup()
+
+
+def _regenerate_all_motion_prompts(state, progress_bar=None, status_text=None) -> int:
+    """
+    Regenerate AI motion prompts for all scenes from their visual prompts.
+
+    Uses Claude to batch-convert visual prompts to short motion descriptions.
+    This is much faster than image-based analysis since it's text-to-text.
+
+    Args:
+        state: App state with scenes
+        progress_bar: Optional st.progress() bar to update
+        status_text: Optional st.empty() placeholder for status text
+
+    Returns:
+        Number of prompts successfully generated
+    """
+    import anthropic
+    from src.config import config
+
+    if not state.scenes:
+        return 0
+
+    scenes = list(state.scenes)
+
+    # Filter to scenes with visual prompts
+    scenes_with_prompts = [s for s in scenes if s.visual_prompt]
+    total_to_process = len(scenes_with_prompts)
+
+    if total_to_process == 0:
+        return 0
+
+    if progress_bar:
+        progress_bar.progress(0.1)
+    if status_text:
+        status_text.text(f"Generating motion prompts for {total_to_process} scenes...")
+
+    # Build batch request - send all visual prompts at once
+    prompt_list = "\n".join([
+        f"Scene {s.index + 1}: {s.visual_prompt}"
+        for s in scenes_with_prompts
+    ])
+
+    system_prompt = """You are a motion prompt generator for video animation.
+For each scene's visual description, create a SHORT motion prompt (5-10 words max) describing natural movement.
+
+Rules:
+- Use present participle verbs (playing, singing, dancing, swaying, flowing)
+- Focus on ONE primary motion
+- Be specific to what's in the scene
+- Keep it SHORT (under 10 words)
+
+Examples:
+- Visual: "A bearded man playing guitar in a tavern" → Motion: "strumming guitar while nodding to rhythm"
+- Visual: "A forest with sunlight filtering through trees" → Motion: "leaves swaying gently in breeze"
+- Visual: "A singer on stage under spotlights" → Motion: "singing passionately with subtle gestures"
+
+Respond with ONLY a numbered list of motion prompts, one per line, matching the scene numbers."""
+
+    user_prompt = f"""Generate short motion prompts for these {total_to_process} scenes:
+
+{prompt_list}
+
+Return ONLY the motion prompts as a numbered list (1. prompt, 2. prompt, etc.)"""
+
+    try:
+        client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+
+        if progress_bar:
+            progress_bar.progress(0.3)
+
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}]
+        )
+
+        if progress_bar:
+            progress_bar.progress(0.7)
+        if status_text:
+            status_text.text("Parsing motion prompts...")
+
+        # Parse response - expect numbered list
+        response_text = response.content[0].text.strip()
+        lines = response_text.split("\n")
+
+        success_count = 0
+        for i, scene in enumerate(scenes_with_prompts):
+            if i < len(lines):
+                # Extract motion prompt (remove numbering like "1. " or "1) ")
+                line = lines[i].strip()
+                # Remove common numbering patterns
+                import re
+                motion = re.sub(r'^[\d]+[\.\)]\s*', '', line).strip()
+
+                if motion:
+                    scenes[scene.index].motion_prompt = motion
+                    # Use temp key pattern - will be transferred to widget on next render
+                    ai_result_key = f"_ai_motion_result_{scene.index}"
+                    st.session_state[ai_result_key] = motion
+                    success_count += 1
+
+        # Final progress update
+        if progress_bar:
+            progress_bar.progress(1.0)
+        if status_text:
+            status_text.text(f"Done! Generated {success_count}/{total_to_process} motion prompts")
+
+        update_state(scenes=scenes)
+        return success_count
+
+    except Exception as e:
+        if status_text:
+            status_text.error(f"Error: {e}")
+        return 0
+
+
+def _get_selected_scene_indices(state) -> list[int]:
+    """
+    Get indices of scenes selected for bulk re-animation.
+
+    Returns:
+        List of scene indices that have their selection checkbox checked
+    """
+    if not state.scenes:
+        return []
+
+    selected = []
+    for scene in state.scenes:
+        checkbox_key = f"reanimate_select_{scene.index}"
+        if st.session_state.get(checkbox_key, False):
+            selected.append(scene.index)
+    return selected
+
+
+def _clear_selected_scene_checkboxes(state) -> None:
+    """Clear all scene selection checkboxes.
+
+    Note: In Streamlit, you cannot modify session state for a widget key after
+    the widget has been rendered. Instead, we delete the key so when the widget
+    re-renders it uses its default value (False).
+
+    Important: Caller should call st.rerun() after this if they want the UI to update.
+    """
+    if not state.scenes:
+        return
+
+    for scene in state.scenes:
+        checkbox_key = f"reanimate_select_{scene.index}"
+        if checkbox_key in st.session_state:
+            del st.session_state[checkbox_key]
 
 
 def _redo_scene_transcription(
@@ -1200,14 +1398,14 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
         with apply_col1:
             animation_options = {
                 "Static (Ken Burns only)": AnimationType.NONE,
-                "Lip Sync (FREE)": AnimationType.LIP_SYNC,
-                "Prompt Motion (FREE)": AnimationType.PROMPT,
-                "AtlasCloud (PAID)": AnimationType.ATLASCLOUD,
-                "Seedance Pro (PAID)": AnimationType.SEEDANCE,
-                "Veo 3.1 (PAID)": AnimationType.VEO,
-                "Kling Lip Sync (PAID)": AnimationType.KLING,
-                "Wan S2V (PAID)": AnimationType.WAN_S2V,
-                "Seedance+LipSync (PAID)": AnimationType.SEEDANCE_LIPSYNC,
+                "Wan S2V Lip Sync (FREE, HF)": AnimationType.LIP_SYNC,
+                "Wan TI2V Motion (FREE, HF)": AnimationType.PROMPT,
+                "Wan 2.5 I2V (AtlasCloud)": AnimationType.ATLASCLOUD,
+                "Seedance 1.5 (AtlasCloud)": AnimationType.SEEDANCE,
+                "Veo 3.1 (Google)": AnimationType.VEO,
+                "Kling Lip Sync (fal.ai)": AnimationType.KLING,
+                "Wan S2V Lip (fal.ai)": AnimationType.WAN_S2V,
+                "Seedance+Kling (Atlas+fal)": AnimationType.SEEDANCE_LIPSYNC,
             }
             selected_animation = st.selectbox(
                 "Animation Type",
@@ -1225,14 +1423,14 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                 # Map AnimationType to radio button label for session state sync
                 anim_type_to_label = {
                     AnimationType.NONE: "Static",
-                    AnimationType.LIP_SYNC: "Lip Sync",
-                    AnimationType.PROMPT: "Prompt",
-                    AnimationType.VEO: "Veo 3.1 (PAID)",
-                    AnimationType.ATLASCLOUD: "AtlasCloud (PAID)",
-                    AnimationType.SEEDANCE: "Seedance (PAID)",
-                    AnimationType.KLING: "Kling Lip Sync (PAID)",
-                    AnimationType.WAN_S2V: "Wan S2V (PAID)",
-                    AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync (PAID)",
+                    AnimationType.LIP_SYNC: "Wan S2V Lip (FREE, HF)",
+                    AnimationType.PROMPT: "Wan TI2V (FREE, HF)",
+                    AnimationType.VEO: "Veo 3.1 (Google)",
+                    AnimationType.ATLASCLOUD: "Wan 2.5 I2V (AtlasCloud)",
+                    AnimationType.SEEDANCE: "Seedance 1.5 (AtlasCloud)",
+                    AnimationType.KLING: "Kling Lip (fal.ai)",
+                    AnimationType.WAN_S2V: "Wan S2V (fal.ai)",
+                    AnimationType.SEEDANCE_LIPSYNC: "Seedance+Kling (Atlas+fal)",
                 }
                 new_label = anim_type_to_label.get(new_anim_type, "Static")
 
@@ -1261,13 +1459,14 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
         # Build info message based on pending animation types
         if pending_animations > 0:
             type_labels = {
-                AnimationType.LIP_SYNC: "Wan2.2-S2V (FREE)",
-                AnimationType.PROMPT: "Wan2.2-TI2V (FREE)",
-                AnimationType.ATLASCLOUD: "AtlasCloud (PAID)",
-                AnimationType.VEO: "Google Veo (PAID)",
-                AnimationType.SEEDANCE: "Seedance Pro (PAID)",
-                AnimationType.KLING: "Kling Lip Sync (PAID)",
-                AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync (PAID)",
+                AnimationType.LIP_SYNC: "Wan S2V Lip (FREE, HF)",
+                AnimationType.PROMPT: "Wan TI2V (FREE, HF)",
+                AnimationType.ATLASCLOUD: "Wan 2.5 I2V (AtlasCloud)",
+                AnimationType.VEO: "Veo 3.1 (Google)",
+                AnimationType.SEEDANCE: "Seedance 1.5 (AtlasCloud)",
+                AnimationType.KLING: "Kling Lip (fal.ai)",
+                AnimationType.WAN_S2V: "Wan S2V (fal.ai)",
+                AnimationType.SEEDANCE_LIPSYNC: "Seedance+Kling (Atlas+fal)",
             }
             pending_parts = []
             for anim_type, count in pending_by_type.items():
@@ -1399,6 +1598,61 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                 crossfade = st.session_state.get("crossfade", 0.3)
                 generate_video_from_storyboard(state, crossfade, is_demo_mode)
 
+    # Motion prompts row
+    motion_col1, motion_col2 = st.columns([1, 4])
+    with motion_col1:
+        if st.button("🤖 Redo All Motion Prompts (AI)", help="Regenerate motion prompts for all scenes using AI image analysis"):
+            # Create progress UI elements
+            status_text = st.empty()
+            progress_bar = st.progress(0.0)
+            status_text.text("Starting motion prompt generation...")
+
+            count = _regenerate_all_motion_prompts(state, progress_bar=progress_bar, status_text=status_text)
+
+            if count > 0:
+                st.success(f"Generated {count} motion prompts!")
+                st.rerun()
+            else:
+                progress_bar.empty()
+                status_text.empty()
+                st.warning("No scenes with images to analyze")
+
+    # Bulk re-animation row
+    selected_indices = _get_selected_scene_indices(state)
+    if selected_indices:
+        reanimate_col1, reanimate_col2 = st.columns([1, 4])
+        with reanimate_col1:
+            if st.button(
+                f"🎬 Reanimate Selected ({len(selected_indices)} scenes)",
+                type="primary",
+                help="Clear existing animations and re-animate all selected scenes"
+            ):
+                # Clear video_path for selected scenes to force re-animation
+                scenes = list(state.scenes)
+                project_dir = getattr(state, 'project_dir', None)
+                cleared_count = 0
+
+                for idx in selected_indices:
+                    scene = scenes[idx]
+                    if scene.video_path:
+                        # Delete existing animation file
+                        video_path = Path(scene.video_path)
+                        if video_path.exists():
+                            video_path.unlink()
+                        scenes[idx].video_path = None
+                        cleared_count += 1
+
+                update_state(scenes=scenes)
+                _clear_selected_scene_checkboxes(state)
+
+                if cleared_count > 0:
+                    st.success(f"Cleared {cleared_count} animations. Use individual Animate buttons or the mass animate feature to regenerate.")
+                else:
+                    st.info("No existing animations to clear. Use individual Animate buttons to animate selected scenes.")
+                st.rerun()
+        with reanimate_col2:
+            st.caption(f"Selected scenes: {', '.join(str(i+1) for i in selected_indices)}")
+
     # Back button
     st.markdown("---")
     if st.button("Back to Upload"):
@@ -1451,14 +1705,14 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
 
     # For prompt animation, we need a motion prompt
     if animation_type == AnimationType.PROMPT:
-        motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+        motion_prompt = _get_motion_prompt(scene)
         if not motion_prompt:
             st.error("No motion prompt found for prompt animation.")
             return
 
     # For Veo animation, we need a motion prompt
     if animation_type == AnimationType.VEO:
-        motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+        motion_prompt = _get_motion_prompt(scene)
         if not motion_prompt:
             st.error("No motion prompt found for Veo animation.")
             return
@@ -1479,14 +1733,14 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
     status_placeholder = st.empty()
 
     anim_type_labels = {
-        AnimationType.LIP_SYNC: "lip sync",
-        AnimationType.PROMPT: "prompt",
-        AnimationType.VEO: "Veo 3.1 (PAID)",
-        AnimationType.ATLASCLOUD: "AtlasCloud (PAID)",
-        AnimationType.SEEDANCE: "Seedance Pro (PAID)",
-        AnimationType.KLING: "Kling Lip Sync (PAID)",
-        AnimationType.WAN_S2V: "Wan S2V (PAID)",
-        AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync (PAID)",
+        AnimationType.LIP_SYNC: "Wan S2V Lip (HF)",
+        AnimationType.PROMPT: "Wan TI2V (HF)",
+        AnimationType.VEO: "Veo 3.1 (Google)",
+        AnimationType.ATLASCLOUD: "Wan 2.5 (AtlasCloud)",
+        AnimationType.SEEDANCE: "Seedance 1.5 (AtlasCloud)",
+        AnimationType.KLING: "Kling Lip (fal.ai)",
+        AnimationType.WAN_S2V: "Wan S2V (fal.ai)",
+        AnimationType.SEEDANCE_LIPSYNC: "Seedance+Kling (Atlas+fal)",
     }
     anim_type_label = anim_type_labels.get(animation_type, "animation")
     status_placeholder.info(f"Animating ({anim_type_label}) at {resolution}...")
@@ -1523,7 +1777,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
         elif animation_type == AnimationType.PROMPT:
             # Use PromptAnimator for prompt-driven motion
             animator = PromptAnimator()
-            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            motion_prompt = _get_motion_prompt(scene)
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
                 prompt=motion_prompt,
@@ -1535,7 +1789,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
         elif animation_type == AnimationType.VEO:
             # Use VeoAnimator for high-quality Veo 3.1 animation (PAID)
             animator = VeoAnimator()
-            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            motion_prompt = _get_motion_prompt(scene)
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
                 prompt=motion_prompt,
@@ -1547,7 +1801,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
         elif animation_type == AnimationType.ATLASCLOUD:
             # Use AtlasCloudAnimator for Wan 2.5 animation (PAID, no GPU limits)
             animator = AtlasCloudAnimator()
-            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            motion_prompt = _get_motion_prompt(scene)
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
                 prompt=motion_prompt,
@@ -1559,7 +1813,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
         elif animation_type == AnimationType.SEEDANCE:
             # Use SeedanceAnimator for Seedance Pro animation (PAID, up to 12s)
             animator = SeedanceAnimator()
-            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            motion_prompt = _get_motion_prompt(scene)
             # Seedance supports 2-12 second durations - pick closest match
             target_duration = min(12, max(2, int(scene.duration)))
             result = animator.animate_scene(
@@ -1598,7 +1852,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
 
             status_placeholder.info("Generating Wan S2V animation (motion + lip sync)...")
             animator = WanS2VAnimator()
-            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            motion_prompt = _get_motion_prompt(scene)
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
                 audio_path=Path(audio_path),
@@ -1617,7 +1871,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
 
             status_placeholder.info("Step 1: Generating motion with Seedance Pro...")
             animator = SeedanceAnimator()
-            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            motion_prompt = _get_motion_prompt(scene)
             target_duration = min(10, max(2, int(scene.duration)))  # Kling lipsync max 10s
 
             motion_output = output_path.with_suffix(".motion.mp4")
@@ -1729,20 +1983,32 @@ def render_scene_card(state, scene: Scene) -> None:
         else:
             status_icons = " :hourglass:"  # Pending animation
 
-    st.markdown(f"**Scene {scene.index + 1}**{status_icons}")
+    # Header row with selection checkbox
+    header_col1, header_col2 = st.columns([3, 1])
+    with header_col1:
+        st.markdown(f"**Scene {scene.index + 1}**{status_icons}")
+    with header_col2:
+        # Checkbox for bulk re-animation selection
+        st.checkbox(
+            "Select",
+            key=f"reanimate_select_{scene.index}",
+            label_visibility="collapsed",
+            help="Select for bulk re-animation"
+        )
     st.caption(f"{scene.start_time:.1f}s - {scene.end_time:.1f}s ({scene.duration:.1f}s)")
 
     # Check for pending variations to select from
     variations_key = f"scene_variations_{scene.index}"
     has_pending_variations = variations_key in st.session_state and st.session_state[variations_key]
 
-    # Image or animation preview
-    if has_animation:
-        st.video(str(animation_path))
-    elif has_pending_variations:
-        # Show variation selection UI
+    # Image or animation preview - pending variations take priority so user can switch frame
+    if has_pending_variations:
+        # Show variation selection UI - even if there's an existing animation
         variation_paths = st.session_state[variations_key]
-        st.info(f"Select from {len(variation_paths)} variations:")
+        if has_animation:
+            st.warning("Select a variation to replace the current animation's source image:")
+        else:
+            st.info(f"Select from {len(variation_paths)} variations:")
 
         # Display variations in columns
         var_cols = st.columns(len(variation_paths))
@@ -1758,6 +2024,8 @@ def render_scene_card(state, scene: Scene) -> None:
         # Cancel button to dismiss variations
         if st.button("Cancel", key=f"cancel_vars_{scene.index}", type="secondary"):
             clear_scene_variations(scene.index)
+    elif has_animation:
+        st.video(str(animation_path))
     elif has_image:
         st.image(str(scene.image_path), use_container_width=True)
     else:
@@ -1772,14 +2040,14 @@ def render_scene_card(state, scene: Scene) -> None:
 
         anim_options = {
             "Static": AnimationType.NONE,
-            "Lip Sync": AnimationType.LIP_SYNC,
-            "Prompt": AnimationType.PROMPT,
-            "Veo 3.1 (PAID)": AnimationType.VEO,
-            "AtlasCloud (PAID)": AnimationType.ATLASCLOUD,
-            "Seedance (PAID)": AnimationType.SEEDANCE,
-            "Kling Lip Sync (PAID)": AnimationType.KLING,
-            "Wan S2V (PAID)": AnimationType.WAN_S2V,
-            "Seedance+LipSync (PAID)": AnimationType.SEEDANCE_LIPSYNC,
+            "Wan S2V Lip (FREE, HF)": AnimationType.LIP_SYNC,
+            "Wan TI2V (FREE, HF)": AnimationType.PROMPT,
+            "Wan 2.5 I2V (AtlasCloud)": AnimationType.ATLASCLOUD,
+            "Seedance 1.5 (AtlasCloud)": AnimationType.SEEDANCE,
+            "Veo 3.1 (Google)": AnimationType.VEO,
+            "Kling Lip (fal.ai)": AnimationType.KLING,
+            "Wan S2V (fal.ai)": AnimationType.WAN_S2V,
+            "Seedance+Kling (Atlas+fal)": AnimationType.SEEDANCE_LIPSYNC,
         }
         anim_labels = list(anim_options.keys())
         current_idx = list(anim_options.values()).index(current_anim_type) if current_anim_type in anim_options.values() else 0
@@ -1800,9 +2068,9 @@ def render_scene_card(state, scene: Scene) -> None:
             ai_result_key = f"_ai_motion_result_{scene.index}"
             scene_motion_prompt = getattr(scene, 'motion_prompt', None)
 
-            # Default to visual_prompt if no motion_prompt is set
-            # This gives users a starting point based on the scene description
-            default_prompt = scene_motion_prompt or scene.visual_prompt or ""
+            # Default to a short motion prompt if no motion_prompt is set
+            # Use _get_motion_prompt to get a mood-appropriate short action prompt
+            default_prompt = _get_motion_prompt(scene)
 
             # Check if AI generated a new prompt (stored in temp key from previous render)
             if ai_result_key in st.session_state:
@@ -1856,14 +2124,15 @@ def render_scene_card(state, scene: Scene) -> None:
             if new_anim_type == AnimationType.NONE:
                 # Clear video path when disabling animation
                 scenes[scene.index].video_path = None
-            # Auto-fill motion prompt from visual prompt when switching to prompt-based animation
+            # Auto-fill motion prompt with a short action description when switching to prompt-based animation
             elif new_anim_type in (AnimationType.PROMPT, AnimationType.VEO, AnimationType.ATLASCLOUD, AnimationType.SEEDANCE, AnimationType.SEEDANCE_LIPSYNC):
                 if not getattr(scenes[scene.index], 'motion_prompt', None):
-                    scenes[scene.index].motion_prompt = scene.visual_prompt
+                    short_motion = _get_motion_prompt(scene)
+                    scenes[scene.index].motion_prompt = short_motion
                     # Also update the widget session state so it shows immediately
                     widget_key = f"motion_prompt_{scene.index}"
                     if widget_key in st.session_state:
-                        st.session_state[widget_key] = scene.visual_prompt
+                        st.session_state[widget_key] = short_motion
             update_state(scenes=scenes)
             st.rerun()
 
@@ -1904,14 +2173,14 @@ def render_scene_card(state, scene: Scene) -> None:
             with anim_col2:
                 button_label = "Re-animate" if has_animation else "Animate"
                 anim_type_names = {
-                    AnimationType.LIP_SYNC: "Lip Sync",
-                    AnimationType.PROMPT: "Prompt",
-                    AnimationType.VEO: "Veo 3.1",
-                    AnimationType.ATLASCLOUD: "AtlasCloud",
-                    AnimationType.SEEDANCE: "Seedance",
-                    AnimationType.KLING: "Kling Lip Sync",
-                    AnimationType.WAN_S2V: "Wan S2V",
-                    AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync",
+                    AnimationType.LIP_SYNC: "Wan S2V Lip (HF)",
+                    AnimationType.PROMPT: "Wan TI2V (HF)",
+                    AnimationType.VEO: "Veo 3.1 (Google)",
+                    AnimationType.ATLASCLOUD: "Wan 2.5 (AtlasCloud)",
+                    AnimationType.SEEDANCE: "Seedance 1.5 (AtlasCloud)",
+                    AnimationType.KLING: "Kling Lip (fal.ai)",
+                    AnimationType.WAN_S2V: "Wan S2V (fal.ai)",
+                    AnimationType.SEEDANCE_LIPSYNC: "Seedance+Kling (Atlas+fal)",
                 }
                 anim_type_name = anim_type_names.get(new_anim_type, "Animation")
                 if st.button(button_label, key=f"animate_{scene.index}", help=f"Generate {anim_type_name} animation"):
@@ -2107,20 +2376,38 @@ def render_scene_card(state, scene: Scene) -> None:
                 regenerate_single_image(state, scene.index)
 
     # Buttons row - check for existing variations
-    project_dir = getattr(state, 'project_dir', None)
+    # IMPORTANT: Read project_dir fresh from get_state() to handle fragment reruns correctly
+    # When st.rerun() is called from within a fragment, the fragment reruns with stale arguments
+    current_state = get_state()
+    project_dir = getattr(current_state, 'project_dir', None)
     existing_variations = get_existing_variations(project_dir, scene.index) if project_dir else []
     has_saved_variations = len(existing_variations) > 0
 
+    # Number of variations selector
+    num_variations_key = f"num_variations_{scene.index}"
+    if num_variations_key not in st.session_state:
+        st.session_state[num_variations_key] = 3
+
     if has_saved_variations:
-        # 3-column layout when variations exist
-        col1, col2, col3 = st.columns(3)
+        # 4-column layout when variations exist
+        col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
         with col1:
-            if st.button(f"Regenerate", key=f"regen_{scene.index}", type="primary" if not has_image else "secondary"):
-                regenerate_single_image(state, scene.index)
+            num_vars = st.number_input(
+                "# Vars",
+                min_value=1,
+                max_value=10,
+                value=st.session_state[num_variations_key],
+                key=f"num_vars_input_{scene.index}",
+                help="Number of variations to generate",
+            )
+            st.session_state[num_variations_key] = num_vars
         with col2:
+            if st.button(f"Regenerate", key=f"regen_{scene.index}", type="primary" if not has_image else "secondary"):
+                regenerate_single_image(current_state, scene.index, num_variations=num_vars)
+        with col3:
             if st.button(f"Variations ({len(existing_variations)})", key=f"view_vars_{scene.index}", help="View and switch between saved variations"):
                 show_existing_variations(project_dir, scene.index)
-        with col3:
+        with col4:
             if has_image:
                 with open(scene.image_path, "rb") as f:
                     st.download_button(
@@ -2131,12 +2418,22 @@ def render_scene_card(state, scene: Scene) -> None:
                         key=f"download_{scene.index}",
                     )
     else:
-        # 2-column layout when no variations
-        col1, col2 = st.columns(2)
+        # 3-column layout when no variations
+        col1, col2, col3 = st.columns([1, 1, 1])
         with col1:
-            if st.button(f"Regenerate", key=f"regen_{scene.index}", type="primary" if not has_image else "secondary"):
-                regenerate_single_image(state, scene.index)
+            num_vars = st.number_input(
+                "# Vars",
+                min_value=1,
+                max_value=10,
+                value=st.session_state[num_variations_key],
+                key=f"num_vars_input_{scene.index}",
+                help="Number of variations to generate",
+            )
+            st.session_state[num_variations_key] = num_vars
         with col2:
+            if st.button(f"Regenerate", key=f"regen_{scene.index}", type="primary" if not has_image else "secondary"):
+                regenerate_single_image(current_state, scene.index, num_variations=num_vars)
+        with col3:
             if has_image:
                 with open(scene.image_path, "rb") as f:
                     st.download_button(
@@ -2310,6 +2607,7 @@ def generate_images_from_prompts(state, is_demo_mode: bool) -> None:
             visual_world=visual_world,
             max_workers=parallel_workers,
             hero_image=hero_image,
+            show_character_flags=[s.show_character for s in scenes],
         )
 
         # Ensure we have the same number of paths as scenes
@@ -2344,12 +2642,14 @@ def generate_images_from_prompts(state, is_demo_mode: bool) -> None:
 
 def regenerate_single_image(state, scene_index: int, num_variations: int = 3) -> None:
     """Regenerate a single scene's image with multiple variations for selection."""
-    project_dir = getattr(state, 'project_dir', None)
+    # Read fresh state to handle fragment reruns correctly
+    current_state = get_state()
+    project_dir = getattr(current_state, 'project_dir', None)
     if not project_dir:
         st.error("No project directory found. Please start over.")
         return
 
-    scenes = state.scenes
+    scenes = current_state.scenes
     if scene_index >= len(scenes):
         st.error(f"Invalid scene index: {scene_index}")
         return
@@ -2357,19 +2657,19 @@ def regenerate_single_image(state, scene_index: int, num_variations: int = 3) ->
     scene = scenes[scene_index]
     images_dir = Path(project_dir) / "images"
     variations_dir = images_dir / "variations" / f"scene_{scene_index:03d}"
-    resolution = getattr(state, 'video_resolution', '1080p')
+    resolution = getattr(current_state, 'video_resolution', '1080p')
     res_info = RESOLUTION_OPTIONS.get(resolution, RESOLUTION_OPTIONS["1080p"])
 
     with st.spinner(f"Generating {num_variations} variations for scene {scene_index + 1}..."):
         image_gen = ImageGenerator()
 
         style_prefix = (
-            state.concept.visual_style
-            if state.concept and state.concept.visual_style
+            current_state.concept.visual_style
+            if current_state.concept and current_state.concept.visual_style
             else config.image.default_style
         )
-        character_desc = state.concept.character_description if state.concept else None
-        visual_world = state.concept.visual_world if state.concept else None
+        character_desc = current_state.concept.character_description if current_state.concept else None
+        visual_world = current_state.concept.visual_world if current_state.concept else None
 
         # Generate multiple variations
         variations = image_gen.generate_scene_variations(
@@ -2396,13 +2696,16 @@ def regenerate_single_image(state, scene_index: int, num_variations: int = 3) ->
 def select_scene_variation(state, scene_index: int, variation_path: str) -> None:
     """Select a variation as the main scene image."""
     import shutil
+    from datetime import datetime
 
-    project_dir = getattr(state, 'project_dir', None)
+    # Read fresh state to handle fragment reruns correctly
+    current_state = get_state()
+    project_dir = getattr(current_state, 'project_dir', None)
     if not project_dir:
         st.error("No project directory found.")
         return
 
-    scenes = state.scenes
+    scenes = current_state.scenes
     if scene_index >= len(scenes):
         st.error(f"Invalid scene index: {scene_index}")
         return
@@ -2413,18 +2716,54 @@ def select_scene_variation(state, scene_index: int, variation_path: str) -> None
     # Copy selected variation to main scene image path
     shutil.copy(variation_path, output_path)
 
-    # Update scene
+    # Update scene image path
     scenes[scene_index].image_path = output_path
-    # Clear any existing video path since image changed
-    if hasattr(scenes[scene_index], 'video_path'):
-        scenes[scene_index].video_path = None
+
+    # Archive any existing animation since the source image changed
+    # Move old animations to archive folder instead of deleting
+    animations_dir = Path(project_dir) / "animations"
+    archive_dir = animations_dir / "archive"
+    expected_anim = animations_dir / f"animated_scene_{scene_index:03d}.mp4"
+
+    archived_animation = False
+    if expected_anim.exists():
+        try:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_path = archive_dir / f"scene_{scene_index:03d}_{timestamp}.mp4"
+            shutil.move(str(expected_anim), str(archive_path))
+            archived_animation = True
+        except Exception:
+            pass  # Ignore archive errors
+
+    # Also archive if video_path points elsewhere
+    if hasattr(scenes[scene_index], 'video_path') and scenes[scene_index].video_path:
+        old_video = Path(scenes[scene_index].video_path)
+        if old_video.exists() and old_video != expected_anim:
+            try:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                archive_path = archive_dir / f"scene_{scene_index:03d}_{timestamp}.mp4"
+                shutil.move(str(old_video), str(archive_path))
+                archived_animation = True
+            except Exception:
+                pass
+
+    # Reset animation state so user can re-animate with new image
+    scenes[scene_index].video_path = None
+    scenes[scene_index].animated = False
+    scenes[scene_index].animation_type = AnimationType.NONE
+
     update_state(scenes=scenes)
 
     # Clear variations from session state
     if f"scene_variations_{scene_index}" in st.session_state:
         del st.session_state[f"scene_variations_{scene_index}"]
 
-    st.success(f"Selected variation applied to scene {scene_index + 1}!")
+    if archived_animation:
+        st.success(f"Selected variation applied to scene {scene_index + 1}! Old animation archived to animations/archive/")
+    else:
+        st.success(f"Selected variation applied to scene {scene_index + 1}!")
     st.rerun()
 
 
@@ -2509,6 +2848,7 @@ def regenerate_missing_images(state) -> None:
                 visual_world=visual_world,
                 output_path=output_path,
                 image_size=res_info["image_size"],
+                show_character=scenes[i].show_character,
             )
 
             if image and output_path.exists():
@@ -2630,14 +2970,14 @@ def _animate_single_scene_worker(
     anim_type = getattr(scene, 'animation_type', AnimationType.LIP_SYNC)
 
     anim_type_names = {
-        AnimationType.LIP_SYNC: "lip-sync",
-        AnimationType.PROMPT: "prompt",
-        AnimationType.VEO: "Veo",
-        AnimationType.ATLASCLOUD: "AtlasCloud",
-        AnimationType.SEEDANCE: "Seedance",
-        AnimationType.KLING: "Kling Lip Sync",
-        AnimationType.WAN_S2V: "Wan S2V",
-        AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync",
+        AnimationType.LIP_SYNC: "Wan S2V Lip (HF)",
+        AnimationType.PROMPT: "Wan TI2V (HF)",
+        AnimationType.VEO: "Veo 3.1 (Google)",
+        AnimationType.ATLASCLOUD: "Wan 2.5 (AtlasCloud)",
+        AnimationType.SEEDANCE: "Seedance 1.5 (AtlasCloud)",
+        AnimationType.KLING: "Kling Lip (fal.ai)",
+        AnimationType.WAN_S2V: "Wan S2V (fal.ai)",
+        AnimationType.SEEDANCE_LIPSYNC: "Seedance+Kling (Atlas+fal)",
     }
     anim_type_name = anim_type_names.get(anim_type, "unknown")
 
@@ -2674,7 +3014,7 @@ def _animate_single_scene_worker(
         elif anim_type == AnimationType.PROMPT:
             messages.append(f"Using Wan2.2-TI2V-5B for prompt animation (FREE)")
             animator = PromptAnimationChainer()
-            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            motion_prompt = _get_motion_prompt(scene)
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
                 prompt=motion_prompt,
@@ -2687,7 +3027,7 @@ def _animate_single_scene_worker(
         elif anim_type == AnimationType.VEO:
             messages.append(f"Using Google Veo 3.1 (PAID)")
             animator = VeoAnimationChainer()
-            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            motion_prompt = _get_motion_prompt(scene)
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
                 prompt=motion_prompt,
@@ -2700,7 +3040,7 @@ def _animate_single_scene_worker(
         elif anim_type == AnimationType.ATLASCLOUD:
             messages.append(f"Using AtlasCloud Wan 2.5 (PAID)")
             animator = AtlasCloudAnimator()
-            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            motion_prompt = _get_motion_prompt(scene)
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
                 prompt=motion_prompt,
@@ -2713,7 +3053,7 @@ def _animate_single_scene_worker(
         elif anim_type == AnimationType.SEEDANCE:
             messages.append(f"Using Seedance Pro (PAID)")
             animator = SeedanceAnimator()
-            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            motion_prompt = _get_motion_prompt(scene)
             target_duration = min(12, max(2, int(scene.duration)))
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
@@ -2761,7 +3101,7 @@ def _animate_single_scene_worker(
 
             messages.append(f"Using Wan S2V (PAID, fal.ai)")
             animator = WanS2VAnimator()
-            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            motion_prompt = _get_motion_prompt(scene)
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
                 audio_path=Path(audio_path),
@@ -2783,7 +3123,7 @@ def _animate_single_scene_worker(
                     "skipped": True,
                 }
 
-            motion_prompt = getattr(scene, 'motion_prompt', None) or scene.visual_prompt
+            motion_prompt = _get_motion_prompt(scene)
             target_duration = min(10, max(2, int(scene.duration)))
 
             motion_output = output_path.with_suffix(".motion.mp4")
@@ -3028,14 +3368,14 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
             for idx, (scene, output_path) in enumerate(tasks):
                 anim_type = getattr(scene, 'animation_type', AnimationType.LIP_SYNC)
                 anim_type_names = {
-                    AnimationType.LIP_SYNC: "lip-sync",
-                    AnimationType.PROMPT: "prompt",
-                    AnimationType.VEO: "Veo",
-                    AnimationType.ATLASCLOUD: "AtlasCloud",
-                    AnimationType.SEEDANCE: "Seedance",
-                    AnimationType.KLING: "Kling Lip Sync",
-                    AnimationType.WAN_S2V: "Wan S2V",
-                    AnimationType.SEEDANCE_LIPSYNC: "Seedance+LipSync",
+                    AnimationType.LIP_SYNC: "Wan S2V Lip (HF)",
+                    AnimationType.PROMPT: "Wan TI2V (HF)",
+                    AnimationType.VEO: "Veo 3.1 (Google)",
+                    AnimationType.ATLASCLOUD: "Wan 2.5 (AtlasCloud)",
+                    AnimationType.SEEDANCE: "Seedance 1.5 (AtlasCloud)",
+                    AnimationType.KLING: "Kling Lip (fal.ai)",
+                    AnimationType.WAN_S2V: "Wan S2V (fal.ai)",
+                    AnimationType.SEEDANCE_LIPSYNC: "Seedance+Kling (Atlas+fal)",
                 }
                 anim_type_name = anim_type_names.get(anim_type, "unknown")
 
@@ -3132,6 +3472,7 @@ def regenerate_all_images(state) -> None:
                 visual_world=visual_world,
                 output_path=output_path,
                 image_size=res_info["image_size"],
+                show_character=scene.show_character,
             )
 
             if image:

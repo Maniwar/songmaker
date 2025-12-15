@@ -36,6 +36,7 @@ class ImageGenerator:
         aspect_ratio: str = "16:9",
         output_path: Optional[Path] = None,
         image_size: Optional[str] = None,
+        show_character: bool = True,
     ) -> Optional[Image.Image]:
         """
         Generate a scene image using Nano Banana Pro (Gemini 3 Pro Image).
@@ -49,6 +50,7 @@ class ImageGenerator:
             aspect_ratio: Output aspect ratio (default 16:9 for video)
             output_path: Optional path to save the image
             image_size: Image size for Gemini models ("2K" or "4K")
+            show_character: Whether the character appears in this scene (default True)
 
         Returns:
             Generated PIL Image or None if generation failed
@@ -68,8 +70,8 @@ class ImageGenerator:
         if style_prefix:
             full_prompt_parts.append(f"Cinematography: {style_prefix}")
 
-        # Character consistency
-        if character_description:
+        # Character consistency - only include if character appears in this scene
+        if character_description and show_character:
             full_prompt_parts.append(f"Character: {character_description}")
 
         # The actual scene content
@@ -361,6 +363,7 @@ Respond with ONLY the motion prompt, nothing else."""
         visual_world: Optional[str] = None,
         max_workers: int = 4,
         hero_image: Optional[Image.Image] = None,
+        show_character_flags: Optional[list[bool]] = None,
     ) -> list[Path]:
         """
         Generate a series of images for a storyboard.
@@ -379,6 +382,7 @@ Respond with ONLY the motion prompt, nothing else."""
             hero_image: Optional reference image for visual consistency
                 - In parallel mode: used as reference for ALL scene generations
                 - In sequential mode: seeds the FIRST scene (scene 0)
+            show_character_flags: Optional list of bools indicating if character appears in each scene
 
         Returns:
             List of paths to generated images (always same length as scene_prompts)
@@ -413,6 +417,11 @@ Respond with ONLY the motion prompt, nothing else."""
                         # Subsequent scenes use previous scene's image
                         reference_image = generated_images[i - 1]
 
+                # Determine if character should appear in this scene
+                show_char = True
+                if show_character_flags is not None and i < len(show_character_flags):
+                    show_char = show_character_flags[i]
+
                 image = self.generate_scene_image(
                     prompt=prompt,
                     style_prefix=style_prefix,
@@ -421,6 +430,7 @@ Respond with ONLY the motion prompt, nothing else."""
                     reference_image=reference_image,
                     output_path=output_path,
                     image_size=image_size,
+                    show_character=show_char,
                 )
 
                 if image and output_path.exists():
@@ -436,7 +446,7 @@ Respond with ONLY the motion prompt, nothing else."""
                     0.05,
                 )
 
-            def generate_single_image(index: int, prompt: str) -> tuple[int, Optional[Image.Image], Optional[Path]]:
+            def generate_single_image(index: int, prompt: str, show_char: bool) -> tuple[int, Optional[Image.Image], Optional[Path]]:
                 """Generate a single image and return (index, image, path)."""
                 output_path = output_dir / f"scene_{index:03d}.png"
 
@@ -448,6 +458,7 @@ Respond with ONLY the motion prompt, nothing else."""
                     reference_image=hero_image,  # Use hero_image for ALL scenes in parallel mode
                     output_path=output_path,
                     image_size=image_size,
+                    show_character=show_char,
                 )
 
                 if image and output_path.exists():
@@ -456,10 +467,13 @@ Respond with ONLY the motion prompt, nothing else."""
 
             # Submit all tasks to thread pool
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(generate_single_image, i, prompt): i
-                    for i, prompt in enumerate(scene_prompts)
-                }
+                futures = {}
+                for i, prompt in enumerate(scene_prompts):
+                    # Determine if character should appear in this scene
+                    show_char = True
+                    if show_character_flags is not None and i < len(show_character_flags):
+                        show_char = show_character_flags[i]
+                    futures[executor.submit(generate_single_image, i, prompt, show_char)] = i
 
                 # Collect results as they complete and update progress from main thread
                 completed_count = 0

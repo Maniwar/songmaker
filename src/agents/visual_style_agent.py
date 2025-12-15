@@ -462,16 +462,23 @@ Return ONLY valid JSON:
   "cinematography_style": "style description",
   "color_palette": "colors or null",
   "scene_prompts": [
-    {{"index": 0, "start_time": X, "end_time": Y, "lyrics_segment": "...", "visual_prompt": "concise but specific image prompt (1-2 sentences)", "mood": "mood", "effect": "zoom_in"}}
+    {{"index": 0, "start_time": X, "end_time": Y, "lyrics_segment": "...", "visual_prompt": "scene-specific action and composition only", "motion_prompt": "short action description for animation (5-10 words)", "mood": "mood", "effect": "zoom_in", "show_character": true}}
   ]
 }}
 
 RULES:
 1. EXACTLY {self._num_scenes} scene_prompts - no more, no less
 2. Use EXACT start_time/end_time from timings above
-3. visual_prompt: concise (1-2 sentences) but specific for AI image generation
-4. effect: zoom_in, zoom_out, pan_left, pan_right, pan_up, or pan_down
-5. NO markdown, NO explanation - ONLY the JSON object"""
+3. visual_prompt: ONLY describe what's UNIQUE to this specific scene (action, composition, key elements)
+   - DO NOT include character description (it's added separately when show_character=true)
+   - DO NOT include visual world/setting (it's added separately)
+   - DO NOT include cinematography style (it's added separately)
+   - JUST describe: what is happening, camera framing, key visual elements in THIS scene
+   - Example: "Close-up of hands strumming guitar strings, warm spotlight from above"
+4. motion_prompt: SHORT action for animation (e.g. "strumming guitar passionately", "walking through rain")
+5. effect: zoom_in, zoom_out, pan_left, pan_right, pan_up, or pan_down
+6. show_character: true if the main character appears in this scene, false for landscapes/objects/establishing shots
+7. NO markdown, NO explanation - ONLY the JSON object"""
 
         messages = self.conversation_history.copy()
         messages.append({"role": "user", "content": extraction_prompt})
@@ -481,7 +488,7 @@ RULES:
         response = client.messages.create(
             model="claude-sonnet-4-5-20250929",
             max_tokens=16384,
-            system="You are a JSON extraction assistant. Return only valid JSON, no markdown formatting, no explanation text. Be concise with visual_prompt (1-2 sentences each).",
+            system="You are a JSON extraction assistant. Return only valid JSON, no markdown. visual_prompt should ONLY describe scene-specific action/composition (1-2 sentences) - DO NOT include character descriptions, visual world, or cinematography style as those are added separately.",
             messages=messages,
         )
 
@@ -519,16 +526,23 @@ Return ONLY valid JSON:
   "cinematography_style": "style description",
   "color_palette": "colors or null",
   "scene_prompts": [
-    {{"index": 0, "start_time": X, "end_time": Y, "lyrics_segment": "...", "visual_prompt": "concise but specific image prompt (1-2 sentences)", "mood": "mood", "effect": "zoom_in"}}
+    {{"index": 0, "start_time": X, "end_time": Y, "lyrics_segment": "...", "visual_prompt": "scene-specific action and composition only", "motion_prompt": "short action description for animation (5-10 words)", "mood": "mood", "effect": "zoom_in", "show_character": true}}
   ]
 }}
 
 RULES:
 1. Create {len(first_batch_segments)} scene_prompts for this batch (scenes 1-{len(first_batch_segments)})
 2. Use EXACT start_time/end_time from timings above
-3. visual_prompt: concise (1-2 sentences) but specific for AI image generation
-4. effect: zoom_in, zoom_out, pan_left, pan_right, pan_up, or pan_down
-5. NO markdown, NO explanation - ONLY the JSON object"""
+3. visual_prompt: ONLY describe what's UNIQUE to this specific scene
+   - DO NOT include character description (it's added separately when show_character=true)
+   - DO NOT include visual world/setting (it's added separately)
+   - DO NOT include cinematography style (it's added separately)
+   - JUST describe: action, camera framing, key visual elements specific to THIS scene
+   - Example: "Close-up of hands on piano keys, sheet music in soft focus"
+4. motion_prompt: SHORT action for animation (e.g. "fingers dancing on piano keys")
+5. effect: zoom_in, zoom_out, pan_left, pan_right, pan_up, or pan_down
+6. show_character: true if the main character appears in this scene, false for landscapes/objects/establishing shots
+7. NO markdown, NO explanation - ONLY the JSON object"""
 
         messages = self.conversation_history.copy()
         messages.append({"role": "user", "content": first_prompt})
@@ -536,7 +550,7 @@ RULES:
         # First batch with retry logic
         first_response = self._call_with_retry(
             client, messages,
-            "You are a JSON extraction assistant. Return only valid JSON, no markdown formatting, no explanation text. Be concise with visual_prompt (1-2 sentences each)."
+            "You are a JSON extraction assistant. Return only valid JSON, no markdown. visual_prompt should ONLY describe scene-specific action/composition (1-2 sentences) - DO NOT include character descriptions, visual world, or cinematography style as those are added separately."
         )
 
         if not first_response:
@@ -574,7 +588,7 @@ RULES:
 
 BATCH {batch_idx + 1} of {num_batches} - scenes {start_idx + 1}-{end_idx} of {self._num_scenes}.
 
-Visual style (maintain consistency):
+Visual style (for context, but DO NOT repeat in visual_prompt):
 - Visual World: {visual_world}
 - Character: {character_description}
 - Cinematography: {cinematography_style}
@@ -587,21 +601,27 @@ Scene timings for THIS BATCH:
 
 Return ONLY a JSON array of scene_prompts for scenes {start_idx + 1}-{end_idx}:
 [
-  {{"index": {start_idx}, "start_time": X, "end_time": Y, "lyrics_segment": "...", "visual_prompt": "...", "mood": "...", "effect": "zoom_in"}}
+  {{"index": {start_idx}, "start_time": X, "end_time": Y, "lyrics_segment": "...", "visual_prompt": "scene-specific action and composition only", "motion_prompt": "short action for animation", "mood": "...", "effect": "zoom_in", "show_character": true}}
 ]
 
 RULES:
 1. Create EXACTLY {len(batch_segments)} scene prompts (indices {start_idx}-{end_idx - 1})
 2. Use EXACT start_time/end_time from timings above
-3. Maintain visual consistency with previous scenes
-4. effect: zoom_in, zoom_out, pan_left, pan_right, pan_up, or pan_down
-5. NO markdown, NO explanation - ONLY the JSON array"""
+3. visual_prompt: ONLY describe what's UNIQUE to this specific scene
+   - DO NOT include character description (it's added separately when show_character=true)
+   - DO NOT include visual world/setting (it's added separately)
+   - DO NOT include cinematography style (it's added separately)
+   - JUST describe: action, camera framing, key visual elements specific to THIS scene
+4. motion_prompt: SHORT action for animation (e.g. "strumming guitar passionately")
+5. effect: zoom_in, zoom_out, pan_left, pan_right, pan_up, or pan_down
+6. show_character: true if the main character appears in this scene, false for landscapes/objects/establishing shots
+7. NO markdown, NO explanation - ONLY the JSON array"""
 
             batch_messages = [{"role": "user", "content": batch_prompt}]
 
             batch_response = self._call_with_retry(
                 client, batch_messages,
-                f"You are extracting scene prompts for a music video. Maintain consistency with: {visual_world}. Return only a JSON array."
+                f"You are extracting scene prompts for a music video. visual_prompt should ONLY describe scene-specific action/composition - DO NOT repeat character descriptions, visual world, or cinematography style. Return only a JSON array."
             )
 
             if batch_response:
@@ -736,6 +756,8 @@ RULES:
                     mood=sp_data.get("mood", "neutral"),
                     effect=effect,
                     user_notes=sp_data.get("user_notes"),
+                    motion_prompt=sp_data.get("motion_prompt"),
+                    show_character=sp_data.get("show_character", True),
                 ))
             except Exception as e:
                 logger.error(f"Error parsing scene prompt {sp_data}: {e}")
