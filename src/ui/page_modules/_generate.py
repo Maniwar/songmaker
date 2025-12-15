@@ -1558,6 +1558,81 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
             help="Separates vocals from music before transcription for better word recognition. Takes longer but improves accuracy for songs with heavy instrumentation.",
         )
 
+    # Video output settings (right before Create Video button)
+    with st.expander("Video Output Settings", expanded=False):
+        vo_col1, vo_col2, vo_col3, vo_col4, vo_col5 = st.columns(5)
+        with vo_col1:
+            # Resolution
+            current_resolution = getattr(state, 'video_resolution', '1080p')
+            resolution_idx = list(RESOLUTION_OPTIONS.keys()).index(current_resolution) if current_resolution in RESOLUTION_OPTIONS else 0
+            new_resolution = st.selectbox(
+                "Resolution",
+                options=list(RESOLUTION_OPTIONS.keys()),
+                index=resolution_idx,
+                help="Final video output resolution",
+                key="video_resolution_storyboard",
+            )
+            if new_resolution != current_resolution:
+                update_state(video_resolution=new_resolution)
+        with vo_col2:
+            # FPS
+            current_fps = getattr(state, 'video_fps', 30)
+            fps_idx = list(FPS_OPTIONS.values()).index(current_fps) if current_fps in FPS_OPTIONS.values() else 1
+            fps_selection = st.selectbox(
+                "Frame Rate",
+                options=list(FPS_OPTIONS.keys()),
+                index=fps_idx,
+                help="Higher fps = smoother but larger file",
+                key="video_fps_storyboard",
+            )
+            new_fps = FPS_OPTIONS[fps_selection]
+            if new_fps != current_fps:
+                update_state(video_fps=new_fps)
+        with vo_col3:
+            # Extension mode
+            extension_options = {
+                "Ken Burns (all scenes)": "all",
+                "Ken Burns (end only)": "end_only",
+                "No Ken Burns": "none",
+            }
+            current_ext_mode = getattr(state, 'extension_mode', 'all')
+            ext_labels = list(extension_options.keys())
+            ext_values = list(extension_options.values())
+            ext_idx = ext_values.index(current_ext_mode) if current_ext_mode in ext_values else 0
+            new_ext_label = st.selectbox(
+                "Animation Extension",
+                options=ext_labels,
+                index=ext_idx,
+                help="How to fill gaps when animations are shorter than scene duration",
+                key="extension_mode_storyboard",
+            )
+            new_ext_mode = extension_options[new_ext_label]
+            if new_ext_mode != current_ext_mode:
+                update_state(extension_mode=new_ext_mode)
+        with vo_col4:
+            # Crossfade
+            crossfade_val = st.slider(
+                "Crossfade (sec)",
+                min_value=0.0,
+                max_value=1.0,
+                value=st.session_state.get("crossfade", 0.3),
+                step=0.1,
+                help="Transition duration between scenes",
+                key="crossfade_storyboard",
+            )
+            st.session_state["crossfade"] = crossfade_val
+        with vo_col5:
+            # Show lyrics toggle
+            current_show_lyrics = getattr(state, 'show_lyrics', True)
+            new_show_lyrics = st.checkbox(
+                "Show Lyrics",
+                value=current_show_lyrics,
+                help="Display karaoke-style lyrics on the video",
+                key="show_lyrics_storyboard",
+            )
+            if new_show_lyrics != current_show_lyrics:
+                update_state(show_lyrics=new_show_lyrics)
+
     # Action buttons
     if missing_count > 0:
         col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -3609,6 +3684,8 @@ def generate_video_from_storyboard(state, crossfade: float, is_demo_mode: bool) 
             )
         else:
             # Full mode: generate with audio
+            ext_mode = getattr(state, 'extension_mode', 'all')
+            st.write(f"Extension mode: **{ext_mode}**")
             video_gen.generate_music_video(
                 scenes=scenes,
                 audio_path=Path(state.audio_path),
@@ -3617,7 +3694,7 @@ def generate_video_from_storyboard(state, crossfade: float, is_demo_mode: bool) 
                 progress_callback=video_progress_callback,
                 resolution=(res_info['width'], res_info['height']),
                 fps=fps,
-                extension_mode=getattr(state, 'extension_mode', 'all'),
+                extension_mode=ext_mode,
             )
 
         update_state(final_video_path=str(output_path))

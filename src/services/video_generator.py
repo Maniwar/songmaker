@@ -878,6 +878,10 @@ class VideoGenerator:
         )
         pad_duration = effective_target_duration - current_duration if needs_extension else 0
 
+        logger.info(f"prepare_animated_clip: target_duration={target_duration}, current_duration={current_duration:.2f}s, "
+                    f"use_natural_duration={use_natural_duration}, needs_extension={needs_extension}, "
+                    f"effect={effect}")
+
         # If we need to extend and have a Ken Burns effect, use that instead of freeze frame
         if needs_extension and effect is not None and pad_duration > 0.1:
             logger.info(f"Video {pad_duration:.1f}s short, extending with Ken Burns effect")
@@ -1093,6 +1097,7 @@ class VideoGenerator:
         Returns:
             Path to the final video
         """
+        logger.info(f"generate_music_video called with extension_mode={extension_mode}")
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir = Path(temp_dir)
             clip_paths = []
@@ -1128,11 +1133,15 @@ class VideoGenerator:
                 clip_path = temp_dir / f"clip_{i:03d}.mp4"
 
                 # Check if this scene has an animation video
-                has_animation = (
-                    getattr(scene, 'animated', False)
-                    and getattr(scene, 'video_path', None)
-                    and Path(scene.video_path).exists()
-                )
+                scene_animated = getattr(scene, 'animated', False)
+                scene_video_path = getattr(scene, 'video_path', None)
+                video_exists = Path(scene_video_path).exists() if scene_video_path else False
+                has_animation = scene_animated and scene_video_path and video_exists
+
+                # Debug logging for first few scenes
+                if i < 3:
+                    logger.info(f"Scene {i}: animated={scene_animated}, video_path={scene_video_path}, "
+                                f"exists={video_exists}, has_animation={has_animation}, extension_mode={extension_mode}")
 
                 if has_animation:
                     # Use the pre-generated animated video clip
@@ -1148,6 +1157,7 @@ class VideoGenerator:
                         # Pack mode: use natural animation duration, no per-clip extension
                         clip_target_duration = 0  # 0 = use natural duration
                         extend_effect = None
+                        logger.info(f"Scene {i}: Using natural duration (extension_mode={extension_mode})")
                     elif is_lip_sync:
                         # Lip-sync must freeze frame to maintain audio timing
                         clip_target_duration = scene.duration
@@ -1156,6 +1166,7 @@ class VideoGenerator:
                         # Default "all" mode: Ken Burns on each scene
                         clip_target_duration = scene.duration
                         extend_effect = scene.effect
+                        logger.info(f"Scene {i}: Using target_duration={clip_target_duration}, effect={extend_effect}")
 
                     self.prepare_animated_clip(
                         video_path=Path(scene.video_path),
