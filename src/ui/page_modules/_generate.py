@@ -1,5 +1,6 @@
 """Video Generation page - Step 4 of the workflow."""
 
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
@@ -1814,8 +1815,9 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
             # Use SeedanceAnimator for Seedance Pro animation (PAID, up to 12s)
             animator = SeedanceAnimator()
             motion_prompt = _get_motion_prompt(scene)
-            # Seedance supports 2-12 second durations - pick closest match
-            target_duration = min(12, max(2, int(scene.duration)))
+            # Seedance supports 2-12 second durations - use ceil to ensure animation covers full scene
+            # (avoids Ken Burns padding at the end due to truncation)
+            target_duration = min(12, max(2, math.ceil(scene.duration)))
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
                 prompt=motion_prompt,
@@ -1872,7 +1874,8 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
             status_placeholder.info("Step 1: Generating motion with Seedance Pro...")
             animator = SeedanceAnimator()
             motion_prompt = _get_motion_prompt(scene)
-            target_duration = min(10, max(2, int(scene.duration)))  # Kling lipsync max 10s
+            # Kling lipsync max 10s - use ceil to ensure animation covers full scene
+            target_duration = min(10, max(2, math.ceil(scene.duration)))
 
             motion_output = output_path.with_suffix(".motion.mp4")
             motion_result = animator.animate_scene(
@@ -2139,12 +2142,13 @@ def render_scene_card(state, scene: Scene) -> None:
         # Animate/Re-animate controls (only if animation type is not NONE)
         if new_anim_type != AnimationType.NONE:
             # Show expected animation duration based on type
+            # Use ceil to show the actual duration that will be requested (avoids Ken Burns padding)
             scene_dur = scene.duration
             if new_anim_type in (AnimationType.SEEDANCE, AnimationType.SEEDANCE_LIPSYNC):
-                anim_dur = min(12, max(2, int(scene_dur)))
+                anim_dur = min(12, max(2, math.ceil(scene_dur)))
                 st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, Seedance: 2-12s)")
             elif new_anim_type == AnimationType.KLING:
-                anim_dur = min(10, max(2, int(scene_dur)))
+                anim_dur = min(10, max(2, math.ceil(scene_dur)))
                 st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, Kling: 2-10s)")
             elif new_anim_type == AnimationType.WAN_S2V:
                 # Wan S2V supports video chaining for long scenes (7.5s segments @ 16fps)
@@ -3054,7 +3058,8 @@ def _animate_single_scene_worker(
             messages.append(f"Using Seedance Pro (PAID)")
             animator = SeedanceAnimator()
             motion_prompt = _get_motion_prompt(scene)
-            target_duration = min(12, max(2, int(scene.duration)))
+            # Use ceil to ensure animation covers full scene (avoids Ken Burns padding)
+            target_duration = min(12, max(2, math.ceil(scene.duration)))
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
                 prompt=motion_prompt,
@@ -3124,7 +3129,8 @@ def _animate_single_scene_worker(
                 }
 
             motion_prompt = _get_motion_prompt(scene)
-            target_duration = min(10, max(2, int(scene.duration)))
+            # Kling lipsync max 10s - use ceil to ensure animation covers full scene
+            target_duration = min(10, max(2, math.ceil(scene.duration)))
 
             motion_output = output_path.with_suffix(".motion.mp4")
             motion_result = None
