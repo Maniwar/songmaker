@@ -2296,8 +2296,8 @@ def generate_images_from_prompts(state, is_demo_mode: bool) -> None:
     st.rerun()
 
 
-def regenerate_single_image(state, scene_index: int) -> None:
-    """Regenerate a single scene's image."""
+def regenerate_single_image(state, scene_index: int, num_variations: int = 3) -> None:
+    """Regenerate a single scene's image with multiple variations for selection."""
     project_dir = getattr(state, 'project_dir', None)
     if not project_dir:
         st.error("No project directory found. Please start over.")
@@ -2310,10 +2310,11 @@ def regenerate_single_image(state, scene_index: int) -> None:
 
     scene = scenes[scene_index]
     images_dir = Path(project_dir) / "images"
+    variations_dir = images_dir / "variations" / f"scene_{scene_index:03d}"
     resolution = getattr(state, 'video_resolution', '1080p')
     res_info = RESOLUTION_OPTIONS.get(resolution, RESOLUTION_OPTIONS["1080p"])
 
-    with st.spinner(f"Regenerating scene {scene_index + 1}..."):
+    with st.spinner(f"Generating {num_variations} variations for scene {scene_index + 1}..."):
         image_gen = ImageGenerator()
 
         style_prefix = (
@@ -2324,24 +2325,67 @@ def regenerate_single_image(state, scene_index: int) -> None:
         character_desc = state.concept.character_description if state.concept else None
         visual_world = state.concept.visual_world if state.concept else None
 
-        output_path = images_dir / f"scene_{scene_index:03d}.png"
-
-        image = image_gen.generate_scene_image(
+        # Generate multiple variations
+        variations = image_gen.generate_scene_variations(
             prompt=scene.visual_prompt,
+            num_variations=num_variations,
             style_prefix=style_prefix,
             character_description=character_desc,
             visual_world=visual_world,
-            output_path=output_path,
+            output_dir=variations_dir,
             image_size=res_info["image_size"],
         )
 
-        if image:
-            scenes[scene_index].image_path = output_path
-            update_state(scenes=scenes)
-            st.success(f"Scene {scene_index + 1} regenerated!")
+        if variations:
+            # Store variation paths in session state for selection UI
+            variation_paths = [str(path) for _, path in variations if path]
+            st.session_state[f"scene_variations_{scene_index}"] = variation_paths
+            st.success(f"Generated {len(variation_paths)} variations for scene {scene_index + 1}. Select one below!")
         else:
-            st.error(f"Failed to regenerate scene {scene_index + 1}")
+            st.error(f"Failed to generate variations for scene {scene_index + 1}")
 
+    st.rerun()
+
+
+def select_scene_variation(state, scene_index: int, variation_path: str) -> None:
+    """Select a variation as the main scene image."""
+    import shutil
+
+    project_dir = getattr(state, 'project_dir', None)
+    if not project_dir:
+        st.error("No project directory found.")
+        return
+
+    scenes = state.scenes
+    if scene_index >= len(scenes):
+        st.error(f"Invalid scene index: {scene_index}")
+        return
+
+    images_dir = Path(project_dir) / "images"
+    output_path = images_dir / f"scene_{scene_index:03d}.png"
+
+    # Copy selected variation to main scene image path
+    shutil.copy(variation_path, output_path)
+
+    # Update scene
+    scenes[scene_index].image_path = output_path
+    # Clear any existing video path since image changed
+    if hasattr(scenes[scene_index], 'video_path'):
+        scenes[scene_index].video_path = None
+    update_state(scenes=scenes)
+
+    # Clear variations from session state
+    if f"scene_variations_{scene_index}" in st.session_state:
+        del st.session_state[f"scene_variations_{scene_index}"]
+
+    st.success(f"Selected variation applied to scene {scene_index + 1}!")
+    st.rerun()
+
+
+def clear_scene_variations(scene_index: int) -> None:
+    """Clear pending variations for a scene."""
+    if f"scene_variations_{scene_index}" in st.session_state:
+        del st.session_state[f"scene_variations_{scene_index}"]
     st.rerun()
 
 
