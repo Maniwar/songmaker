@@ -1732,9 +1732,32 @@ def render_scene_card(state, scene: Scene) -> None:
     st.markdown(f"**Scene {scene.index + 1}**{status_icons}")
     st.caption(f"{scene.start_time:.1f}s - {scene.end_time:.1f}s ({scene.duration:.1f}s)")
 
+    # Check for pending variations to select from
+    variations_key = f"scene_variations_{scene.index}"
+    has_pending_variations = variations_key in st.session_state and st.session_state[variations_key]
+
     # Image or animation preview
     if has_animation:
         st.video(str(animation_path))
+    elif has_pending_variations:
+        # Show variation selection UI
+        variation_paths = st.session_state[variations_key]
+        st.info(f"Select from {len(variation_paths)} variations:")
+
+        # Display variations in columns
+        var_cols = st.columns(len(variation_paths))
+        for i, (col, var_path) in enumerate(zip(var_cols, variation_paths)):
+            with col:
+                if Path(var_path).exists():
+                    st.image(var_path, use_container_width=True)
+                    if st.button(f"Select #{i+1}", key=f"select_var_{scene.index}_{i}", type="primary"):
+                        select_scene_variation(state, scene.index, var_path)
+                else:
+                    st.error(f"Variation {i+1} not found")
+
+        # Cancel button to dismiss variations
+        if st.button("Cancel", key=f"cancel_vars_{scene.index}", type="secondary"):
+            clear_scene_variations(scene.index)
     elif has_image:
         st.image(str(scene.image_path), use_container_width=True)
     else:
