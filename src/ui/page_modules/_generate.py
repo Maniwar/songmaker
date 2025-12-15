@@ -2106,23 +2106,46 @@ def render_scene_card(state, scene: Scene) -> None:
                 update_state(scenes=scenes)
                 regenerate_single_image(state, scene.index)
 
-    # Buttons row
-    col1, col2 = st.columns(2)
-    with col1:
-        # Regenerate button for this scene
-        if st.button(f"Regenerate", key=f"regen_{scene.index}", type="primary" if not has_image else "secondary"):
-            regenerate_single_image(state, scene.index)
-    with col2:
-        # Download button for the image
-        if has_image:
-            with open(scene.image_path, "rb") as f:
-                st.download_button(
-                    "Download",
-                    data=f.read(),
-                    file_name=f"scene_{scene.index + 1}.png",
-                    mime="image/png",
-                    key=f"download_{scene.index}",
-                )
+    # Buttons row - check for existing variations
+    project_dir = getattr(state, 'project_dir', None)
+    existing_variations = get_existing_variations(project_dir, scene.index) if project_dir else []
+    has_saved_variations = len(existing_variations) > 0
+
+    if has_saved_variations:
+        # 3-column layout when variations exist
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button(f"Regenerate", key=f"regen_{scene.index}", type="primary" if not has_image else "secondary"):
+                regenerate_single_image(state, scene.index)
+        with col2:
+            if st.button(f"Variations ({len(existing_variations)})", key=f"view_vars_{scene.index}", help="View and switch between saved variations"):
+                show_existing_variations(project_dir, scene.index)
+        with col3:
+            if has_image:
+                with open(scene.image_path, "rb") as f:
+                    st.download_button(
+                        "Download",
+                        data=f.read(),
+                        file_name=f"scene_{scene.index + 1}.png",
+                        mime="image/png",
+                        key=f"download_{scene.index}",
+                    )
+    else:
+        # 2-column layout when no variations
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button(f"Regenerate", key=f"regen_{scene.index}", type="primary" if not has_image else "secondary"):
+                regenerate_single_image(state, scene.index)
+        with col2:
+            if has_image:
+                with open(scene.image_path, "rb") as f:
+                    st.download_button(
+                        "Download",
+                        data=f.read(),
+                        file_name=f"scene_{scene.index + 1}.png",
+                        mime="image/png",
+                        key=f"download_{scene.index}",
+                    )
 
 
 def render_video_complete(state) -> None:
@@ -2410,6 +2433,30 @@ def clear_scene_variations(scene_index: int) -> None:
     if f"scene_variations_{scene_index}" in st.session_state:
         del st.session_state[f"scene_variations_{scene_index}"]
     st.rerun()
+
+
+def get_existing_variations(project_dir: str, scene_index: int) -> list[str]:
+    """Get existing variation image paths for a scene from disk."""
+    if not project_dir:
+        return []
+
+    variations_dir = Path(project_dir) / "images" / "variations" / f"scene_{scene_index:03d}"
+    if not variations_dir.exists():
+        return []
+
+    # Find all variation_XX.png files
+    variation_files = sorted(variations_dir.glob("variation_*.png"))
+    return [str(f) for f in variation_files if f.exists()]
+
+
+def show_existing_variations(project_dir: str, scene_index: int) -> None:
+    """Load existing variations into session state for display."""
+    variations = get_existing_variations(project_dir, scene_index)
+    if variations:
+        st.session_state[f"scene_variations_{scene_index}"] = variations
+        st.rerun()
+    else:
+        st.warning(f"No variations found for scene {scene_index + 1}")
 
 
 def regenerate_missing_images(state) -> None:
