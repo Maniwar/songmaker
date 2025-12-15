@@ -1715,11 +1715,11 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                 status_text.empty()
                 st.warning("No scenes with images to analyze")
 
-    # Bulk re-animation row
+    # Bulk re-animation row - always show so it's visible after checkbox changes
     selected_indices = _get_selected_scene_indices(state)
-    if selected_indices:
-        reanimate_col1, reanimate_col2 = st.columns([1, 4])
-        with reanimate_col1:
+    reanimate_col1, reanimate_col2, reanimate_col3 = st.columns([2, 3, 1])
+    with reanimate_col1:
+        if selected_indices:
             if st.button(
                 f"🎬 Reanimate Selected ({len(selected_indices)} scenes)",
                 type="primary",
@@ -1748,8 +1748,15 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                 else:
                     st.info("No existing animations to clear. Use individual Animate buttons to animate selected scenes.")
                 st.rerun()
-        with reanimate_col2:
+        else:
+            st.caption("Select scenes using checkboxes to enable bulk re-animation")
+    with reanimate_col2:
+        if selected_indices:
             st.caption(f"Selected scenes: {', '.join(str(i+1) for i in selected_indices)}")
+    with reanimate_col3:
+        # Refresh button to update selection from fragment checkboxes
+        if st.button("🔄", help="Refresh to see selected scenes"):
+            st.rerun()
 
     # Back button
     st.markdown("---")
@@ -2091,7 +2098,7 @@ def render_scene_card(state, scene: Scene) -> None:
         # Checkbox for bulk re-animation selection
         # Note: on_change triggers full page rerun so the bulk action button appears
         def _on_select_change():
-            st.rerun()
+            st.rerun(scope="app")
         st.checkbox(
             "Select",
             key=f"reanimate_select_{scene.index}",
