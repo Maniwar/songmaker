@@ -2089,11 +2089,15 @@ def render_scene_card(state, scene: Scene) -> None:
         st.markdown(f"**Scene {scene.index + 1}**{status_icons}")
     with header_col2:
         # Checkbox for bulk re-animation selection
+        # Note: on_change triggers full page rerun so the bulk action button appears
+        def _on_select_change():
+            st.rerun()
         st.checkbox(
             "Select",
             key=f"reanimate_select_{scene.index}",
             label_visibility="collapsed",
-            help="Select for bulk re-animation"
+            help="Select for bulk re-animation",
+            on_change=_on_select_change,
         )
     st.caption(f"{scene.start_time:.1f}s - {scene.end_time:.1f}s ({scene.duration:.1f}s)")
 
