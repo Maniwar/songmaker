@@ -82,71 +82,381 @@ class VisualAgent:
         self,
         duration: float,
         transcript: Transcript,
-        min_scene_duration: float = 4.0,
-        max_scene_duration: float = 12.0,
+        min_scene_duration: float = 3.0,
+        max_scene_duration: float = 15.0,
         target_scenes_per_minute: float = 4.0,
     ) -> list[tuple[float, float, list[Word]]]:
         """
-        Calculate optimal scene boundaries based on song duration.
+        Calculate optimal scene boundaries using intelligent multi-pass analysis.
+
+        This algorithm prioritizes:
+        1. Lyrical coherence - keeping phrases/sentences together
+        2. Natural pauses - using silence as scene transitions
+        3. Variable duration - allowing scenes to breathe based on content
+        4. Instrumental awareness - proper handling of non-vocal sections
 
         Args:
             duration: Total song duration in seconds
             transcript: Transcript with word timestamps
-            min_scene_duration: Minimum scene length
-            max_scene_duration: Maximum scene length
-            target_scenes_per_minute: Target number of scenes per minute
+            min_scene_duration: Minimum scene length (default 3s)
+            max_scene_duration: Maximum scene length (default 15s)
+            target_scenes_per_minute: Target scenes per minute (default 4)
 
         Returns:
             List of (start_time, end_time, words) tuples
         """
-        # Calculate target scene count
-        target_count = max(
-            math.ceil(duration / max_scene_duration),
-            min(
-                math.ceil(duration * target_scenes_per_minute / 60),
-                math.floor(duration / min_scene_duration),
-            ),
+        words = transcript.all_words
+        if not words:
+            # No words - single instrumental scene
+            return [(0.0, duration, [])]
+
+        # Pass 1: Analyze gaps and classify them by significance
+        gap_analysis = self._analyze_gaps(words, duration)
+
+        # Pass 2: Identify instrumental sections (long gaps with no words)
+        instrumental_sections = self._find_instrumental_sections(words, duration)
+
+        # Pass 3: Group words into logical phrases
+        phrases = self._group_into_phrases(words, gap_analysis)
+
+        # Pass 4: Build scenes from phrases, respecting constraints
+        scenes = self._build_scenes_from_phrases(
+            phrases=phrases,
+            instrumental_sections=instrumental_sections,
+            gap_analysis=gap_analysis,
+            duration=duration,
+            min_duration=min_scene_duration,
+            max_duration=max_scene_duration,
+            target_per_minute=target_scenes_per_minute,
         )
 
-        # Ensure at least 1 scene
-        target_count = max(1, target_count)
+        # Pass 5: Final validation and adjustment
+        scenes = self._validate_and_adjust_scenes(scenes, duration, min_scene_duration)
 
-        # Find natural break points (gaps between words)
-        words = transcript.all_words
-        break_points = self._find_break_points(words)
-
-        # Distribute scenes
-        scene_duration = duration / target_count
-        scenes = []
-        current_time = 0.0
-
-        for i in range(target_count):
-            ideal_end = current_time + scene_duration
-
-            # Find nearest break point
-            actual_end = self._find_nearest_break(break_points, ideal_end, tolerance=2.0)
-            if actual_end is None or actual_end > duration:
-                actual_end = min(ideal_end, duration)
-
-            # Get words in this time range
-            scene_words = [
-                w for w in words if w.start >= current_time and w.end <= actual_end
-            ]
-
-            scenes.append((current_time, actual_end, scene_words))
-            current_time = actual_end
-
-        # Ensure last scene extends to song end
-        if scenes and scenes[-1][1] < duration:
-            start, _, words = scenes[-1]
-            # Get any remaining words
-            remaining_words = [w for w in transcript.all_words if w.start >= start]
-            scenes[-1] = (start, duration, remaining_words)
+        logger.info(f"Created {len(scenes)} scenes with intelligent boundaries")
+        for i, (start, end, scene_words) in enumerate(scenes):
+            word_preview = " ".join(w.word for w in scene_words[:5])
+            if len(scene_words) > 5:
+                word_preview += "..."
+            logger.debug(f"  Scene {i+1}: {start:.1f}s-{end:.1f}s ({end-start:.1f}s) - {len(scene_words)} words: {word_preview}")
 
         return scenes
 
+    def _analyze_gaps(self, words: list[Word], duration: float) -> dict:
+        """
+        Analyze gaps between words and classify them by significance.
+
+        Gap classifications:
+        - micro (<0.3s): Normal speech pause, not a boundary
+        - phrase (0.3-0.8s): Phrase boundary, weak scene break candidate
+        - sentence (0.8-1.5s): Sentence/line boundary, good scene break
+        - section (1.5-3.0s): Section boundary, strong scene break
+        - major (>3.0s): Major section change, definite scene break
+        """
+        gaps = []
+
+        # Check for intro silence (before first word)
+        if words and words[0].start > 0.5:
+            gaps.append({
+                "time": words[0].start / 2,
+                "duration": words[0].start,
+                "type": self._classify_gap(words[0].start),
+                "position": "intro",
+                "before_word_idx": 0,
+            })
+
+        # Analyze gaps between words
+        for i in range(len(words) - 1):
+            gap_duration = words[i + 1].start - words[i].end
+            if gap_duration > 0.2:  # Ignore very tiny gaps
+                gap_time = words[i].end + gap_duration / 2
+                gaps.append({
+                    "time": gap_time,
+                    "duration": gap_duration,
+                    "type": self._classify_gap(gap_duration),
+                    "position": "between",
+                    "after_word_idx": i,
+                    "before_word_idx": i + 1,
+                })
+
+        # Check for outro silence (after last word)
+        if words and (duration - words[-1].end) > 0.5:
+            outro_gap = duration - words[-1].end
+            gaps.append({
+                "time": words[-1].end + outro_gap / 2,
+                "duration": outro_gap,
+                "type": self._classify_gap(outro_gap),
+                "position": "outro",
+                "after_word_idx": len(words) - 1,
+            })
+
+        return {
+            "gaps": gaps,
+            "section_breaks": [g for g in gaps if g["type"] in ("section", "major")],
+            "sentence_breaks": [g for g in gaps if g["type"] == "sentence"],
+            "phrase_breaks": [g for g in gaps if g["type"] == "phrase"],
+        }
+
+    def _classify_gap(self, gap_duration: float) -> str:
+        """Classify a gap by its duration."""
+        if gap_duration < 0.3:
+            return "micro"
+        elif gap_duration < 0.8:
+            return "phrase"
+        elif gap_duration < 1.5:
+            return "sentence"
+        elif gap_duration < 3.0:
+            return "section"
+        else:
+            return "major"
+
+    def _find_instrumental_sections(
+        self, words: list[Word], duration: float
+    ) -> list[tuple[float, float]]:
+        """
+        Find instrumental sections (periods with no vocals).
+
+        An instrumental section is a gap > 3 seconds with no words.
+        """
+        instrumentals = []
+
+        # Check intro
+        if words and words[0].start > 3.0:
+            instrumentals.append((0.0, words[0].start))
+
+        # Check between words
+        for i in range(len(words) - 1):
+            gap_start = words[i].end
+            gap_end = words[i + 1].start
+            if (gap_end - gap_start) > 3.0:
+                instrumentals.append((gap_start, gap_end))
+
+        # Check outro
+        if words and (duration - words[-1].end) > 3.0:
+            instrumentals.append((words[-1].end, duration))
+
+        return instrumentals
+
+    def _group_into_phrases(
+        self, words: list[Word], gap_analysis: dict
+    ) -> list[list[Word]]:
+        """
+        Group words into logical phrases based on natural pauses.
+
+        A phrase is a group of words that should stay together in a scene.
+        We break on sentence-level gaps or stronger, keeping phrase-level
+        gaps together when possible.
+        """
+        if not words:
+            return []
+
+        # Get indices where we should break (sentence or stronger)
+        break_indices = set()
+        for gap in gap_analysis["gaps"]:
+            if gap["type"] in ("sentence", "section", "major"):
+                if "after_word_idx" in gap:
+                    break_indices.add(gap["after_word_idx"])
+
+        # Group words into phrases
+        phrases = []
+        current_phrase = []
+
+        for i, word in enumerate(words):
+            current_phrase.append(word)
+            if i in break_indices:
+                if current_phrase:
+                    phrases.append(current_phrase)
+                    current_phrase = []
+
+        # Don't forget the last phrase
+        if current_phrase:
+            phrases.append(current_phrase)
+
+        return phrases
+
+    def _build_scenes_from_phrases(
+        self,
+        phrases: list[list[Word]],
+        instrumental_sections: list[tuple[float, float]],
+        gap_analysis: dict,
+        duration: float,
+        min_duration: float,
+        max_duration: float,
+        target_per_minute: float,
+    ) -> list[tuple[float, float, list[Word]]]:
+        """
+        Build scenes by combining phrases while respecting constraints.
+
+        Strategy:
+        1. Section breaks (>1.5s gaps) are mandatory scene boundaries
+        2. Combine phrases until we approach target duration
+        3. Split if a combined phrase would exceed max duration
+        4. Handle instrumental sections as their own scenes
+        """
+        scenes = []
+        target_duration = 60.0 / target_per_minute  # e.g., 15s for 4 scenes/min
+
+        # Get all mandatory break points (section and major gaps)
+        mandatory_breaks = set()
+        for gap in gap_analysis["section_breaks"]:
+            mandatory_breaks.add(gap["time"])
+
+        # Track what time ranges are instrumental
+        def is_instrumental(start: float, end: float) -> bool:
+            for inst_start, inst_end in instrumental_sections:
+                # Check if this range overlaps significantly with instrumental
+                overlap_start = max(start, inst_start)
+                overlap_end = min(end, inst_end)
+                if overlap_end > overlap_start:
+                    overlap = overlap_end - overlap_start
+                    range_duration = end - start
+                    if overlap / range_duration > 0.5:
+                        return True
+            return False
+
+        # Build scenes by accumulating phrases
+        current_words = []
+        current_start = 0.0
+
+        for phrase in phrases:
+            phrase_start = phrase[0].start
+            phrase_end = phrase[-1].end
+            phrase_duration = phrase_end - phrase_start
+
+            # Check if there's a mandatory break before this phrase
+            has_mandatory_break = any(
+                current_words and current_words[-1].end < brk < phrase_start
+                for brk in mandatory_breaks
+            )
+
+            # Calculate what duration would be if we add this phrase
+            potential_end = phrase_end
+            potential_duration = potential_end - current_start
+
+            # Decide whether to start a new scene
+            start_new_scene = False
+
+            if not current_words:
+                # First phrase - check if we need an intro instrumental scene
+                if phrase_start > 2.0:
+                    # Add instrumental intro scene
+                    scenes.append((0.0, phrase_start, []))
+                    current_start = phrase_start
+            elif has_mandatory_break:
+                # Mandatory break - must start new scene
+                start_new_scene = True
+            elif potential_duration > max_duration:
+                # Would exceed max - start new scene
+                start_new_scene = True
+            elif potential_duration > target_duration * 1.3:
+                # Significantly over target and we have enough content
+                current_duration = (current_words[-1].end if current_words else current_start) - current_start
+                if current_duration >= min_duration:
+                    start_new_scene = True
+
+            if start_new_scene and current_words:
+                # Finalize current scene
+                scene_end = current_words[-1].end
+                # Extend slightly into the gap for visual continuity
+                gap_to_next = phrase_start - scene_end
+                if gap_to_next > 0:
+                    scene_end += min(gap_to_next * 0.3, 0.5)
+                scenes.append((current_start, scene_end, current_words))
+
+                # Check for instrumental gap between scenes
+                if phrase_start - scene_end > 2.0:
+                    scenes.append((scene_end, phrase_start, []))
+                    current_start = phrase_start
+                else:
+                    current_start = scene_end
+
+                current_words = []
+
+            # Add phrase to current scene
+            current_words.extend(phrase)
+
+        # Finalize last scene
+        if current_words:
+            scene_end = current_words[-1].end
+            # Extend to end if close, or add outro scene
+            if duration - scene_end < 2.0:
+                scene_end = duration
+                scenes.append((current_start, scene_end, current_words))
+            else:
+                # Extend slightly, then add outro
+                scene_end += min((duration - scene_end) * 0.2, 0.5)
+                scenes.append((current_start, scene_end, current_words))
+                if duration - scene_end > 1.0:
+                    scenes.append((scene_end, duration, []))
+        elif current_start < duration:
+            # Only instrumental remaining
+            scenes.append((current_start, duration, []))
+
+        return scenes
+
+    def _validate_and_adjust_scenes(
+        self,
+        scenes: list[tuple[float, float, list[Word]]],
+        duration: float,
+        min_duration: float,
+    ) -> list[tuple[float, float, list[Word]]]:
+        """
+        Final validation pass to ensure scene quality.
+
+        - Merge scenes that are too short
+        - Ensure no gaps between scenes
+        - Ensure last scene ends at song duration
+        """
+        if not scenes:
+            return [(0.0, duration, [])]
+
+        validated = []
+
+        for i, (start, end, words) in enumerate(scenes):
+            scene_duration = end - start
+
+            # If scene is too short, try to merge with previous
+            if scene_duration < min_duration and validated:
+                prev_start, prev_end, prev_words = validated[-1]
+                combined_duration = end - prev_start
+
+                # Merge if combined duration is reasonable
+                if combined_duration <= 18.0:  # Allow slightly over max for merging
+                    merged_words = prev_words + words
+                    validated[-1] = (prev_start, end, merged_words)
+                    continue
+
+            # Ensure no gaps - adjust start to previous end
+            if validated:
+                prev_start, prev_end, prev_words = validated[-1]
+                if start > prev_end + 0.1:
+                    # There's a gap - extend previous scene or adjust current start
+                    gap = start - prev_end
+                    if gap < 1.0:
+                        # Small gap - just adjust current start
+                        start = prev_end
+                    else:
+                        # Larger gap - extend previous scene halfway
+                        midpoint = prev_end + gap / 2
+                        validated[-1] = (prev_start, midpoint, prev_words)
+                        start = midpoint
+
+            validated.append((start, end, words))
+
+        # Ensure first scene starts at 0
+        if validated and validated[0][0] > 0.1:
+            start, end, words = validated[0]
+            validated[0] = (0.0, end, words)
+
+        # Ensure last scene ends at duration
+        if validated and validated[-1][1] < duration - 0.1:
+            start, end, words = validated[-1]
+            validated[-1] = (start, duration, words)
+
+        return validated
+
     def _find_break_points(self, words: list[Word]) -> list[float]:
-        """Find natural break points (gaps) between words."""
+        """Find natural break points (gaps) between words. (Legacy method for compatibility)"""
         break_points = []
         for i in range(len(words) - 1):
             gap = words[i + 1].start - words[i].end
@@ -160,7 +470,7 @@ class VisualAgent:
         target: float,
         tolerance: float,
     ) -> Optional[float]:
-        """Find the nearest break point within tolerance."""
+        """Find the nearest break point within tolerance. (Legacy method for compatibility)"""
         if not break_points:
             return None
 
