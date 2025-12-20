@@ -1639,104 +1639,14 @@ def render_upscale_only_page(state) -> None:
             progress_bar = st.progress(0, text="Starting upscaling...")
             status_text = st.empty()
 
-            # Live preview section
-            st.markdown("### Live Preview (Before / After)")
-
-            # Frame selector - use auto_latest flag to avoid min_value conflict
-            if "preview_auto_latest" not in st.session_state:
-                st.session_state["preview_auto_latest"] = True  # Start in auto mode
-            if "preview_frame_num" not in st.session_state:
-                st.session_state["preview_frame_num"] = 1
-
-            frame_col1, frame_col2, frame_col3, frame_col4 = st.columns([2, 1, 1, 1])
-            with frame_col1:
-                # Only show number input if NOT in auto mode
-                if not st.session_state["preview_auto_latest"]:
-                    selected_frame = st.number_input(
-                        "Frame #",
-                        min_value=1,
-                        value=st.session_state["preview_frame_num"],
-                        step=100,
-                        key="frame_selector_input",
-                        help="Enter frame number to preview"
-                    )
-                    st.session_state["preview_frame_num"] = selected_frame
-                else:
-                    st.info("🔄 Auto: showing latest upscaled frame")
-            with frame_col2:
-                if st.button("⏮ First", key="first_frame"):
-                    st.session_state["preview_auto_latest"] = False
-                    st.session_state["preview_frame_num"] = 1
-                    st.rerun()
-            with frame_col3:
-                if st.button("⏭ Latest", key="latest_frame"):
-                    st.session_state["preview_auto_latest"] = True
-                    st.rerun()
-            with frame_col4:
-                if st.button("📝 Manual", key="manual_frame"):
-                    st.session_state["preview_auto_latest"] = False
-                    st.rerun()
-
-            preview_cols = st.columns(2)
-            with preview_cols[0]:
-                st.caption("Original (1080p)")
-                original_preview = st.empty()
-            with preview_cols[1]:
-                st.caption("Upscaled (4K)")
-                upscaled_preview = st.empty()
-            frame_info = st.empty()
-
-            # Store work_dir for preview updates
-            work_dir_holder = {"path": None, "last_check": 0, "frame_num": 1, "max_upscaled": 0}
-
             def progress_callback(message: str, progress: float):
-                import time
                 progress_bar.progress(progress, text=message)
                 status_text.text(message)
 
-                # Extract work directory from progress message
+                # Extract work directory and store in session state for persistent preview
                 if "Work:" in message:
-                    work_dir_holder["path"] = message.split("Work:")[-1].strip()
-
-                # Update preview during upscaling
-                if work_dir_holder["path"] and progress >= 0.22:
-                    current_time = time.time()
-                    if current_time - work_dir_holder["last_check"] > 2:  # Update every 2 seconds
-                        work_dir_holder["last_check"] = current_time
-                        from pathlib import Path
-                        work_dir = Path(work_dir_holder["path"])
-
-                        # Count upscaled frames
-                        upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
-                        if upscaled_frames:
-                            work_dir_holder["max_upscaled"] = len(upscaled_frames)
-
-                            # Use selected frame or latest if auto mode
-                            auto_latest = st.session_state.get("preview_auto_latest", True)
-                            user_frame = st.session_state.get("preview_frame_num", 1)
-                            if auto_latest or user_frame > work_dir_holder["max_upscaled"]:
-                                # Show latest
-                                latest_frame = upscaled_frames[-1]
-                                frame_num = int(latest_frame.stem.split("_")[-1])
-                            else:
-                                # Show user-selected frame
-                                frame_num = user_frame
-                                target_frame = work_dir / "upscaled" / f"frame_{frame_num:06d}.jpg"
-                                if not target_frame.exists():
-                                    # Fall back to latest if selected frame not yet upscaled
-                                    latest_frame = upscaled_frames[-1]
-                                    frame_num = int(latest_frame.stem.split("_")[-1])
-
-                            work_dir_holder["frame_num"] = frame_num
-                            orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
-                            up_frame = work_dir / "upscaled" / f"frame_{frame_num:06d}.jpg"
-
-                            frame_info.caption(f"Frame {frame_num} | {work_dir_holder['max_upscaled']} upscaled so far")
-
-                            if orig_frame.exists():
-                                original_preview.image(str(orig_frame), use_container_width=True)
-                            if up_frame.exists():
-                                upscaled_preview.image(str(up_frame), use_container_width=True)
+                    work_dir_path = message.split("Work:")[-1].strip()
+                    st.session_state["upscale_work_dir"] = work_dir_path
 
             try:
                 upscaler = VideoUpscaler()
