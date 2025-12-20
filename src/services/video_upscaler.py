@@ -171,6 +171,8 @@ class VideoUpscaler:
         preserve_audio: bool = True,
         progress_callback: Optional[Callable[[str, float], None]] = None,
         model: Optional[str] = None,
+        batch_size: int = 8,
+        tile_size: int = 768,
     ) -> bool:
         """
         Upscale a video to the target resolution.
@@ -185,10 +187,17 @@ class VideoUpscaler:
             progress_callback: Optional callback for progress updates
             model: AI model to use (for realesrgan: "realesrgan-x4plus", "realesr-animevideov3",
                    or custom models like "4xNomos2_hq_dat2" if installed)
+            batch_size: Number of tiles to process at once for MPS (higher = faster, more memory)
+            tile_size: Size of tiles for MPS upscaling (larger = fewer tiles = faster)
+                       - M1 (8-16GB): 384-512
+                       - M1 Pro/Max (16-32GB): 768-896
+                       - M2/M3 Ultra (64-128GB): 1024
 
         Returns:
             True if successful, False otherwise
         """
+        self._batch_size = batch_size
+        self._tile_size = tile_size
         # Store model for use in realesrgan method
         self._realesrgan_model = model or "realesrgan-x4plus"
         if not input_path.exists():
@@ -296,7 +305,14 @@ class VideoUpscaler:
             # Use x4plus for 4K targets, x2plus for smaller
             model_name = "realesrgan-x4plus" if target_width >= 3840 else "realesrgan-x4plus"
 
-            upscaler = MPSUpscaler(model_name=model_name)
+            # Get settings from instance (set in upscale() method)
+            batch_size = getattr(self, '_batch_size', 8)
+            tile_size = getattr(self, '_tile_size', 768)
+            upscaler = MPSUpscaler(
+                model_name=model_name,
+                tile_size=tile_size,
+                batch_size=batch_size,
+            )
             success = upscaler.upscale_video(input_path, output_path, progress_callback)
 
             # If output resolution doesn't match target, resize with ffmpeg

@@ -1368,6 +1368,54 @@ def render_upscale_only_page(state) -> None:
                     "Use MPS version instead for reliable results."
                 )
 
+        # Advanced settings for MPS upscaling
+        batch_size = 8  # Default for M1 Max
+        tile_size = 768  # Default for M1 Max Pro (larger = faster for 1080p+)
+        if selected_method == "mps_realesrgan":
+            with st.expander("⚡ Performance Settings (M1 Max Pro recommended)", expanded=True):
+                st.markdown("**Optimize for your Apple Silicon Mac:**")
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    tile_size = st.slider(
+                        "Tile Size",
+                        min_value=256,
+                        max_value=1024,
+                        value=768,  # Good for M1 Max Pro with 32GB
+                        step=128,
+                        help=(
+                            "Size of image tiles for processing. Larger = fewer tiles = faster!\n"
+                            "**For 1080p video, this is the KEY setting.**\n"
+                            "- M1 (8-16GB): 384-512\n"
+                            "- M1 Pro/Max (16-32GB): 768-896\n"
+                            "- M2/M3 Ultra (64-128GB): 1024"
+                        ),
+                        key="upscale_tile_size",
+                    )
+
+                with col2:
+                    batch_size = st.slider(
+                        "Batch Size",
+                        min_value=1,
+                        max_value=16,
+                        value=8,  # Good for M1 Max Pro
+                        help=(
+                            "Process multiple tiles at once. Higher = faster.\n"
+                            "- M1: 2-4\n"
+                            "- M1 Pro/Max: 8-12\n"
+                            "- M2/M3 Ultra: 12-16"
+                        ),
+                        key="upscale_batch_size",
+                    )
+
+                # Calculate expected tiles for 1080p
+                tiles_per_frame = ((1920 // (tile_size - 32)) + 1) * ((1080 // (tile_size - 32)) + 1)
+                st.info(
+                    f"⚡ **Tiles per 1080p frame:** ~{tiles_per_frame} | "
+                    f"**Batch processing:** {batch_size} tiles at a time"
+                )
+
         # Model selection for Real-ESRGAN
         selected_model = None
         if selected_method == "realesrgan":
@@ -1450,6 +1498,8 @@ def render_upscale_only_page(state) -> None:
                     preserve_audio=True,
                     progress_callback=progress_callback,
                     model=selected_model,  # Pass AI model for Real-ESRGAN/Nomos2
+                    batch_size=batch_size,  # MPS batch/tile processing parallelism
+                    tile_size=tile_size,  # MPS tile size (larger = faster for 1080p+)
                 )
 
                 if success and output_path.exists():
