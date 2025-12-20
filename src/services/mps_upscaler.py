@@ -67,6 +67,112 @@ _model_cache: dict[str, tuple] = {}  # model_name -> (model, device)
 WORK_DIR_BASE = Path.home() / ".cache" / "songmaker" / "upscale_work"
 
 
+class GPUMemoryManager:
+    """Automatic GPU memory management for MPS upscaling.
+
+    Detects available GPU memory and calculates optimal tile_size and batch_size.
+    Since we have OOM recovery with safe_mode fallback, we can be more aggressive
+    with settings for better performance.
+    """
+
+    # Memory requirements (empirically measured on M1 Max)
+    MODEL_BASE_MEMORY_GB = 0.5
+
+    def __init__(self):
+        self.device = get_device()
+        self.total_memory_gb = self._get_total_memory()
+        # Use 85% of available memory - we have OOM recovery as safety net
+        self.safe_memory_gb = self.total_memory_gb * 0.85
+        logger.info(f"GPU Memory Manager: {self.total_memory_gb:.1f}GB total, using up to {self.safe_memory_gb:.1f}GB")
+
+    def _get_total_memory(self) -> float:
+        """Get total GPU memory in GB."""
+        if self.device.type == "mps":
+            # MPS shares system RAM - Apple Silicon is efficient at memory management
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["sysctl", "-n", "hw.memsize"],
+                    capture_output=True, text=True, timeout=5
+                )
+                total_ram = int(result.stdout.strip()) / (1024**3)
+                # Apple Silicon can use most of RAM for GPU when needed
+                return total_ram * 0.85
+            except Exception:
+                return 16.0  # Default assumption
+        elif self.device.type == "cuda":
+            return torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        return 8.0  # CPU fallback
+
+    def get_safe_settings(self, frame_width: int = 1920, frame_height: int = 1080) -> tuple[int, int]:
+        """Calculate optimal tile_size and batch_size based on available memory.
+
+        More aggressive settings since we have OOM recovery with safe_mode fallback.
+
+        Args:
+            frame_width: Width of video frames
+            frame_height: Height of video frames
+
+        Returns:
+            Tuple of (tile_size, batch_size)
+        """
+        available = self.safe_memory_gb
+
+        # More aggressive settings - OOM recovery will catch any issues
+        # Empirically tested on M1 Max 32GB: tile_size=512, batch_size=6 works well
+        if available >= 24:  # 32GB+ system
+            tile_size = 512
+            batch_size = 6
+        elif available >= 16:  # 24GB system
+            tile_size = 512
+            batch_size = 5
+        elif available >= 12:  # 16GB system
+            tile_size = 512
+            batch_size = 4
+        elif available >= 8:  # 8-12GB system
+            tile_size = 384
+            batch_size = 3
+        else:  # <8GB system
+            tile_size = 384
+            batch_size = 2
+
+        logger.info(f"Auto-calculated settings: tile_size={tile_size}, batch_size={batch_size} "
+                   f"(available memory: {available:.1f}GB)")
+        return tile_size, batch_size
+
+    def clear_cache(self):
+        """Clear GPU memory cache."""
+        if self.device.type == "mps":
+            torch.mps.empty_cache()
+        elif self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def get_current_usage(self) -> float:
+        """Get current GPU memory usage in GB (approximate for MPS)."""
+        if self.device.type == "mps":
+            # MPS doesn't have direct memory query, return estimate
+            return 0.0  # Can't reliably measure on MPS
+        elif self.device.type == "cuda":
+            return torch.cuda.memory_allocated() / (1024**3)
+        return 0.0
+
+
+# Global memory manager instance
+_memory_manager: Optional[GPUMemoryManager] = None
+
+
+def get_memory_manager(reset: bool = False) -> GPUMemoryManager:
+    """Get or create the global memory manager.
+
+    Args:
+        reset: If True, recreate the memory manager (useful after settings change)
+    """
+    global _memory_manager
+    if _memory_manager is None or reset:
+        _memory_manager = GPUMemoryManager()
+    return _memory_manager
+
+
 def get_video_content_hash(video_path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
     """Generate a hash based on video file content for resume detection.
 
@@ -246,37 +352,53 @@ class MPSUpscaler:
     """AI video upscaler using MPS acceleration on Apple Silicon.
 
     Features:
+    - Automatic memory management with safe tile/batch size calculation
     - Batch processing for better GPU utilization
     - Parallel I/O for loading/saving frames
     - Tile-based processing for large images with batch tile optimization
     - Cancellation support for long operations
+    - OOM recovery with safe mode fallback
     """
 
     def __init__(
         self,
         model_name: str = "realesrgan-x4plus",
-        tile_size: int = DEFAULT_TILE_SIZE,
-        batch_size: int = DEFAULT_BATCH_SIZE,
+        tile_size: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        auto_memory: bool = True,
     ):
         """Initialize the upscaler.
 
         Args:
             model_name: Model to use (realesrgan-x4plus or realesrgan-x2plus)
-            tile_size: Size of tiles for processing large images
-                       - M1 (8-16GB): 512
-                       - M1 Pro/Max (16-32GB): 768-1024
-                       - M2/M3 Ultra (64-128GB): 1024-1536
-            batch_size: Number of frames/tiles to process at once
-                       - M1: 2-4
-                       - M1 Pro/Max: 6-12
-                       - M2/M3 Ultra: 12-24
+            tile_size: Size of tiles for processing large images.
+                       If None and auto_memory=True, calculated automatically.
+                       Manual override: M1 (8-16GB): 256-384, M1 Pro/Max: 384-512
+            batch_size: Number of frames/tiles to process at once.
+                       If None and auto_memory=True, calculated automatically.
+                       Manual override: M1: 1-2, M1 Pro/Max: 2-4
+            auto_memory: If True (default), automatically calculate safe tile_size
+                        and batch_size based on available GPU memory.
         """
         self.model_name = model_name
-        self.tile_size = tile_size
-        self.batch_size = batch_size
         self.scale = 4 if "x4" in model_name else 2
         self.device = get_device()
         self.model = None
+
+        # Use automatic memory management to calculate safe settings
+        if auto_memory and (tile_size is None or batch_size is None):
+            mem_manager = get_memory_manager()
+            auto_tile, auto_batch = mem_manager.get_safe_settings()
+            self.tile_size = tile_size if tile_size is not None else auto_tile
+            self.batch_size = batch_size if batch_size is not None else auto_batch
+            logger.info(
+                f"MPSUpscaler using auto-calculated settings: "
+                f"tile_size={self.tile_size}, batch_size={self.batch_size}"
+            )
+        else:
+            # Use provided values or defaults
+            self.tile_size = tile_size if tile_size is not None else DEFAULT_TILE_SIZE
+            self.batch_size = batch_size if batch_size is not None else DEFAULT_BATCH_SIZE
 
         logger.info(
             f"MPSUpscaler initialized: device={self.device}, "
@@ -338,11 +460,12 @@ class MPSUpscaler:
         _model_cache[cache_key] = self.model
         logger.info(f"Model loaded and cached on {self.device}")
 
-    def upscale_image(self, img: np.ndarray) -> np.ndarray:
+    def upscale_image(self, img: np.ndarray, safe_mode: bool = False) -> np.ndarray:
         """Upscale a single image.
 
         Args:
             img: Input image as numpy array (H, W, C) in RGB format, 0-255
+            safe_mode: If True, use smaller tiles and process one at a time to avoid OOM
 
         Returns:
             Upscaled image as numpy array (H*scale, W*scale, C)
@@ -354,10 +477,12 @@ class MPSUpscaler:
         img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
         img_tensor = img_tensor.to(self.device)
 
+        tile_threshold = min(self.tile_size, 512) if safe_mode else self.tile_size
+
         with torch.no_grad():
             # Process in tiles if image is large
-            if img.shape[0] > self.tile_size or img.shape[1] > self.tile_size:
-                output = self._tile_process(img_tensor)
+            if img.shape[0] > tile_threshold or img.shape[1] > tile_threshold:
+                output = self._tile_process(img_tensor, safe_mode=safe_mode)
             else:
                 output = self.model(img_tensor)
 
@@ -417,15 +542,19 @@ class MPSUpscaler:
             results.append(self.upscale_image(img))
         return results
 
-    def _tile_process(self, img: torch.Tensor) -> torch.Tensor:
+    def _tile_process(self, img: torch.Tensor, safe_mode: bool = False) -> torch.Tensor:
         """Process image in tiles with batch optimization for better GPU utilization.
 
         This method extracts all tiles, batches them together, and processes
         them in parallel on the GPU for significantly faster upscaling of
         large images (e.g., 1080p, 4K).
+
+        Args:
+            img: Input image tensor (1, C, H, W)
+            safe_mode: If True, process one tile at a time to avoid OOM
         """
         _, c, h, w = img.shape
-        tile = self.tile_size
+        tile = min(self.tile_size, 512) if safe_mode else self.tile_size  # Use smaller tiles in safe mode
         tile_overlap = 32
 
         # Calculate output size
@@ -448,8 +577,11 @@ class MPSUpscaler:
         output = torch.zeros((1, c, out_h, out_w), device=self.device)
         tile_outputs = []
 
-        for i in range(0, len(tiles), self.batch_size):
-            batch_tiles = tiles[i:i + self.batch_size]
+        # In safe mode, process one tile at a time
+        effective_batch = 1 if safe_mode else self.batch_size
+
+        for i in range(0, len(tiles), effective_batch):
+            batch_tiles = tiles[i:i + effective_batch]
 
             # Pad tiles to same size for batching (tiles at edges may be smaller)
             max_h = max(t.shape[1] for t in batch_tiles)
@@ -460,8 +592,9 @@ class MPSUpscaler:
                 pad_h = max_h - t.shape[1]
                 pad_w = max_w - t.shape[2]
                 if pad_h > 0 or pad_w > 0:
-                    # Pad with reflection to reduce edge artifacts
-                    t = F.pad(t, (0, pad_w, 0, pad_h), mode='reflect')
+                    # Use 'constant' mode with zeros - no size limitations
+                    # The padded area will be cropped after processing anyway
+                    t = F.pad(t, (0, pad_w, 0, pad_h), mode='constant', value=0)
                 padded_tiles.append(t)
 
             # Stack into batch and process
@@ -752,6 +885,11 @@ class MPSUpscaler:
             batch_size = self.batch_size
             logger.info(f"Upscaling {len(frames_to_process)} frames with AI on {self.device} (batch_size={batch_size})...")
 
+            # Clear GPU memory before starting
+            if self.device.type == "mps":
+                torch.mps.empty_cache()
+                logger.info("Cleared MPS cache before upscaling")
+
             # Track timing for ETA calculation
             start_time = time.time()
             frames_processed = 0
@@ -807,8 +945,25 @@ class MPSUpscaler:
                         loaded_frames.append(img)
                         frame_paths.append(path)
 
-                    # Upscale batch on GPU
-                    upscaled_frames = self.upscale_batch(loaded_frames)
+                    # Upscale batch on GPU with OOM recovery
+                    try:
+                        upscaled_frames = self.upscale_batch(loaded_frames)
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower():
+                            # Clear cache and try one frame at a time with safe mode
+                            logger.warning(f"OOM error, clearing cache and processing in safe mode...")
+                            if self.device.type == "mps":
+                                torch.mps.empty_cache()
+                            if progress_callback:
+                                progress_callback(f"Memory issue - switching to safe mode...", 0.2)
+                            upscaled_frames = []
+                            for img in loaded_frames:
+                                # Use safe_mode which uses smaller tiles and processes one at a time
+                                upscaled_frames.append(self.upscale_image(img, safe_mode=True))
+                                if self.device.type == "mps":
+                                    torch.mps.empty_cache()
+                        else:
+                            raise
 
                     # Save batch in parallel
                     save_data = [
@@ -822,8 +977,8 @@ class MPSUpscaler:
 
                     frames_processed += len(batch_frames)
 
-                    # Clear MPS cache periodically to prevent memory buildup
-                    if self.device.type == "mps" and frames_processed % 50 == 0:
+                    # Clear MPS cache after EVERY batch to prevent memory buildup
+                    if self.device.type == "mps":
                         torch.mps.empty_cache()
 
             # Final cancellation check before reassembly
@@ -941,25 +1096,52 @@ def format_eta(seconds: float) -> str:
         return f"{hours}h {mins}m"
 
 
+def get_recommended_settings() -> dict:
+    """Get recommended tile_size and batch_size based on system memory.
+
+    Returns:
+        Dict with 'tile_size', 'batch_size', 'total_memory_gb', and 'safe_memory_gb'
+    """
+    mem_manager = get_memory_manager()
+    tile_size, batch_size = mem_manager.get_safe_settings()
+    return {
+        "tile_size": tile_size,
+        "batch_size": batch_size,
+        "total_memory_gb": mem_manager.total_memory_gb,
+        "safe_memory_gb": mem_manager.safe_memory_gb,
+    }
+
+
 def upscale_video_mps(
     input_path: Path,
     output_path: Path,
     model: str = "realesrgan-x4plus",
+    tile_size: Optional[int] = None,
+    batch_size: Optional[int] = None,
     progress_callback: Optional[Callable[[str, float], None]] = None,
 ) -> bool:
     """Convenience function to upscale a video with MPS.
+
+    Uses automatic memory management by default for safe tile/batch sizes.
 
     Args:
         input_path: Path to input video
         output_path: Path for output video
         model: Model name (realesrgan-x4plus or realesrgan-x2plus)
+        tile_size: Optional override for tile size (auto-calculated if None)
+        batch_size: Optional override for batch size (auto-calculated if None)
         progress_callback: Optional progress callback
 
     Returns:
         True if successful
     """
     try:
-        upscaler = MPSUpscaler(model_name=model)
+        upscaler = MPSUpscaler(
+            model_name=model,
+            tile_size=tile_size,
+            batch_size=batch_size,
+            auto_memory=True,
+        )
         return upscaler.upscale_video(input_path, output_path, progress_callback)
     except Exception as e:
         logger.error(f"MPS upscaling failed: {e}")

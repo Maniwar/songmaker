@@ -1369,11 +1369,23 @@ def render_upscale_only_page(state) -> None:
                 )
 
         # Advanced settings for MPS upscaling
-        batch_size = 8  # Default for M1 Max
-        tile_size = 768  # Default for M1 Max Pro (larger = faster for 1080p+)
+        # Get auto-calculated safe settings from memory manager
+        from src.services.mps_upscaler import get_recommended_settings
+        recommended = get_recommended_settings()
+        default_tile_size = recommended["tile_size"]
+        default_batch_size = recommended["batch_size"]
+        system_memory_gb = recommended["total_memory_gb"]
+
+        batch_size = default_batch_size
+        tile_size = default_tile_size
+
         if selected_method == "mps_realesrgan":
-            with st.expander("⚡ Performance Settings (M1 Max Pro recommended)", expanded=True):
-                st.markdown("**Optimize for your Apple Silicon Mac:**")
+            with st.expander("⚡ Performance Settings (Auto-optimized for your system)", expanded=True):
+                st.success(
+                    f"**Auto-detected:** {system_memory_gb:.0f}GB system memory. "
+                    f"Recommended: tile_size={default_tile_size}, batch_size={default_batch_size}"
+                )
+                st.markdown("**Adjust if needed (OOM recovery will catch issues):**")
 
                 col1, col2 = st.columns(2)
 
@@ -1381,15 +1393,15 @@ def render_upscale_only_page(state) -> None:
                     tile_size = st.slider(
                         "Tile Size",
                         min_value=256,
-                        max_value=1024,
-                        value=768,  # Good for M1 Max Pro with 32GB
-                        step=128,
+                        max_value=768,
+                        value=default_tile_size,
+                        step=64,
                         help=(
-                            "Size of image tiles for processing. Larger = fewer tiles = faster!\n"
-                            "**For 1080p video, this is the KEY setting.**\n"
-                            "- M1 (8-16GB): 384-512\n"
-                            "- M1 Pro/Max (16-32GB): 768-896\n"
-                            "- M2/M3 Ultra (64-128GB): 1024"
+                            "Size of image tiles for processing. Larger = faster.\n"
+                            "OOM recovery will automatically reduce if memory issues occur.\n"
+                            "- 384: Conservative\n"
+                            "- 512: Balanced (recommended for most)\n"
+                            "- 768: Fast (32GB+ RAM)"
                         ),
                         key="upscale_tile_size",
                     )
@@ -1398,13 +1410,14 @@ def render_upscale_only_page(state) -> None:
                     batch_size = st.slider(
                         "Batch Size",
                         min_value=1,
-                        max_value=16,
-                        value=8,  # Good for M1 Max Pro
+                        max_value=8,
+                        value=default_batch_size,
                         help=(
                             "Process multiple tiles at once. Higher = faster.\n"
-                            "- M1: 2-4\n"
-                            "- M1 Pro/Max: 8-12\n"
-                            "- M2/M3 Ultra: 12-16"
+                            "OOM recovery will automatically reduce if memory issues occur.\n"
+                            "- 2-3: Conservative\n"
+                            "- 4-6: Balanced (recommended)\n"
+                            "- 7-8: Fast (32GB+ RAM)"
                         ),
                         key="upscale_batch_size",
                     )
@@ -1412,8 +1425,9 @@ def render_upscale_only_page(state) -> None:
                 # Calculate expected tiles for 1080p
                 tiles_per_frame = ((1920 // (tile_size - 32)) + 1) * ((1080 // (tile_size - 32)) + 1)
                 st.info(
-                    f"⚡ **Tiles per 1080p frame:** ~{tiles_per_frame} | "
-                    f"**Batch processing:** {batch_size} tiles at a time"
+                    f"**Tiles per 1080p frame:** ~{tiles_per_frame} | "
+                    f"**Batch processing:** {batch_size} tiles at a time | "
+                    f"*OOM recovery enabled*"
                 )
 
         # Model selection for Real-ESRGAN
@@ -1462,8 +1476,35 @@ def render_upscale_only_page(state) -> None:
 
         st.markdown("---")
 
-        # Upscale button
-        if st.button("Start Upscaling", type="primary", use_container_width=True, key="start_upscale_only"):
+        # Initialize upscaling state
+        if "upscaling_in_progress" not in st.session_state:
+            st.session_state.upscaling_in_progress = False
+
+        # Always show both Start and Stop buttons
+        col_start, col_stop = st.columns([3, 1])
+        with col_start:
+            start_disabled = st.session_state.upscaling_in_progress
+            start_clicked = st.button(
+                "Start Upscaling" if not start_disabled else "Upscaling...",
+                type="primary",
+                use_container_width=True,
+                key="start_upscale_only",
+                disabled=start_disabled,
+            )
+        with col_stop:
+            # Always show Stop button - it works even during processing
+            # because the cancel flag is checked in the upscaling loop
+            if st.button("Stop", type="secondary", use_container_width=True, key="stop_upscale"):
+                from src.services.mps_upscaler import cancel_upscale
+                cancel_upscale()
+                st.session_state.upscaling_in_progress = False
+                st.warning("Cancelling upscale... (progress is saved)")
+                st.rerun()
+
+        st.caption("Click Stop to cancel - progress is saved and you can resume later")
+
+        if start_clicked:
+            st.session_state.upscaling_in_progress = True
             # Save uploaded file temporarily
             config.ensure_directories()
             upload_dir = config.output_dir / "uploads"
@@ -1560,11 +1601,14 @@ def render_upscale_only_page(state) -> None:
 
                     # Store path for reference
                     update_state(upscaled_video_path=str(output_path))
+                    st.session_state.upscaling_in_progress = False
                 else:
                     st.error("Upscaling failed. Check the logs for details.")
+                    st.session_state.upscaling_in_progress = False
 
             except Exception as e:
                 st.error(f"Upscaling error: {e}")
+                st.session_state.upscaling_in_progress = False
 
     # Show previously upscaled video if exists
     if state.upscaled_video_path and Path(state.upscaled_video_path).exists():

@@ -1,20 +1,23 @@
 """Video upscaling service for 4K output.
 
 This service upscales videos to 4K (3840x2160) resolution using:
-- MPS Real-ESRGAN (Apple Silicon, best quality AI with GPU acceleration)
+- Core ML Real-ESRGAN (Apple Silicon Neural Engine - FASTEST, recommended)
+- MPS Real-ESRGAN (Apple Silicon GPU - slower fallback)
 - fx-upscale with MetalFX (Apple Silicon, fast but no detail enhancement)
 - FFmpeg with lanczos scaling (fast, always available)
 - Video2X with Real-ESRGAN/Real-CUGAN (best quality, requires video2x)
 - Real-ESRGAN ncnn-vulkan (good quality, requires realesrgan-ncnn-vulkan)
 
-Quality ranking (best to worst):
-1. mps_realesrgan - Best AI upscaling on Apple Silicon (adds detail)
-2. video2x with Real-CUGAN or Real-ESRGAN - Best AI upscaling on NVIDIA
-3. realesrgan-ncnn-vulkan - Good AI upscaling (may crash on Apple Silicon)
-4. fx-upscale - Fast MetalFX upscaling (no detail enhancement)
-5. ffmpeg lanczos - Fast, acceptable quality
+Quality/Speed ranking (best first):
+1. coreml_realesrgan - FASTEST on Apple Silicon (Neural Engine, ~10x faster than MPS)
+2. mps_realesrgan - Good AI upscaling on Apple Silicon GPU (slower)
+3. video2x with Real-CUGAN or Real-ESRGAN - Best AI upscaling on NVIDIA
+4. realesrgan-ncnn-vulkan - Good AI upscaling (may crash on Apple Silicon)
+5. fx-upscale - Fast MetalFX upscaling (no detail enhancement)
+6. ffmpeg lanczos - Fast, acceptable quality
 
 Installation:
+- Core ML Real-ESRGAN: Built-in (requires coremltools, spandrel)
 - MPS Real-ESRGAN: Built-in (requires PyTorch with MPS support)
 - fx-upscale: brew install finnvoor/tools/fx-upscale (macOS only)
 - Video2X: pip install video2x (requires ffmpeg, ncnn models)
@@ -37,8 +40,20 @@ RESOLUTIONS = {
     "4K": (3840, 2160),
 }
 
-# Upscaling methods in order of quality (best first)
-UPSCALE_METHODS = ["mps_realesrgan", "video2x", "realesrgan", "fxupscale", "ffmpeg"]
+# Upscaling methods in order of speed/quality (best first)
+UPSCALE_METHODS = ["coreml_realesrgan", "mps_realesrgan", "video2x", "realesrgan", "fxupscale", "ffmpeg"]
+
+
+def check_coreml_available() -> bool:
+    """Check if Core ML is available (macOS with Apple Silicon)."""
+    try:
+        import platform
+        if platform.system() != "Darwin":
+            return False
+        import coremltools
+        return True
+    except ImportError:
+        return False
 
 
 def check_mps_available() -> bool:
@@ -103,7 +118,9 @@ def check_ffmpeg_available() -> bool:
 
 def get_best_available_method() -> str:
     """Get the best available upscaling method."""
-    if check_mps_available():
+    if check_coreml_available():
+        return "coreml_realesrgan"  # FASTEST on Apple Silicon
+    elif check_mps_available():
         return "mps_realesrgan"
     elif check_video2x_available():
         return "video2x"
@@ -143,6 +160,7 @@ class VideoUpscaler:
         self._video2x_available = check_video2x_available()
         self._fxupscale_available = check_fxupscale_available()
         self._mps_available = check_mps_available()
+        self._coreml_available = check_coreml_available()
 
         if not self._ffmpeg_available:
             raise RuntimeError("FFmpeg is required for video upscaling")
@@ -150,6 +168,8 @@ class VideoUpscaler:
     def get_available_methods(self) -> list[str]:
         """Get list of available upscaling methods."""
         methods = []
+        if self._coreml_available:
+            methods.append("coreml_realesrgan")  # FASTEST on Apple Silicon
         if self._mps_available:
             methods.append("mps_realesrgan")
         if self._video2x_available:
@@ -167,12 +187,12 @@ class VideoUpscaler:
         input_path: Path,
         output_path: Path,
         target_resolution: Literal["1080p", "2K", "4K"] = "4K",
-        method: Literal["auto", "mps_realesrgan", "fxupscale", "video2x", "realesrgan", "ffmpeg"] = "auto",
+        method: Literal["auto", "coreml_realesrgan", "mps_realesrgan", "fxupscale", "video2x", "realesrgan", "ffmpeg"] = "auto",
         preserve_audio: bool = True,
         progress_callback: Optional[Callable[[str, float], None]] = None,
         model: Optional[str] = None,
-        batch_size: int = 8,
-        tile_size: int = 768,
+        batch_size: Optional[int] = None,
+        tile_size: Optional[int] = None,
     ) -> bool:
         """
         Upscale a video to the target resolution.
@@ -181,17 +201,16 @@ class VideoUpscaler:
             input_path: Path to input video
             output_path: Path for upscaled output
             target_resolution: Target resolution ("1080p", "2K", or "4K")
-            method: Upscaling method ("auto", "mps_realesrgan", "video2x", "realesrgan", "fxupscale", or "ffmpeg")
-                    "auto" uses the best available method
+            method: Upscaling method ("auto", "coreml_realesrgan", "mps_realesrgan", etc.)
+                    "auto" uses the best available method (Core ML preferred on Apple Silicon)
             preserve_audio: Whether to preserve audio track
             progress_callback: Optional callback for progress updates
             model: AI model to use (for realesrgan: "realesrgan-x4plus", "realesr-animevideov3",
                    or custom models like "4xNomos2_hq_dat2" if installed)
-            batch_size: Number of tiles to process at once for MPS (higher = faster, more memory)
-            tile_size: Size of tiles for MPS upscaling (larger = fewer tiles = faster)
-                       - M1 (8-16GB): 384-512
-                       - M1 Pro/Max (16-32GB): 768-896
-                       - M2/M3 Ultra (64-128GB): 1024
+            batch_size: Number of tiles to process at once for MPS. If None, auto-calculated
+                       based on available GPU memory.
+            tile_size: Size of tiles for MPS upscaling. If None, auto-calculated based on
+                       available GPU memory.
 
         Returns:
             True if successful, False otherwise
@@ -204,9 +223,11 @@ class VideoUpscaler:
             logger.error(f"Input file not found: {input_path}")
             return False
 
-        # Auto-select best available method
+        # Auto-select best available method (Core ML is fastest on Apple Silicon)
         if method == "auto":
-            if self._mps_available:
+            if self._coreml_available:
+                method = "coreml_realesrgan"  # FASTEST - uses Neural Engine
+            elif self._mps_available:
                 method = "mps_realesrgan"
             elif self._video2x_available:
                 method = "video2x"
@@ -243,11 +264,13 @@ class VideoUpscaler:
 
         target_width, target_height = RESOLUTIONS[target_resolution]
 
+        logger.info(f"Final method after validation: {method}")
         if progress_callback:
             progress_callback(f"Upscaling to {target_resolution} using {method}...", 0.1)
 
         try:
             if method == "mps_realesrgan":
+                logger.info("Calling _upscale_mps_realesrgan...")
                 success = self._upscale_mps_realesrgan(
                     input_path, output_path, target_width, target_height,
                     preserve_audio, progress_callback
@@ -296,7 +319,18 @@ class VideoUpscaler:
         This uses our custom MPS implementation that doesn't depend on
         the problematic basicsr/realesrgan packages.
         """
-        from src.services.mps_upscaler import MPSUpscaler
+        logger.info(f"_upscale_mps_realesrgan called with input={input_path}")
+
+        if progress_callback:
+            progress_callback("Starting MPS Real-ESRGAN upscaler...", 0.12)
+
+        try:
+            from src.services.mps_upscaler import MPSUpscaler
+        except Exception as e:
+            logger.error(f"Failed to import mps_upscaler: {e}")
+            if progress_callback:
+                progress_callback(f"MPS import failed: {e}", 0.4)
+            raise
 
         if progress_callback:
             progress_callback("Initializing AI upscaler (MPS)...", 0.15)
@@ -306,12 +340,14 @@ class VideoUpscaler:
             model_name = "realesrgan-x4plus" if target_width >= 3840 else "realesrgan-x4plus"
 
             # Get settings from instance (set in upscale() method)
-            batch_size = getattr(self, '_batch_size', 8)
-            tile_size = getattr(self, '_tile_size', 768)
+            # If None, MPSUpscaler will auto-calculate safe values based on GPU memory
+            batch_size = getattr(self, '_batch_size', None)
+            tile_size = getattr(self, '_tile_size', None)
             upscaler = MPSUpscaler(
                 model_name=model_name,
                 tile_size=tile_size,
                 batch_size=batch_size,
+                auto_memory=True,  # Enable automatic memory management
             )
             success = upscaler.upscale_video(input_path, output_path, progress_callback)
 
@@ -330,15 +366,15 @@ class VideoUpscaler:
 
         except Exception as e:
             import traceback
-            logger.error(f"MPS Real-ESRGAN failed: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            # Fall back to ffmpeg
+            error_msg = f"MPS Real-ESRGAN failed: {type(e).__name__}: {e}"
+            tb = traceback.format_exc()
+            logger.error(error_msg)
+            logger.error(f"Traceback: {tb}")
+            # Show error in UI - DO NOT fall back to FFmpeg
             if progress_callback:
-                progress_callback(f"MPS failed ({type(e).__name__}), falling back to FFmpeg...", 0.5)
-            return self._upscale_ffmpeg(
-                input_path, output_path, target_width, target_height,
-                preserve_audio, progress_callback
-            )
+                progress_callback(f"MPS error: {str(e)[:150]}", 0.0)
+            # Re-raise so user sees the actual error
+            raise
 
     def _upscale_video2x(
         self,
