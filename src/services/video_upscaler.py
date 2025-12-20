@@ -970,21 +970,29 @@ class VideoUpscaler:
         if progress_callback:
             progress_callback("Reassembling video...", 0.8)
 
+        # Build FFmpeg command with correct option order:
+        # inputs first, then filters/options, then output
         reassemble_cmd = [
             "ffmpeg", "-y",
             "-framerate", fps,
             "-i", str(upscaled_dir / "frame_%06d.jpg"),
+        ]
+
+        if preserve_audio:
+            # Add audio source as second input BEFORE any output options
+            reassemble_cmd.extend(["-i", str(input_path)])
+
+        # Now add output options (filters, codecs, etc.)
+        reassemble_cmd.extend([
             "-vf", f"scale={target_width}:{target_height}:flags=lanczos",
             "-c:v", "libx264",
             "-preset", "slow",
             "-crf", "18",
             "-pix_fmt", "yuv420p",
-        ]
+        ])
 
         if preserve_audio:
-            # Add audio from original
             reassemble_cmd.extend([
-                "-i", str(input_path),
                 "-map", "0:v", "-map", "1:a",
                 "-c:a", "aac", "-b:a", "192k",
                 "-shortest",
