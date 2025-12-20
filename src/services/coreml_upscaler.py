@@ -12,6 +12,7 @@ Performance comparison:
 Based on: https://medium.com/@ronregev/optimized-ai-image-video-upscaling-on-macs-with-apple-silicon
 """
 
+import hashlib
 import logging
 import shutil
 import subprocess
@@ -32,6 +33,53 @@ COREML_MODELS_DIR = Path.home() / ".cache" / "songmaker" / "coreml_models"
 
 # Work directory for resume capability
 WORK_DIR_BASE = Path.home() / ".cache" / "songmaker" / "upscale_work"
+
+
+def get_video_content_hash(video_path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
+    """Generate a hash based on video file content for resume detection."""
+    hasher = hashlib.md5()
+    file_size = video_path.stat().st_size
+    hasher.update(str(file_size).encode())
+
+    with open(video_path, 'rb') as f:
+        # Hash first chunk
+        first_chunk = f.read(chunk_size)
+        hasher.update(first_chunk)
+
+        # Hash last chunk if file is large enough
+        if file_size > chunk_size * 2:
+            f.seek(-chunk_size, 2)
+            last_chunk = f.read(chunk_size)
+            hasher.update(last_chunk)
+
+    return hasher.hexdigest()[:8]
+
+
+def find_existing_work_dir(video_path: Path) -> Optional[Path]:
+    """Find an existing work directory for the video if one exists."""
+    content_hash = get_video_content_hash(video_path)
+    WORK_DIR_BASE.mkdir(parents=True, exist_ok=True)
+
+    # Look for work directories with matching hash (prefer coreml_ dirs)
+    for prefix in ["coreml_", "upscale_"]:
+        for work_dir in sorted(WORK_DIR_BASE.glob(f"{prefix}{content_hash}_*"), reverse=True):
+            if work_dir.is_dir():
+                frames_dir = work_dir / "frames"
+                if frames_dir.exists() and any(frames_dir.glob("*.png")):
+                    logger.info(f"Found existing work directory: {work_dir}")
+                    return work_dir
+
+    return None
+
+
+def get_work_dir(video_path: Path) -> Path:
+    """Get or create a work directory for the video based on content hash."""
+    content_hash = get_video_content_hash(video_path)
+    timestamp = int(time.time())
+    work_dir = WORK_DIR_BASE / f"coreml_{content_hash}_{timestamp}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Created new work directory: {work_dir}")
+    return work_dir
 
 # Global cancellation flag
 _cancel_upscale = threading.Event()
@@ -239,19 +287,17 @@ class CoreMLUpscaler:
         self.model = ct.models.MLModel(str(self.mlmodel_path))
         logger.info(f"Loaded Core ML model from {self.mlmodel_path}")
 
-    def upscale_image(self, img: np.ndarray) -> np.ndarray:
-        """Upscale a single image using Neural Engine.
+    def upscale_tile(self, tile: np.ndarray) -> np.ndarray:
+        """Upscale a single 512x512 tile using Neural Engine.
 
         Args:
-            img: Input image as numpy array (H, W, C) in RGB format, 0-255
+            tile: Input tile as numpy array (512, 512, 3) in RGB format, 0-255
 
         Returns:
-            Upscaled image as numpy array (H*4, W*4, C)
+            Upscaled tile as numpy array (2048, 2048, 3)
         """
-        self.ensure_model()
-
         # Convert to PIL Image (Core ML expects this)
-        pil_img = Image.fromarray(img.astype(np.uint8))
+        pil_img = Image.fromarray(tile.astype(np.uint8))
 
         # Run inference
         result = self.model.predict({"image": pil_img})
@@ -264,6 +310,68 @@ class CoreMLUpscaler:
             return np.array(output_img)
         else:
             return output_img
+
+    def upscale_image(self, img: np.ndarray) -> np.ndarray:
+        """Upscale a full image using tile-based processing.
+
+        The Core ML model only accepts 512x512 input, so we split the image
+        into tiles, upscale each, and stitch them back together.
+
+        Args:
+            img: Input image as numpy array (H, W, C) in RGB format, 0-255
+
+        Returns:
+            Upscaled image as numpy array (H*4, W*4, C)
+        """
+        self.ensure_model()
+
+        h, w, c = img.shape
+        tile_size = 512
+        scale = self.scale
+
+        # Pad image to be divisible by tile_size
+        pad_h = (tile_size - h % tile_size) % tile_size
+        pad_w = (tile_size - w % tile_size) % tile_size
+
+        if pad_h > 0 or pad_w > 0:
+            padded = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode='reflect')
+        else:
+            padded = img
+
+        padded_h, padded_w = padded.shape[:2]
+
+        # Calculate output size
+        out_h = padded_h * scale
+        out_w = padded_w * scale
+
+        # Create output array
+        output = np.zeros((out_h, out_w, c), dtype=np.uint8)
+
+        # Process tiles
+        tiles_y = padded_h // tile_size
+        tiles_x = padded_w // tile_size
+
+        for ty in range(tiles_y):
+            for tx in range(tiles_x):
+                # Extract tile
+                y1 = ty * tile_size
+                x1 = tx * tile_size
+                tile = padded[y1:y1+tile_size, x1:x1+tile_size]
+
+                # Upscale tile
+                upscaled_tile = self.upscale_tile(tile)
+
+                # Place in output
+                out_y1 = ty * tile_size * scale
+                out_x1 = tx * tile_size * scale
+                output[out_y1:out_y1+tile_size*scale, out_x1:out_x1+tile_size*scale] = upscaled_tile
+
+        # Crop to original output size
+        final_h = h * scale
+        final_w = w * scale
+        output = output[:final_h, :final_w]
+
+        return output
 
     def upscale_video(
         self,
@@ -285,128 +393,191 @@ class CoreMLUpscaler:
 
         self.ensure_model(progress_callback)
 
-        # Create work directory
-        work_dir = WORK_DIR_BASE / f"coreml_{int(time.time())}"
-        frames_dir = work_dir / "frames"
-        upscaled_dir = work_dir / "upscaled"
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        upscaled_dir.mkdir(parents=True, exist_ok=True)
+        # Check for existing work directory (resume capability)
+        existing_work_dir = find_existing_work_dir(input_path)
 
-        try:
+        if existing_work_dir:
+            work_dir = existing_work_dir
+            frames_dir = work_dir / "frames"
+            upscaled_dir = work_dir / "upscaled"
+            upscaled_dir.mkdir(parents=True, exist_ok=True)
+
+            frames = sorted(frames_dir.glob("*.png"))
+            total_frames = len(frames)
+
+            if progress_callback:
+                progress_callback(f"Resuming: Found {total_frames} existing frames", 0.12)
+            logger.info(f"Resuming from existing work dir with {total_frames} frames")
+        else:
+            # Create new work directory
+            work_dir = get_work_dir(input_path)
+            frames_dir = work_dir / "frames"
+            upscaled_dir = work_dir / "upscaled"
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            upscaled_dir.mkdir(parents=True, exist_ok=True)
+
             # Extract frames
             if progress_callback:
-                progress_callback("Extracting frames...", 0.1)
+                progress_callback("Extracting frames (this may take a minute)...", 0.1)
 
+            # Get frame count first for progress
+            probe_cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-count_packets", "-show_entries", "stream=nb_read_packets",
+                "-of", "csv=p=0",
+                str(input_path),
+            ]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            expected_frames = int(probe_result.stdout.strip()) if probe_result.returncode == 0 else 0
+
+            # Extract frames with progress
             extract_cmd = [
                 "ffmpeg", "-y",
-                "-hwaccel", "videotoolbox",
                 "-i", str(input_path),
-                "-compression_level", "1",
+                "-q:v", "1",
                 str(frames_dir / "frame_%06d.png"),
             ]
 
-            result = subprocess.run(extract_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                # Fallback without hwaccel
-                extract_cmd = [
-                    "ffmpeg", "-y",
-                    "-i", str(input_path),
-                    str(frames_dir / "frame_%06d.png"),
-                ]
-                subprocess.run(extract_cmd, capture_output=True, text=True)
+            logger.info(f"Running: {' '.join(extract_cmd)}")
+
+            # Run ffmpeg and monitor progress
+            process = subprocess.Popen(
+                extract_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            # Monitor extraction progress
+            if expected_frames > 0 and progress_callback:
+                while process.poll() is None:
+                    current_frames = len(list(frames_dir.glob("*.png")))
+                    if current_frames > 0:
+                        extract_progress = 0.1 + (0.05 * current_frames / expected_frames)
+                        progress_callback(
+                            f"Extracting frames: {current_frames}/{expected_frames}",
+                            min(0.15, extract_progress)
+                        )
+                    time.sleep(0.5)
+
+            stdout, stderr = process.communicate()
+
+            if process.returncode != 0:
+                logger.error(f"FFmpeg frame extraction failed: {stderr}")
+                if progress_callback:
+                    progress_callback(f"Frame extraction failed: {stderr[:100]}", 0.0)
+                return False
 
             # Get frame list
             frames = sorted(frames_dir.glob("*.png"))
             total_frames = len(frames)
 
             if total_frames == 0:
-                logger.error("No frames extracted")
+                logger.error(f"No frames extracted. FFmpeg stderr: {stderr}")
+                if progress_callback:
+                    progress_callback("No frames found after extraction", 0.0)
                 return False
 
-            logger.info(f"Extracted {total_frames} frames")
+            logger.info(f"Extracted {total_frames} frames to {frames_dir}")
 
-            # Upscale frames
-            start_time = time.time()
+        # Count already upscaled frames for resume
+        existing_upscaled = set(f.name for f in upscaled_dir.glob("*.png"))
+        frames_to_process = [(i, f) for i, f in enumerate(frames) if f.name not in existing_upscaled]
+        already_done = len(existing_upscaled)
 
-            for i, frame_path in enumerate(frames):
-                if is_cancelled():
-                    logger.info("Upscaling cancelled")
-                    return False
-
-                # Load frame
-                img = np.array(Image.open(frame_path).convert("RGB"))
-
-                # Upscale
-                upscaled = self.upscale_image(img)
-
-                # Save
-                output_frame = upscaled_dir / frame_path.name
-                Image.fromarray(upscaled).save(output_frame)
-
-                # Progress
-                if progress_callback:
-                    elapsed = time.time() - start_time
-                    if i > 0:
-                        time_per_frame = elapsed / i
-                        remaining = time_per_frame * (total_frames - i)
-                        eta = format_eta(remaining)
-                    else:
-                        eta = "calculating..."
-
-                    progress = 0.15 + (0.7 * (i + 1) / total_frames)
-                    progress_callback(
-                        f"Upscaling frame {i+1}/{total_frames} (ETA: {eta})",
-                        progress
-                    )
-
-            # Get FPS from original
-            probe_cmd = [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=r_frame_rate",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(input_path),
-            ]
-            result = subprocess.run(probe_cmd, capture_output=True, text=True)
-            fps = result.stdout.strip() if result.returncode == 0 else "30"
-
-            # Reassemble video
+        if already_done > 0:
+            logger.info(f"Resuming: {already_done} frames already upscaled, {len(frames_to_process)} remaining")
             if progress_callback:
-                progress_callback("Reassembling video...", 0.9)
+                progress_callback(f"Resuming: {already_done}/{total_frames} already done", 0.15)
 
-            reassemble_cmd = [
-                "ffmpeg", "-y",
-                "-framerate", fps,
-                "-i", str(upscaled_dir / "frame_%06d.png"),
-                "-i", str(input_path),
-                "-map", "0:v", "-map", "1:a?",
-                "-c:v", "h264_videotoolbox",
-                "-q:v", "65",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k",
-                "-shortest",
-                str(output_path),
-            ]
+        # Upscale remaining frames
+        start_time = time.time()
+        processed_count = 0
 
-            result = subprocess.run(reassemble_cmd, capture_output=True, text=True)
+        for i, frame_path in frames_to_process:
+            if is_cancelled():
+                logger.info("Upscaling cancelled")
+                return False
 
-            if result.returncode != 0:
-                # Fallback to software encoding
-                reassemble_cmd[10] = "libx264"
-                reassemble_cmd[11:13] = ["-preset", "fast", "-crf", "18"]
-                subprocess.run(reassemble_cmd, capture_output=True, text=True)
+            # Load frame
+            img = np.array(Image.open(frame_path).convert("RGB"))
 
-            # Cleanup
+            # Upscale
+            upscaled = self.upscale_image(img)
+
+            # Save
+            output_frame = upscaled_dir / frame_path.name
+            Image.fromarray(upscaled).save(output_frame)
+
+            processed_count += 1
+
+            # Progress
+            if progress_callback:
+                elapsed = time.time() - start_time
+                if processed_count > 0:
+                    time_per_frame = elapsed / processed_count
+                    remaining = time_per_frame * (len(frames_to_process) - processed_count)
+                    eta = format_eta(remaining)
+                else:
+                    eta = "calculating..."
+
+                total_done = already_done + processed_count
+                progress = 0.15 + (0.7 * total_done / total_frames)
+                progress_callback(
+                    f"Upscaling frame {total_done}/{total_frames} (ETA: {eta})",
+                    progress
+                )
+
+        # Get FPS from original
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(input_path),
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        fps = result.stdout.strip() if result.returncode == 0 else "30"
+
+        # Reassemble video
+        if progress_callback:
+            progress_callback("Reassembling video...", 0.9)
+
+        reassemble_cmd = [
+            "ffmpeg", "-y",
+            "-framerate", fps,
+            "-i", str(upscaled_dir / "frame_%06d.png"),
+            "-i", str(input_path),
+            "-map", "0:v", "-map", "1:a?",
+            "-c:v", "h264_videotoolbox",
+            "-q:v", "65",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+            str(output_path),
+        ]
+
+        result = subprocess.run(reassemble_cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            # Fallback to software encoding
+            reassemble_cmd[10] = "libx264"
+            reassemble_cmd[11:13] = ["-preset", "fast", "-crf", "18"]
+            subprocess.run(reassemble_cmd, capture_output=True, text=True)
+
+        # Cleanup work directory on success
+        if output_path.exists():
             shutil.rmtree(work_dir)
 
-            if progress_callback:
-                progress_callback("Upscaling complete!", 1.0)
+        if progress_callback:
+            progress_callback("Upscaling complete!", 1.0)
 
-            return output_path.exists()
+        return output_path.exists()
 
-        except Exception as e:
-            logger.error(f"Core ML upscaling failed: {e}")
-            raise
+    except Exception as e:
+        logger.error(f"Core ML upscaling failed: {e}")
+        raise
 
 
 def format_eta(seconds: float) -> str:
