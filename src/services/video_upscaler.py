@@ -841,7 +841,7 @@ class VideoUpscaler:
             total_frames = len(list(frames_dir.glob("*.png")))
             logger.info(f"Extracted {total_frames} frames")
 
-        # Step 2: Upscale frames with Real-ESRGAN (runs regardless of extraction)
+        # Step 2: Upscale frames with Real-ESRGAN (with resume support)
         # Get Real-ESRGAN binary path
         realesrgan_bin = get_realesrgan_path()
         if not realesrgan_bin:
@@ -851,75 +851,108 @@ class VideoUpscaler:
         # Use model from instance or default to RealESRGAN_General_x4_v3
         model_name = getattr(self, '_realesrgan_model', 'RealESRGAN_General_x4_v3')
 
+        # Check which frames still need to be upscaled (for resume capability)
+        all_frames = sorted(frames_dir.glob("*.png"))
+        upscaled_files = {f.stem for f in upscaled_dir.glob("*.jpg")}
+        remaining_frames = [f for f in all_frames if f.stem not in upscaled_files]
+
+        already_done = len(all_frames) - len(remaining_frames)
+
         if progress_callback:
             progress_callback(f"📁 Work: {work_dir}", 0.21)
+            if already_done > 0:
+                progress_callback(f"⏩ Resuming: {already_done}/{total_frames} already done, {len(remaining_frames)} remaining", 0.22)
             progress_callback(f"🤖 Model: {model_name} | Frames: {total_frames}", 0.22)
-            progress_callback(f"📷 Original: {frames_dir}/frame_000001.png", 0.22)
-            progress_callback(f"✨ Upscaled: {upscaled_dir}/frame_000001.jpg", 0.22)
 
-        # Find models directory
-        home = Path.home()
-        models_dir = home / ".local" / "share" / "realesrgan-ncnn-vulkan" / "models"
-        if not models_dir.exists():
-            # Check next to binary
-            bin_path = Path(realesrgan_bin).parent
-            models_dir = bin_path / "models"
+        # If all frames are already upscaled, skip to reassembly
+        if len(remaining_frames) == 0:
+            if progress_callback:
+                progress_callback(f"✅ All {total_frames} frames already upscaled!", 0.80)
+            logger.info(f"All {total_frames} frames already upscaled, skipping to reassembly")
+        else:
+            # Create temp directory with symlinks to only the remaining frames
+            # This is faster than copying and allows realesrgan to process only what's needed
+            pending_dir = work_dir / "pending"
+            if pending_dir.exists():
+                shutil.rmtree(pending_dir)
+            pending_dir.mkdir(parents=True, exist_ok=True)
 
-        upscale_cmd = [
-            realesrgan_bin,
-            "-i", str(frames_dir),
-            "-o", str(upscaled_dir),
-            "-n", model_name,
-            "-f", "jpg",  # JPEG is ~10x smaller/faster than PNG (3-5MB vs 43MB per frame)
-            "-j", "4:4:4",  # Parallel: 4 threads for load, 4 for process, 4 for save
-        ]
+            for frame in remaining_frames:
+                (pending_dir / frame.name).symlink_to(frame)
 
-        # Add models path if it exists
-        if models_dir.exists():
-            upscale_cmd.extend(["-m", str(models_dir)])
+            if progress_callback:
+                progress_callback(f"📷 Processing {len(remaining_frames)} remaining frames...", 0.22)
 
-        logger.info(f"Running Real-ESRGAN: {' '.join(upscale_cmd)}")
+            # Find models directory
+            home = Path.home()
+            models_dir = home / ".local" / "share" / "realesrgan-ncnn-vulkan" / "models"
+            if not models_dir.exists():
+                # Check next to binary
+                bin_path = Path(realesrgan_bin).parent
+                models_dir = bin_path / "models"
 
-        # Run upscaling in background and monitor progress
-        process = subprocess.Popen(
-            upscale_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+            upscale_cmd = [
+                realesrgan_bin,
+                "-i", str(pending_dir),  # Only process remaining frames
+                "-o", str(upscaled_dir),
+                "-n", model_name,
+                "-f", "jpg",  # JPEG is ~10x smaller/faster than PNG (3-5MB vs 43MB per frame)
+                "-j", "4:4:4",  # Parallel: 4 threads for load, 4 for process, 4 for save
+            ]
 
-        # Monitor upscaling progress
-        start_time = time.time()
-        if progress_callback:
-            while process.poll() is None:
-                upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
-                if upscaled_count > 0 and total_frames > 0:
-                    # Calculate ETA
-                    elapsed = time.time() - start_time
-                    time_per_frame = elapsed / upscaled_count
-                    remaining = time_per_frame * (total_frames - upscaled_count)
+            # Add models path if it exists
+            if models_dir.exists():
+                upscale_cmd.extend(["-m", str(models_dir)])
 
-                    if remaining < 60:
-                        eta = f"{int(remaining)}s"
-                    elif remaining < 3600:
-                        eta = f"{int(remaining/60)}m {int(remaining%60)}s"
-                    else:
-                        eta = f"{int(remaining/3600)}h {int((remaining%3600)/60)}m"
+            logger.info(f"Running Real-ESRGAN on {len(remaining_frames)} remaining frames: {' '.join(upscale_cmd)}")
 
-                    upscale_progress = 0.22 + (0.58 * upscaled_count / total_frames)
-                    progress_callback(
-                        f"Upscaling: {upscaled_count}/{total_frames} (ETA: {eta})",
-                        min(0.80, upscale_progress)
-                    )
-                time.sleep(1.0)
+            # Run upscaling in background and monitor progress
+            process = subprocess.Popen(
+                upscale_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
 
-        stdout, stderr = process.communicate()
-        if process.returncode != 0:
-            logger.error(f"Real-ESRGAN failed: {stderr}")
-            return False
+            # Monitor upscaling progress - use total already done + new upscaled for accurate ETA
+            start_time = time.time()
+            initial_upscaled = already_done
+            if progress_callback:
+                while process.poll() is None:
+                    upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+                    new_this_run = upscaled_count - initial_upscaled
+                    if new_this_run > 0 and total_frames > 0:
+                        # Calculate ETA based on new frames processed this run
+                        elapsed = time.time() - start_time
+                        time_per_frame = elapsed / new_this_run
+                        remaining_count = total_frames - upscaled_count
+                        remaining_time = time_per_frame * remaining_count
+
+                        if remaining_time < 60:
+                            eta = f"{int(remaining_time)}s"
+                        elif remaining_time < 3600:
+                            eta = f"{int(remaining_time/60)}m {int(remaining_time%60)}s"
+                        else:
+                            eta = f"{int(remaining_time/3600)}h {int((remaining_time%3600)/60)}m"
+
+                        upscale_progress = 0.22 + (0.58 * upscaled_count / total_frames)
+                        progress_callback(
+                            f"Upscaling: {upscaled_count}/{total_frames} (ETA: {eta})",
+                            min(0.80, upscale_progress)
+                        )
+                    time.sleep(1.0)
+
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                logger.error(f"Real-ESRGAN failed: {stderr}")
+                return False
+
+            # Clean up pending symlink directory
+            if pending_dir.exists():
+                shutil.rmtree(pending_dir)
 
         upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
-        logger.info(f"Upscaled {upscaled_count} frames")
+        logger.info(f"Upscaled {upscaled_count} frames total")
 
         # Step 3: Get original video info (fps)
         probe_cmd = [

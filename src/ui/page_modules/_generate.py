@@ -1521,86 +1521,47 @@ def render_upscale_only_page(state) -> None:
 
         st.caption("Click Stop to cancel - progress is saved and you can resume later")
 
-        # ===== PERSISTENT PREVIEW SECTION =====
-        # Show preview when NOT actively upscaling (for frame browsing between runs)
-        if (not st.session_state.get("upscaling_in_progress", False) and
-            "upscale_work_dir" in st.session_state and st.session_state["upscale_work_dir"]):
-            from pathlib import Path
-            work_dir = Path(st.session_state["upscale_work_dir"])
-            if work_dir.exists():
-                st.markdown("### Live Preview (Before / After)")
-                st.code(str(work_dir), language=None)
-
-                # Frame selector - use auto_latest flag
-                if "preview_auto_latest" not in st.session_state:
-                    st.session_state["preview_auto_latest"] = True
-                if "preview_frame_num" not in st.session_state:
-                    st.session_state["preview_frame_num"] = 1
-
-                frame_col1, frame_col2, frame_col3, frame_col4 = st.columns([2, 1, 1, 1])
-                with frame_col1:
-                    if not st.session_state["preview_auto_latest"]:
-                        # Get max frame count for validation
-                        upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
-                        max_frame = len(upscaled_frames) if upscaled_frames else 1
-                        selected_frame = st.number_input(
-                            "Frame #",
-                            min_value=1,
-                            max_value=max(1, max_frame),
-                            value=min(st.session_state["preview_frame_num"], max(1, max_frame)),
-                            step=100,
-                            key="frame_selector_input",
-                            help=f"Enter frame number (1-{max_frame})"
+        # Browse existing work directories - only show when NOT upscaling to avoid interference
+        from pathlib import Path
+        work_dir_base = Path.home() / ".cache" / "songmaker" / "upscale_work"
+        if not start_clicked and not st.session_state.get("upscaling_in_progress", False):
+            if work_dir_base.exists():
+                existing_dirs = sorted(work_dir_base.glob("realesrgan_*"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if existing_dirs:
+                    with st.expander("🖼️ Browse Previous Upscale Sessions", expanded=False):
+                        dir_options = {str(d): f"{d.name} ({len(list(d.glob('upscaled/*.jpg')))} frames)" for d in existing_dirs[:10]}
+                        selected_dir = st.selectbox(
+                            "Select session",
+                            options=list(dir_options.keys()),
+                            format_func=lambda x: dir_options[x],
+                            key="browse_work_dir_select_top"
                         )
-                        st.session_state["preview_frame_num"] = selected_frame
-                    else:
-                        st.info("🔄 Auto: showing latest upscaled frame")
-                with frame_col2:
-                    if st.button("⏮ First", key="first_frame"):
-                        st.session_state["preview_auto_latest"] = False
-                        st.session_state["preview_frame_num"] = 1
-                with frame_col3:
-                    if st.button("⏭ Latest", key="latest_frame"):
-                        st.session_state["preview_auto_latest"] = True
-                with frame_col4:
-                    if st.button("📝 Manual", key="manual_frame"):
-                        st.session_state["preview_auto_latest"] = False
-
-                # Show preview images
-                preview_cols = st.columns(2)
-                upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
-                if upscaled_frames:
-                    # Determine which frame to show
-                    if st.session_state["preview_auto_latest"]:
-                        frame_path = upscaled_frames[-1]
-                        frame_num = int(frame_path.stem.split("_")[-1])
-                    else:
-                        frame_num = st.session_state["preview_frame_num"]
-                        frame_path = work_dir / "upscaled" / f"frame_{frame_num:06d}.jpg"
-                        if not frame_path.exists():
-                            # Fall back to latest
-                            frame_path = upscaled_frames[-1]
-                            frame_num = int(frame_path.stem.split("_")[-1])
-
-                    orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
-
-                    with preview_cols[0]:
-                        st.caption("Original (1080p)")
-                        if orig_frame.exists():
-                            st.image(str(orig_frame), use_container_width=True)
-                    with preview_cols[1]:
-                        st.caption("Upscaled (4K)")
-                        if frame_path.exists():
-                            st.image(str(frame_path), use_container_width=True)
-
-                    st.caption(f"Frame {frame_num} of {len(upscaled_frames)} upscaled")
-                else:
-                    with preview_cols[0]:
-                        st.caption("Original (1080p)")
-                        st.info("Waiting for frames...")
-                    with preview_cols[1]:
-                        st.caption("Upscaled (4K)")
-                        st.info("Upscaling in progress...")
+                        if selected_dir:
+                            work_dir = Path(selected_dir)
+                            st.code(str(work_dir), language=None)
+                            st.session_state["upscale_work_dir"] = str(work_dir)
+                            upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
+                            if upscaled_frames:
+                                max_frame = len(upscaled_frames)
+                                frame_num = st.slider(
+                                    "Select frame",
+                                    min_value=1,
+                                    max_value=max_frame,
+                                    value=1,
+                                    key="browse_frame_slider_top"
+                                )
+                                frame_path = work_dir / "upscaled" / f"frame_{frame_num:06d}.jpg"
+                                orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
+                                cols = st.columns(2)
+                                with cols[0]:
+                                    st.caption("Original")
+                                    if orig_frame.exists():
+                                        st.image(str(orig_frame), use_container_width=True)
+                                with cols[1]:
+                                    st.caption("Upscaled")
+                                    if frame_path.exists():
+                                        st.image(str(frame_path), use_container_width=True)
+                                st.caption(f"Frame {frame_num} of {max_frame}")
 
         if start_clicked:
             st.session_state.upscaling_in_progress = True
@@ -1760,6 +1721,36 @@ def render_upscale_only_page(state) -> None:
                     # Store path for reference
                     update_state(upscaled_video_path=str(output_path))
                     st.session_state.upscaling_in_progress = False
+
+                    # Frame browser after completion
+                    if "upscale_work_dir" in st.session_state and st.session_state["upscale_work_dir"]:
+                        work_dir = Path(st.session_state["upscale_work_dir"])
+                        if work_dir.exists():
+                            with st.expander("🖼️ Browse Individual Frames", expanded=False):
+                                st.code(str(work_dir), language=None)
+                                upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
+                                if upscaled_frames:
+                                    max_frame = len(upscaled_frames)
+                                    frame_num = st.slider(
+                                        "Select frame",
+                                        min_value=1,
+                                        max_value=max_frame,
+                                        value=max_frame,
+                                        key="post_upscale_frame_slider"
+                                    )
+                                    frame_path = work_dir / "upscaled" / f"frame_{frame_num:06d}.jpg"
+                                    orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
+
+                                    cols = st.columns(2)
+                                    with cols[0]:
+                                        st.caption("Original")
+                                        if orig_frame.exists():
+                                            st.image(str(orig_frame), use_container_width=True)
+                                    with cols[1]:
+                                        st.caption("Upscaled")
+                                        if frame_path.exists():
+                                            st.image(str(frame_path), use_container_width=True)
+                                    st.caption(f"Frame {frame_num} of {max_frame}")
                 else:
                     st.error("Upscaling failed. Check the logs for details.")
                     st.session_state.upscaling_in_progress = False
@@ -1784,7 +1775,6 @@ def render_upscale_only_page(state) -> None:
                 use_container_width=True,
                 key="download_prev_upscaled",
             )
-
 
 def render_generate_page() -> None:
     """Render the video generation page."""
