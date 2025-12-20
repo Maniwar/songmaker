@@ -88,7 +88,7 @@ Respond in this exact JSON format:
 Only respond with the JSON, no other text."""
 
         response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model=self.config.claude_model,
             max_tokens=2048,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
@@ -146,7 +146,7 @@ Please refine the lyrics based on this feedback. Keep the same JSON format:
 Only respond with the JSON, no other text."""
 
         response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model=self.config.claude_model,
             max_tokens=2048,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],

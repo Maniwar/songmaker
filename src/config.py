@@ -141,6 +141,14 @@ class Config:
         default_factory=lambda: os.getenv("DEMUCS_MODEL", "htdemucs")
     )
 
+    # Claude model selection:
+    # - claude-sonnet-4-5-20250929 (default, best quality)
+    # - claude-3-5-haiku-20241022 (fastest, cheapest)
+    # - claude-opus-4-5-20251101 (highest quality, most expensive)
+    claude_model: str = field(
+        default_factory=lambda: os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
+    )
+
     # Sub-configurations
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
     video: VideoConfig = field(default_factory=VideoConfig)

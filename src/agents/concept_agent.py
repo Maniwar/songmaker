@@ -78,7 +78,7 @@ class ConceptAgent:
 
         # Send to Claude
         response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model=self.config.claude_model,
             max_tokens=1024,
             system=SYSTEM_PROMPT,
             messages=self.conversation_history,
@@ -201,7 +201,7 @@ IMPORTANT:
         messages.append({"role": "user", "content": extraction_prompt})
 
         response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model=self.config.claude_model,
             max_tokens=4096,  # Increased for longer lyrics
             system="You are a JSON extraction assistant. Return only valid JSON, no markdown formatting, no explanation text.",
             messages=messages,
@@ -313,7 +313,7 @@ Respond with only a JSON array of strings, no other text:
 ["genre1", "genre2", "genre3", "genre4", "genre5"]"""
 
         response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model=self.config.claude_model,
             max_tokens=256,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -348,7 +348,7 @@ Respond with only a JSON array of strings, no other text:
 ["mood1", "mood2", "mood3", "mood4", "mood5"]"""
 
         response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model=self.config.claude_model,
             max_tokens=256,
             messages=[{"role": "user", "content": prompt}],
         )

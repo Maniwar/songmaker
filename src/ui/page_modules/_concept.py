@@ -159,27 +159,37 @@ def render_concept_page() -> None:
         st.markdown("---")
         st.subheader("Quick Start")
         st.markdown("Already have your song ready?")
-        if st.button("Skip to Upload", type="secondary"):
-            # Create a minimal concept for skipping
-            from src.models.schemas import SongConcept, WorkflowStep, GeneratedLyrics
-            minimal_concept = SongConcept(
-                idea="Custom song",
-                genre="Various",
-                mood="Mixed",
-                themes=["music video"],
-                visual_style="cinematic digital art, dramatic lighting",
-            )
-            # Create placeholder lyrics so user doesn't need to go through lyrics step
-            placeholder_lyrics = GeneratedLyrics(
-                title="Custom Song",
-                lyrics="[Lyrics will be extracted from audio]",
-                suno_tags="custom",
-                structure=["Custom"],
-            )
-            update_state(
-                concept=minimal_concept,
-                lyrics=placeholder_lyrics,
-                lyrics_approved=True,  # Skip lyrics requirement
-            )
-            go_to_step(WorkflowStep.UPLOAD)
-            st.rerun()
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Skip to Upload", type="secondary", use_container_width=True):
+                # Create a minimal concept for skipping
+                from src.models.schemas import SongConcept, WorkflowStep, GeneratedLyrics
+                minimal_concept = SongConcept(
+                    idea="Custom song",
+                    genre="Various",
+                    mood="Mixed",
+                    themes=["music video"],
+                    visual_style="cinematic digital art, dramatic lighting",
+                )
+                # Create placeholder lyrics so user doesn't need to go through lyrics step
+                placeholder_lyrics = GeneratedLyrics(
+                    title="Custom Song",
+                    lyrics="[Lyrics will be extracted from audio]",
+                    suno_tags="custom",
+                    structure=["Custom"],
+                )
+                update_state(
+                    concept=minimal_concept,
+                    lyrics=placeholder_lyrics,
+                    lyrics_approved=True,  # Skip lyrics requirement
+                )
+                go_to_step(WorkflowStep.UPLOAD)
+                st.rerun()
+        with col2:
+            if st.button("Skip to Upscale", type="secondary", use_container_width=True):
+                # Go directly to upscale mode with existing video
+                # Use session state flag for compatibility
+                st.session_state.upscale_only_mode = True
+                st.rerun()
+        st.caption("Skip to Upload: Create a music video from audio + images")
+        st.caption("Skip to Upscale: Upscale an existing video to 4K")

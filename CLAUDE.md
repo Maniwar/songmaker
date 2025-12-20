@@ -49,7 +49,11 @@ tests/                # test_audio.py, test_video.py, test_sync.py
 # Install dependencies
 pip install -e .
 
-# Run the Streamlit app
+# Run the Streamlit app (recommended - uses correct venv)
+./run.sh
+
+# Or manually with venv
+source venv/bin/activate
 streamlit run src/ui/app.py
 
 # Or use the CLI launcher

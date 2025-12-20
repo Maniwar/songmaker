@@ -354,7 +354,7 @@ Return ONLY the motion prompts as a numbered list (1. prompt, 2. prompt, etc.)""
             progress_bar.progress(0.3)
 
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=config.claude_model,
             max_tokens=1024,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}]
@@ -1246,9 +1246,302 @@ CINEMATOGRAPHY_STYLES = {
 }
 
 
+def render_upscale_only_page(state) -> None:
+    """Render dedicated upscale page for Skip to Upscale mode."""
+    st.header("Upscale Video to 4K")
+
+    # Exit button
+    col1, col2 = st.columns([6, 1])
+    with col2:
+        if st.button("Exit", type="secondary"):
+            # Clear upscale mode from session state
+            st.session_state.upscale_only_mode = False
+            go_to_step(WorkflowStep.CONCEPT)
+            st.rerun()
+
+    st.markdown("""
+    Upload any video to upscale it to 4K resolution using local AI-powered upscaling.
+
+    **Supported formats:** MP4, MOV, WebM, MKV, AVI
+    """)
+
+    # File uploader
+    uploaded_video = st.file_uploader(
+        "Drag and drop your video here",
+        type=["mp4", "mov", "webm", "mkv", "avi"],
+        key="upscale_only_video_upload",
+    )
+
+    if uploaded_video:
+        # Show preview
+        st.video(uploaded_video)
+
+        # Show file info
+        file_size_mb = uploaded_video.size / 1024 / 1024
+        st.caption(f"**File:** {uploaded_video.name} ({file_size_mb:.1f} MB)")
+
+        st.markdown("---")
+        st.subheader("Upscaling Options")
+
+        # Import upscaler utilities
+        from src.services.video_upscaler import (
+            VideoUpscaler,
+            check_ffmpeg_available,
+            check_fxupscale_available,
+            check_mps_available,
+            check_realesrgan_available,
+            check_video2x_available,
+        )
+
+        # Check available methods
+        mps_available = check_mps_available()
+        fxupscale_available = check_fxupscale_available()
+        video2x_available = check_video2x_available()
+        realesrgan_available = check_realesrgan_available()
+        ffmpeg_available = check_ffmpeg_available()
+
+        if not ffmpeg_available:
+            st.error("FFmpeg is required for upscaling. Please install: `brew install ffmpeg`")
+            return
+
+        # Settings columns
+        col1, col2 = st.columns(2)
+
+        with col1:
+            target_resolution = st.selectbox(
+                "Target Resolution",
+                options=["4K (3840x2160)", "2K (2560x1440)", "1080p (1920x1080)"],
+                index=0,
+                key="upscale_only_resolution",
+            )
+
+        with col2:
+            # Build method options - best options first
+            method_options = []
+            method_map = {}  # Display name -> method key
+
+            # MPS Real-ESRGAN is best for Apple Silicon (true AI upscaling)
+            if mps_available:
+                method_options.append("Real-ESRGAN MPS (Best Quality - Mac)")
+                method_map["Real-ESRGAN MPS (Best Quality - Mac)"] = "mps_realesrgan"
+
+            # FFmpeg is always available as fallback
+            method_options.append("FFmpeg Lanczos (Fast, Universal)")
+            method_map["FFmpeg Lanczos (Fast, Universal)"] = "ffmpeg"
+
+            # MetalFX is fast but doesn't add detail
+            if fxupscale_available:
+                method_options.append("MetalFX (Fast, No Detail Enhancement)")
+                method_map["MetalFX (Fast, No Detail Enhancement)"] = "fxupscale"
+
+            # Other AI options (may have issues)
+            if realesrgan_available:
+                method_options.append("Real-ESRGAN ncnn (May crash on M1/M2)")
+                method_map["Real-ESRGAN ncnn (May crash on M1/M2)"] = "realesrgan"
+
+            if video2x_available:
+                method_options.append("Video2X AI (Requires Docker)")
+                method_map["Video2X AI (Requires Docker)"] = "video2x"
+
+            selected_method_display = st.selectbox(
+                "Upscaling Method",
+                options=method_options,
+                index=0,  # Default to best available
+                key="upscale_only_method",
+            )
+            selected_method = method_map.get(selected_method_display, "ffmpeg")
+
+            # Show info for selected method
+            if "MPS" in selected_method_display:
+                st.success(
+                    "**Real-ESRGAN MPS:** True AI upscaling that adds detail. "
+                    "Uses Apple GPU for acceleration. Best quality on Mac."
+                )
+            elif "MetalFX" in selected_method_display:
+                st.info(
+                    "**MetalFX:** Fast upscaling but doesn't add detail - "
+                    "just enlarges pixels. Use MPS for quality improvement."
+                )
+            elif "ncnn" in selected_method_display:
+                st.warning(
+                    "**Warning:** Real-ESRGAN ncnn may crash on Apple Silicon. "
+                    "Use MPS version instead for reliable results."
+                )
+
+        # Model selection for Real-ESRGAN
+        selected_model = None
+        if selected_method == "realesrgan":
+            st.markdown("**AI Upscaling Model**")
+            model_col1, model_col2 = st.columns([1, 1])
+
+            with model_col1:
+                # Built-in models that come with realesrgan-ncnn-vulkan
+                model_options = {
+                    "realesrgan-x4plus": "Real-ESRGAN x4+ (General - Best for photos/video)",
+                    "realesrgan-x4plus-anime": "Real-ESRGAN x4+ Anime (Anime images)",
+                    "realesr-animevideov3": "Real-ESRGAN AnimeVideo v3 (Anime video - Fast)",
+                }
+
+                selected_model_display = st.selectbox(
+                    "Upscaling Model",
+                    options=list(model_options.values()),
+                    index=0,  # Default to general-purpose
+                    key="upscale_only_model",
+                )
+
+                # Reverse lookup to get model key
+                selected_model = next(
+                    (k for k, v in model_options.items() if v == selected_model_display),
+                    "realesrgan-x4plus"
+                )
+
+            with model_col2:
+                # Show model info based on selection
+                if "animevideo" in selected_model.lower():
+                    st.info("**Fast** - Optimized for anime video. Lightweight model with good speed.")
+                elif "anime" in selected_model.lower():
+                    st.info("**Anime** - Sharper lines and vibrant colors for anime/cartoon content.")
+                else:
+                    st.info("**General** - Best for real-world photos and video. Highest quality.")
+
+        # Map resolution selection to value
+        resolution_map = {
+            "4K (3840x2160)": "4K",
+            "2K (2560x1440)": "2K",
+            "1080p (1920x1080)": "1080p",
+        }
+        target_res = resolution_map[target_resolution]
+
+        st.markdown("---")
+
+        # Upscale button
+        if st.button("Start Upscaling", type="primary", use_container_width=True, key="start_upscale_only"):
+            # Save uploaded file temporarily
+            config.ensure_directories()
+            upload_dir = config.output_dir / "uploads"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            input_path = upload_dir / f"upscale_input_{timestamp}_{uploaded_video.name}"
+
+            with open(input_path, "wb") as f:
+                f.write(uploaded_video.getvalue())
+
+            # Output path
+            output_name = f"upscaled_{target_res}_{timestamp}_{Path(uploaded_video.name).stem}.mp4"
+            output_path = config.output_dir / output_name
+
+            # Run upscaling
+            progress_bar = st.progress(0, text="Starting upscaling...")
+            status_text = st.empty()
+
+            def progress_callback(message: str, progress: float):
+                progress_bar.progress(progress, text=message)
+                status_text.text(message)
+
+            try:
+                upscaler = VideoUpscaler()
+                success = upscaler.upscale(
+                    input_path=Path(input_path),
+                    output_path=Path(output_path),
+                    target_resolution=target_res,
+                    method=selected_method,
+                    preserve_audio=True,
+                    progress_callback=progress_callback,
+                    model=selected_model,  # Pass AI model for Real-ESRGAN/Nomos2
+                )
+
+                if success and output_path.exists():
+                    progress_bar.progress(1.0, text="Upscaling complete!")
+                    st.success(f"Video upscaled successfully!")
+
+                    # Get file sizes for comparison
+                    original_size_mb = input_path.stat().st_size / 1024 / 1024
+                    upscaled_size_mb = output_path.stat().st_size / 1024 / 1024
+
+                    # Get resolutions
+                    try:
+                        import subprocess
+                        probe_cmd = [
+                            "ffprobe", "-v", "error",
+                            "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height",
+                            "-of", "csv=p=0",
+                        ]
+                        orig_result = subprocess.run(
+                            probe_cmd + [str(input_path)],
+                            capture_output=True, text=True
+                        )
+                        up_result = subprocess.run(
+                            probe_cmd + [str(output_path)],
+                            capture_output=True, text=True
+                        )
+                        orig_res = orig_result.stdout.strip().replace(",", "x")
+                        up_res = up_result.stdout.strip().replace(",", "x")
+                    except Exception:
+                        orig_res = "Unknown"
+                        up_res = target_resolution
+
+                    # Before/After comparison
+                    st.markdown("### Before / After Comparison")
+                    col_before, col_after = st.columns(2)
+
+                    with col_before:
+                        st.markdown("**Original**")
+                        st.video(str(input_path))
+                        st.caption(f"Resolution: {orig_res} | Size: {original_size_mb:.1f} MB")
+
+                    with col_after:
+                        st.markdown("**Upscaled**")
+                        st.video(str(output_path))
+                        st.caption(f"Resolution: {up_res} | Size: {upscaled_size_mb:.1f} MB")
+
+                    # Download button
+                    st.markdown("---")
+                    with open(output_path, "rb") as f:
+                        st.download_button(
+                            "Download Upscaled Video",
+                            f,
+                            file_name=output_name,
+                            mime="video/mp4",
+                            use_container_width=True,
+                        )
+
+                    # Store path for reference
+                    update_state(upscaled_video_path=str(output_path))
+                else:
+                    st.error("Upscaling failed. Check the logs for details.")
+
+            except Exception as e:
+                st.error(f"Upscaling error: {e}")
+
+    # Show previously upscaled video if exists
+    if state.upscaled_video_path and Path(state.upscaled_video_path).exists():
+        st.markdown("---")
+        st.subheader("Previous Upscaled Video")
+        st.video(state.upscaled_video_path)
+        st.caption(f"Path: {state.upscaled_video_path}")
+
+        with open(state.upscaled_video_path, "rb") as f:
+            st.download_button(
+                "Download Previous Upscaled Video",
+                f,
+                file_name=Path(state.upscaled_video_path).name,
+                mime="video/mp4",
+                use_container_width=True,
+                key="download_prev_upscaled",
+            )
+
+
 def render_generate_page() -> None:
     """Render the video generation page."""
     state = get_state()
+
+    # Check for upscale-only mode
+    if getattr(state, 'upscale_only_mode', False):
+        render_upscale_only_page(state)
+        return
 
     st.header("Generate Your Music Video")
 
@@ -1278,7 +1571,7 @@ def render_generate_page() -> None:
     effective_storyboard_ready = storyboard_ready or has_images
 
     # Workflow: Setup -> Prompt Review -> Image Generation -> Video
-    if state.final_video_path:
+    if state.final_video_path and Path(state.final_video_path).exists():
         render_video_complete(state)
     elif effective_storyboard_ready and state.scenes:
         render_storyboard_view(state, is_demo_mode)
@@ -1300,6 +1593,41 @@ def render_storyboard_setup(state, is_demo_mode: bool) -> None:
         - **Mode:** {"Demo (images only)" if is_demo_mode else "Full (with audio)"}
         """
     )
+
+    # Quick action: Upscale existing video
+    with st.expander("Upscale Existing Video to 4K", expanded=False):
+        st.markdown("""
+        Already have a video? Upload it here to upscale to 4K resolution.
+        """)
+        uploaded_video = st.file_uploader(
+            "Upload video to upscale",
+            type=["mp4", "mov", "webm", "mkv"],
+            key="upload_video_for_upscale",
+        )
+        if uploaded_video:
+            st.video(uploaded_video)
+            st.caption(f"File: {uploaded_video.name} ({uploaded_video.size / 1024 / 1024:.1f} MB)")
+
+            if st.button("Go to Upscale", type="primary", key="go_to_upscale_btn"):
+                # Save to output directory
+                config.ensure_directories()
+                upload_dir = config.output_dir / "uploads"
+                upload_dir.mkdir(parents=True, exist_ok=True)
+
+                # Generate unique filename
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                safe_name = _sanitize_filename(uploaded_video.name.rsplit('.', 1)[0])
+                ext = uploaded_video.name.rsplit('.', 1)[-1] if '.' in uploaded_video.name else 'mp4'
+                save_path = upload_dir / f"{safe_name}_{timestamp}.{ext}"
+
+                # Save the file
+                with open(save_path, "wb") as f:
+                    f.write(uploaded_video.getvalue())
+
+                st.success(f"Saved to {save_path}")
+                update_state(final_video_path=str(save_path))
+                st.rerun()
 
     # Generation settings
     with st.expander("Video Settings", expanded=True):
@@ -1984,9 +2312,9 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
             with anim_col1:
                 resolution = st.selectbox(
                     "Animation Resolution",
-                    options=["720P", "480P"],
-                    index=0,
-                    help="Higher resolution takes longer to generate",
+                    options=["1080P", "720P", "480P"],
+                    index=1,  # Default to 720P for balance of quality/speed
+                    help="Higher resolution takes longer and costs more. 1080P available for Seedance, Kling, Veo.",
                     key="animation_resolution",
                 )
             with anim_col2:
@@ -2373,7 +2701,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
                 prompt=motion_prompt,
                 output_path=output_path,
                 duration_seconds=scene.duration,  # Veo supports 4, 6, or 8 seconds
-                resolution="720p",  # Can be 720p or 1080p
+                resolution=resolution.lower(),  # e.g., "720p" or "1080p"
                 progress_callback=progress_callback,
             )
         elif animation_type == AnimationType.ATLASCLOUD:
@@ -2385,7 +2713,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
                 prompt=motion_prompt,
                 output_path=output_path,
                 duration_seconds=5 if scene.duration < 7.5 else 10,  # AtlasCloud supports 5 or 10 seconds
-                resolution="720p",  # Can be 720p or 1080p
+                resolution=resolution.lower(),  # e.g., "720p" or "1080p"
                 progress_callback=progress_callback,
             )
         elif animation_type == AnimationType.SEEDANCE:
@@ -2400,7 +2728,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
                 prompt=motion_prompt,
                 output_path=output_path,
                 duration_seconds=target_duration,
-                resolution="720p",  # Can be 480p, 720p, or 1080p
+                resolution=resolution.lower(),  # e.g., "480p", "720p", or "1080p"
                 progress_callback=progress_callback,
             )
 
@@ -2418,7 +2746,7 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
                 start_time=scene.start_time,
                 duration=scene.duration,
                 output_path=output_path,
-                resolution="720p",
+                resolution=resolution.lower(),  # e.g., "720p" or "1080p"
                 use_i2v=False,  # Use static video as base (cheaper)
                 progress_callback=progress_callback,
             )
@@ -2751,8 +3079,8 @@ def render_scene_card(state, scene: Scene) -> None:
             with anim_col1:
                 anim_resolution = st.selectbox(
                     "Resolution",
-                    options=["720P", "480P"],
-                    index=0,
+                    options=["1080P", "720P", "480P"],
+                    index=1,  # Default to 720P
                     key=f"anim_res_{scene.index}",
                     label_visibility="collapsed",
                 )
@@ -3065,6 +3393,10 @@ def render_video_complete(state) -> None:
             )
             st.rerun()
 
+    # 4K Upscaling section
+    st.markdown("---")
+    _render_upscale_section(state)
+
     if st.button("Complete", type="primary"):
         advance_step()
         st.rerun()
@@ -3074,6 +3406,130 @@ def render_video_complete(state) -> None:
     if st.button("Back to Storyboard"):
         update_state(final_video_path=None)
         st.rerun()
+
+
+def _render_upscale_section(state) -> None:
+    """Render the 4K upscaling section."""
+    from src.services.video_upscaler import (
+        VideoUpscaler, check_ffmpeg_available,
+        check_realesrgan_available, check_video2x_available
+    )
+
+    st.subheader("Upscale to 4K")
+
+    # Check current video resolution
+    video_path = Path(state.final_video_path)
+    upscaled_path = getattr(state, 'upscaled_video_path', None)
+
+    # Check available methods
+    methods_available = []
+    method_labels = {}
+
+    if check_video2x_available():
+        methods_available.append("video2x")
+        method_labels["video2x"] = "Video2X (AI - Best Quality)"
+    if check_realesrgan_available():
+        methods_available.append("realesrgan")
+        method_labels["realesrgan"] = "Real-ESRGAN (AI - Good Quality)"
+    if check_ffmpeg_available():
+        methods_available.append("ffmpeg")
+        method_labels["ffmpeg"] = "FFmpeg Lanczos (Fast)"
+
+    if not methods_available:
+        st.warning("No upscaling methods available. Install FFmpeg to enable upscaling.")
+        return
+
+    # Show upscaled video if exists
+    if upscaled_path and Path(upscaled_path).exists():
+        st.success(f"4K version available: {Path(upscaled_path).name}")
+        col1, col2 = st.columns(2)
+        with col1:
+            with open(upscaled_path, "rb") as f:
+                st.download_button(
+                    "Download 4K Version",
+                    data=f,
+                    file_name=Path(upscaled_path).name,
+                    mime="video/mp4",
+                    key="download_4k",
+                )
+        with col2:
+            if st.button("Re-upscale", key="re_upscale"):
+                Path(upscaled_path).unlink(missing_ok=True)
+                update_state(upscaled_video_path=None)
+                st.rerun()
+        return
+
+    # Upscaling options
+    with st.expander("Upscale Video to 4K", expanded=False):
+        st.markdown("""
+        Upscale your video to 4K (3840x2160) resolution for maximum quality.
+
+        **Methods:**
+        - **Video2X (AI)**: Best quality, uses Real-ESRGAN/Real-CUGAN models. Slowest.
+        - **Real-ESRGAN**: Good AI upscaling. Medium speed.
+        - **FFmpeg**: Fast lanczos scaling. Acceptable quality.
+        """)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            target_res = st.selectbox(
+                "Target Resolution",
+                options=["4K", "2K", "1080p"],
+                index=0,
+                key="upscale_resolution",
+            )
+        with col2:
+            method = st.selectbox(
+                "Upscaling Method",
+                options=methods_available,
+                format_func=lambda x: method_labels.get(x, x),
+                index=0,
+                key="upscale_method",
+            )
+
+        if st.button("Start Upscaling", type="primary", key="start_upscale"):
+            _run_upscale(state, target_res, method)
+
+
+def _run_upscale(state, target_resolution: str, method: str) -> None:
+    """Run the upscaling process."""
+    from src.services.video_upscaler import VideoUpscaler
+
+    video_path = Path(state.final_video_path)
+    output_path = video_path.with_name(
+        f"{video_path.stem}_{target_resolution}{video_path.suffix}"
+    )
+
+    with st.status(f"Upscaling to {target_resolution}...", expanded=True) as status:
+        progress_text = st.empty()
+        progress_bar = st.progress(0)
+
+        def progress_callback(message: str, progress: float):
+            progress_text.write(message)
+            progress_bar.progress(min(1.0, progress))
+
+        try:
+            upscaler = VideoUpscaler()
+            success = upscaler.upscale(
+                input_path=video_path,
+                output_path=output_path,
+                target_resolution=target_resolution,
+                method=method,
+                preserve_audio=True,
+                progress_callback=progress_callback,
+            )
+
+            if success and output_path.exists():
+                status.update(label="Upscaling complete!", state="complete")
+                update_state(upscaled_video_path=str(output_path))
+                st.rerun()
+            else:
+                status.update(label="Upscaling failed", state="error")
+                st.error("Upscaling failed. Check logs for details.")
+
+        except Exception as e:
+            status.update(label="Upscaling error", state="error")
+            st.error(f"Upscaling error: {e}")
 
 
 def generate_scene_prompts(state, scenes_per_minute: int, style_override: str, resolution: str) -> None:

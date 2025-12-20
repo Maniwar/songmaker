@@ -288,6 +288,11 @@ def load_state(filepath: Path) -> bool:
         if fix_malformed_project_path(loaded_state):
             st.info("Project path was fixed automatically.")
 
+        # Sync Claude model from loaded state to config
+        if hasattr(loaded_state, 'claude_model') and loaded_state.claude_model:
+            from src.config import config
+            config.claude_model = loaded_state.claude_model
+
         st.session_state.app_state = loaded_state
         return True
     except Exception as e:
@@ -699,8 +704,82 @@ def render_project_sidebar() -> None:
 
                     st.markdown("---")
 
-        # New project
+        # Settings
+        with st.expander("Settings", expanded=False):
+            # Claude model selection
+            claude_models = {
+                "claude-3-5-haiku-20241022": "Haiku (Fast & Cheap)",
+                "claude-sonnet-4-5-20250929": "Sonnet (Balanced)",
+                "claude-opus-4-5-20251101": "Opus (Best Quality)",
+            }
+
+            state = get_state()
+            current_model = getattr(state, 'claude_model', 'claude-sonnet-4-5-20250929')
+
+            # Find index of current model
+            model_ids = list(claude_models.keys())
+            try:
+                current_index = model_ids.index(current_model)
+            except ValueError:
+                current_index = 1  # Default to Sonnet
+
+            selected_model = st.selectbox(
+                "Claude Model",
+                options=model_ids,
+                format_func=lambda x: claude_models[x],
+                index=current_index,
+                key="claude_model_select",
+                help="Haiku: Fastest, cheapest. Sonnet: Best balance. Opus: Highest quality."
+            )
+
+            if selected_model != current_model:
+                state.claude_model = selected_model
+                # Also update config for immediate effect
+                from src.config import config
+                config.claude_model = selected_model
+                st.rerun()
+
+        # New project and quick actions
         st.divider()
         if st.button("New Project", key="new_project_btn", use_container_width=True):
             reset_state()
+            st.rerun()
+
+        # Quick action buttons
+        st.markdown("##### Quick Actions")
+        if st.button("Skip to Upload", key="sidebar_skip_upload", use_container_width=True):
+            # Create minimal state for upload
+            from src.models.schemas import SongConcept, GeneratedLyrics
+            minimal_concept = SongConcept(
+                idea="Custom song",
+                genre="Various",
+                mood="Mixed",
+                themes=["music video"],
+                visual_style="cinematic digital art, dramatic lighting",
+            )
+            placeholder_lyrics = GeneratedLyrics(
+                title="Custom Song",
+                lyrics="[Lyrics will be extracted from audio]",
+                suno_tags="custom",
+                structure=["Custom"],
+            )
+            state = get_state()
+            state.concept = minimal_concept
+            state.lyrics = placeholder_lyrics
+            state.lyrics_approved = True
+            go_to_step(WorkflowStep.UPLOAD)
+            st.rerun()
+
+        if st.button("Skip to Upscale", key="sidebar_skip_upscale", use_container_width=True):
+            # Go directly to upscale-only mode
+            # Use session state flag for compatibility with older AppState objects
+            st.session_state.upscale_only_mode = True
+            st.rerun()
+
+        # Movie Mode - for animated podcasts and educational videos
+        st.divider()
+        st.markdown("##### Special Modes")
+        if st.button("🎬 Movie Mode", key="sidebar_movie_mode", use_container_width=True):
+            # Enable movie mode
+            st.session_state.movie_mode = True
             st.rerun()
