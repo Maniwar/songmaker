@@ -118,6 +118,13 @@ class Config:
     hf_token: Optional[str] = field(
         default_factory=lambda: os.getenv("HF_TOKEN")
     )
+    # TTS API Keys (for Movie Mode)
+    elevenlabs_api_key: str = field(
+        default_factory=lambda: os.getenv("ELEVENLABS_API_KEY", "")
+    )
+    openai_api_key: str = field(
+        default_factory=lambda: os.getenv("OPENAI_API_KEY", "")
+    )
 
     # Lip sync backend: "wan2s2v" (free, slow) or "kling" (paid, fast)
     lip_sync_backend: str = field(

@@ -10,6 +10,11 @@ pydub>=0.25.1
 assemblyai>=0.35.0
 demucs>=4.0.0  # Vocal separation for better music transcription
 
+# Text-to-Speech (for Movie Mode)
+openai>=1.0.0  # OpenAI TTS (paid, good quality)
+elevenlabs>=2.0.0  # ElevenLabs TTS (paid, best quality)
+edge-tts>=6.0.0  # Microsoft Edge TTS (free)
+
 # Video/Image Processing
 Pillow>=10.4.0
 

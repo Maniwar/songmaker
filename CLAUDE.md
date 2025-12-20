@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-An agentic AI system that transforms song ideas into complete music videos with synchronized lyrics for sing-along capability. Users collaborate with AI to develop song concepts, generate professional lyrics, create songs via Suno, and produce cohesive videos with dynamically-generated scenes and word-level synced karaoke lyrics.
+An agentic AI system with two modes:
+
+1. **Song Mode**: Transform song ideas into complete music videos with synchronized lyrics for sing-along capability. Users collaborate with AI to develop song concepts, generate professional lyrics, create songs via Suno, and produce cohesive videos with dynamically-generated scenes and word-level synced karaoke lyrics.
+
+2. **Movie Mode**: Create animated podcasts, educational videos, and short films with consistent characters and unique AI-generated voices. Script-based workflow with TTS voice generation.
 
 ## Architecture
 
@@ -31,15 +35,15 @@ USER WORKFLOW
 
 ```
 src/
-├── agents/           # concept_agent, lyrics_agent, visual_agent
-├── services/         # audio_processor, image_generator, video_generator, lyrics_sync, subtitle_generator
-├── models/           # Pydantic schemas
+├── agents/           # concept_agent, lyrics_agent, visual_agent, script_agent
+├── services/         # audio_processor, image_generator, video_generator, tts_service, mps_upscaler
+├── models/           # Pydantic schemas (Song + Movie mode)
 └── ui/
     ├── app.py        # Main Streamlit app
     ├── components/   # wizard, progress, player
-    └── pages/        # concept, lyrics, upload, generate
+    └── pages/        # concept, lyrics, upload, generate, movie
 
-output/               # songs/, images/, videos/, subtitles/
+output/               # songs/, images/, videos/, subtitles/, movie/
 tests/                # test_audio.py, test_video.py, test_sync.py
 ```
 
@@ -79,12 +83,17 @@ python -m src.main transcribe audio.mp3 --output transcript.json
 ANTHROPIC_API_KEY=sk-ant-...     # Claude for reasoning/lyrics
 GOOGLE_API_KEY=...               # Gemini for images
 
-# Optional
+# Optional - Song Mode
 WHISPER_MODEL=large-v3
 WHISPER_DEVICE=cuda              # or cpu for Mac
 VIDEO_RESOLUTION=1920x1080
 VIDEO_FPS=30
 DEFAULT_ART_STYLE="cinematic digital art, dramatic lighting, 8k quality"
+
+# Optional - Movie Mode TTS (pick one)
+OPENAI_API_KEY=...               # OpenAI TTS (good quality)
+ELEVENLABS_API_KEY=...           # ElevenLabs TTS (best quality)
+# Edge TTS is free and requires no API key
 ```
 
 ## Key Implementation Details
