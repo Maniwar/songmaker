@@ -1529,6 +1529,7 @@ def render_upscale_only_page(state) -> None:
             work_dir = Path(st.session_state["upscale_work_dir"])
             if work_dir.exists():
                 st.markdown("### Live Preview (Before / After)")
+                st.code(str(work_dir), language=None)
 
                 # Frame selector - use auto_latest flag
                 if "preview_auto_latest" not in st.session_state:
