@@ -878,7 +878,8 @@ class VideoUpscaler:
             pending_dir.mkdir(parents=True, exist_ok=True)
 
             for frame in remaining_frames:
-                (pending_dir / frame.name).symlink_to(frame)
+                # Use absolute path for symlink target to avoid issues
+                (pending_dir / frame.name).symlink_to(frame.absolute())
 
             if progress_callback:
                 progress_callback(f"📷 Processing {len(remaining_frames)} remaining frames...", 0.22)
