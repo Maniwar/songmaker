@@ -1643,6 +1643,7 @@ def render_upscale_only_page(state) -> None:
 
             # Live preview during upscaling
             st.markdown("### Live Preview (Before / After)")
+            work_dir_display = st.empty()  # Shows work directory path
             preview_cols = st.columns(2)
             with preview_cols[0]:
                 st.caption("Original (1080p)")
@@ -1665,6 +1666,7 @@ def render_upscale_only_page(state) -> None:
                     work_dir_path = message.split("Work:")[-1].strip()
                     live_state["work_dir"] = work_dir_path
                     st.session_state["upscale_work_dir"] = work_dir_path
+                    work_dir_display.code(work_dir_path, language=None)
 
                 # Update live preview every 2 seconds
                 if live_state["work_dir"] and progress >= 0.22:
