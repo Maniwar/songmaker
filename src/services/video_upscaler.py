@@ -40,8 +40,9 @@ RESOLUTIONS = {
     "4K": (3840, 2160),
 }
 
-# Upscaling methods in order of speed/quality (best first)
-UPSCALE_METHODS = ["coreml_realesrgan", "mps_realesrgan", "video2x", "realesrgan", "fxupscale", "ffmpeg"]
+# Upscaling methods in order of preference (best first)
+# realesrgan (ncnn-vulkan) is most stable and uses GPU via Vulkan
+UPSCALE_METHODS = ["realesrgan", "coreml_realesrgan", "mps_realesrgan", "video2x", "fxupscale", "ffmpeg"]
 
 
 def check_coreml_available() -> bool:
@@ -205,8 +206,11 @@ class VideoUpscaler:
                     "auto" uses the best available method (Core ML preferred on Apple Silicon)
             preserve_audio: Whether to preserve audio track
             progress_callback: Optional callback for progress updates
-            model: AI model to use (for realesrgan: "realesrgan-x4plus", "realesr-animevideov3",
-                   or custom models like "4xNomos2_hq_dat2" if installed)
+            model: AI model to use (for realesrgan):
+                   - "RealESRGAN_General_x4_v3" (default, 10x faster, for cinematic/general content)
+                   - "4xLSDIRCompactC3" (16x faster, slightly lower quality)
+                   - "realesrgan-x4plus" (best quality but slow)
+                   - "realesr-animevideov3" (for anime content)
             batch_size: Number of tiles to process at once for MPS. If None, auto-calculated
                        based on available GPU memory.
             tile_size: Size of tiles for MPS upscaling. If None, auto-calculated based on
@@ -218,7 +222,8 @@ class VideoUpscaler:
         self._batch_size = batch_size
         self._tile_size = tile_size
         # Store model for use in realesrgan method
-        self._realesrgan_model = model or "realesrgan-x4plus"
+        # RealESRGAN_General_x4_v3 is 10x faster than x4plus and designed for general/cinematic content
+        self._realesrgan_model = model or "RealESRGAN_General_x4_v3"
         if not input_path.exists():
             logger.error(f"Input file not found: {input_path}")
             return False
@@ -734,32 +739,72 @@ class VideoUpscaler:
         preserve_audio: bool,
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> bool:
-        """Upscale using Real-ESRGAN AI model.
+        """Upscale using Real-ESRGAN AI model (ncnn-vulkan).
 
         Real-ESRGAN upscales by a fixed factor (usually 4x), so we may need
         to do a two-step process: AI upscale then resize to exact target.
+
+        Uses persistent work directory for resume capability.
         """
-        import tempfile
+        import hashlib
+        import time
 
         if progress_callback:
-            progress_callback("Upscaling with Real-ESRGAN AI...", 0.2)
+            progress_callback("Starting Real-ESRGAN Vulkan upscaler...", 0.1)
 
         # Real-ESRGAN works on images, so we need to:
-        # 1. Extract frames
-        # 2. Upscale each frame
+        # 1. Extract frames (or reuse existing)
+        # 2. Upscale each frame (resume from where we left off)
         # 3. Reassemble video
         # 4. Add audio back
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
-            frames_dir = tmpdir / "frames"
-            upscaled_dir = tmpdir / "upscaled"
-            frames_dir.mkdir()
-            upscaled_dir.mkdir()
+        # Use persistent work directory for resume capability
+        work_dir_base = Path.home() / ".cache" / "songmaker" / "upscale_work"
 
-            # Step 1: Extract frames
+        # Create unique work dir based on input file content (not mtime or filename which change)
+        # Use file size + first 1MB content hash for stability across re-uploads
+        file_stat = input_path.stat()
+        hasher = hashlib.md5()
+        hasher.update(str(file_stat.st_size).encode())
+        # Read first 1MB for content hash (enough to identify unique files)
+        with open(input_path, "rb") as f:
+            hasher.update(f.read(1024 * 1024))
+        work_hash = hasher.hexdigest()[:12]
+        work_dir = work_dir_base / f"realesrgan_{work_hash}"
+
+        logger.info(f"Input: {input_path.name}, size: {file_stat.st_size}, hash: {work_hash}")
+
+        frames_dir = work_dir / "frames"
+        upscaled_dir = work_dir / "upscaled"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        upscaled_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"Work directory: {work_dir}")
+
+        # Get expected frame count first
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-count_packets", "-show_entries", "stream=nb_read_packets",
+            "-of", "csv=p=0",
+            str(input_path),
+        ]
+        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        expected_frames = int(probe_result.stdout.strip()) if probe_result.returncode == 0 else 0
+
+        # Check if frames already extracted
+        existing_frames = len(list(frames_dir.glob("*.png")))
+
+        if existing_frames >= expected_frames and expected_frames > 0:
+            # Frames already extracted, skip extraction
             if progress_callback:
-                progress_callback("Extracting frames...", 0.3)
+                progress_callback(f"Found {existing_frames} existing frames, skipping extraction", 0.20)
+            logger.info(f"Reusing {existing_frames} existing extracted frames")
+            total_frames = existing_frames
+        else:
+            # Step 1: Extract frames with progress monitoring
+            if progress_callback:
+                progress_callback(f"Extracting frames (expecting ~{expected_frames})...", 0.12)
 
             extract_cmd = [
                 "ffmpeg", "-y",
@@ -768,95 +813,159 @@ class VideoUpscaler:
                 str(frames_dir / "frame_%06d.png"),
             ]
 
-            result = subprocess.run(extract_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                logger.error(f"Frame extraction failed: {result.stderr}")
+            # Run extraction in background and monitor progress
+            process = subprocess.Popen(
+                extract_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            # Monitor extraction progress
+            if expected_frames > 0 and progress_callback:
+                while process.poll() is None:
+                    current_frames = len(list(frames_dir.glob("*.png")))
+                    if current_frames > 0:
+                        extract_progress = 0.12 + (0.08 * current_frames / expected_frames)
+                        progress_callback(
+                            f"Extracting frames: {current_frames}/{expected_frames}",
+                            min(0.20, extract_progress)
+                        )
+                    time.sleep(0.5)
+
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                logger.error(f"Frame extraction failed: {stderr}")
                 return False
 
-            # Step 2: Upscale frames with Real-ESRGAN
-            if progress_callback:
-                progress_callback("AI upscaling frames...", 0.5)
+            total_frames = len(list(frames_dir.glob("*.png")))
+            logger.info(f"Extracted {total_frames} frames")
 
-            # Get Real-ESRGAN binary path
-            realesrgan_bin = get_realesrgan_path()
-            if not realesrgan_bin:
-                logger.error("Real-ESRGAN binary not found")
-                return False
+        # Step 2: Upscale frames with Real-ESRGAN (runs regardless of extraction)
+        # Get Real-ESRGAN binary path
+        realesrgan_bin = get_realesrgan_path()
+        if not realesrgan_bin:
+            logger.error("Real-ESRGAN binary not found")
+            return False
 
-            # Use model from instance or default to realesrgan-x4plus
-            model_name = getattr(self, '_realesrgan_model', 'realesrgan-x4plus')
+        # Use model from instance or default to RealESRGAN_General_x4_v3
+        model_name = getattr(self, '_realesrgan_model', 'RealESRGAN_General_x4_v3')
 
-            # Find models directory
-            home = Path.home()
-            models_dir = home / ".local" / "share" / "realesrgan-ncnn-vulkan" / "models"
-            if not models_dir.exists():
-                # Check next to binary
-                bin_path = Path(realesrgan_bin).parent
-                models_dir = bin_path / "models"
+        if progress_callback:
+            progress_callback(f"📁 Work: {work_dir}", 0.21)
+            progress_callback(f"🤖 Model: {model_name} | Frames: {total_frames}", 0.22)
+            progress_callback(f"📷 Original: {frames_dir}/frame_000001.png", 0.22)
+            progress_callback(f"✨ Upscaled: {upscaled_dir}/frame_000001.jpg", 0.22)
 
-            upscale_cmd = [
-                realesrgan_bin,
-                "-i", str(frames_dir),
-                "-o", str(upscaled_dir),
-                "-n", model_name,
-                "-f", "png",
-            ]
+        # Find models directory
+        home = Path.home()
+        models_dir = home / ".local" / "share" / "realesrgan-ncnn-vulkan" / "models"
+        if not models_dir.exists():
+            # Check next to binary
+            bin_path = Path(realesrgan_bin).parent
+            models_dir = bin_path / "models"
 
-            # Add models path if it exists
-            if models_dir.exists():
-                upscale_cmd.extend(["-m", str(models_dir)])
+        upscale_cmd = [
+            realesrgan_bin,
+            "-i", str(frames_dir),
+            "-o", str(upscaled_dir),
+            "-n", model_name,
+            "-f", "jpg",  # JPEG is ~10x smaller/faster than PNG (3-5MB vs 43MB per frame)
+            "-j", "4:4:4",  # Parallel: 4 threads for load, 4 for process, 4 for save
+        ]
 
-            logger.info(f"Running Real-ESRGAN: {' '.join(upscale_cmd)}")
-            result = subprocess.run(upscale_cmd, capture_output=True, text=True, timeout=7200)
-            if result.returncode != 0:
-                logger.error(f"Real-ESRGAN failed: {result.stderr}")
-                return False
+        # Add models path if it exists
+        if models_dir.exists():
+            upscale_cmd.extend(["-m", str(models_dir)])
 
-            # Step 3: Get original video info (fps)
-            probe_cmd = [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=r_frame_rate",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(input_path),
-            ]
-            result = subprocess.run(probe_cmd, capture_output=True, text=True)
-            fps = result.stdout.strip() if result.returncode == 0 else "30"
+        logger.info(f"Running Real-ESRGAN: {' '.join(upscale_cmd)}")
 
-            # Step 4: Reassemble video at target resolution
-            if progress_callback:
-                progress_callback("Reassembling video...", 0.8)
+        # Run upscaling in background and monitor progress
+        process = subprocess.Popen(
+            upscale_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
 
-            reassemble_cmd = [
-                "ffmpeg", "-y",
-                "-framerate", fps,
-                "-i", str(upscaled_dir / "frame_%06d.png"),
-                "-vf", f"scale={target_width}:{target_height}:flags=lanczos",
-                "-c:v", "libx264",
-                "-preset", "slow",
-                "-crf", "18",
-                "-pix_fmt", "yuv420p",
-            ]
+        # Monitor upscaling progress
+        start_time = time.time()
+        if progress_callback:
+            while process.poll() is None:
+                upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+                if upscaled_count > 0 and total_frames > 0:
+                    # Calculate ETA
+                    elapsed = time.time() - start_time
+                    time_per_frame = elapsed / upscaled_count
+                    remaining = time_per_frame * (total_frames - upscaled_count)
 
-            if preserve_audio:
-                # Add audio from original
-                reassemble_cmd.extend([
-                    "-i", str(input_path),
-                    "-map", "0:v", "-map", "1:a",
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-shortest",
-                ])
-            else:
-                reassemble_cmd.extend(["-an"])
+                    if remaining < 60:
+                        eta = f"{int(remaining)}s"
+                    elif remaining < 3600:
+                        eta = f"{int(remaining/60)}m {int(remaining%60)}s"
+                    else:
+                        eta = f"{int(remaining/3600)}h {int((remaining%3600)/60)}m"
 
-            reassemble_cmd.append(str(output_path))
+                    upscale_progress = 0.22 + (0.58 * upscaled_count / total_frames)
+                    progress_callback(
+                        f"Upscaling: {upscaled_count}/{total_frames} (ETA: {eta})",
+                        min(0.80, upscale_progress)
+                    )
+                time.sleep(1.0)
 
-            result = subprocess.run(reassemble_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                logger.error(f"Video reassembly failed: {result.stderr}")
-                return False
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            logger.error(f"Real-ESRGAN failed: {stderr}")
+            return False
 
-            return output_path.exists()
+        upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+        logger.info(f"Upscaled {upscaled_count} frames")
+
+        # Step 3: Get original video info (fps)
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(input_path),
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        fps = result.stdout.strip() if result.returncode == 0 else "30"
+
+        # Step 4: Reassemble video at target resolution
+        if progress_callback:
+            progress_callback("Reassembling video...", 0.8)
+
+        reassemble_cmd = [
+            "ffmpeg", "-y",
+            "-framerate", fps,
+            "-i", str(upscaled_dir / "frame_%06d.jpg"),
+            "-vf", f"scale={target_width}:{target_height}:flags=lanczos",
+            "-c:v", "libx264",
+            "-preset", "slow",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+        ]
+
+        if preserve_audio:
+            # Add audio from original
+            reassemble_cmd.extend([
+                "-i", str(input_path),
+                "-map", "0:v", "-map", "1:a",
+                "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+            ])
+        else:
+            reassemble_cmd.extend(["-an"])
+
+        reassemble_cmd.append(str(output_path))
+
+        result = subprocess.run(reassemble_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.error(f"Video reassembly failed: {result.stderr}")
+            return False
+
+        return output_path.exists()
 
     def get_video_resolution(self, video_path: Path) -> tuple[int, int]:
         """Get the current resolution of a video."""

@@ -1322,29 +1322,29 @@ def render_upscale_only_page(state) -> None:
             method_options = []
             method_map = {}  # Display name -> method key
 
-            # Core ML is FASTEST on Apple Silicon (uses Neural Engine)
-            if coreml_available:
-                method_options.append("Core ML Neural Engine (Fastest - Mac)")
-                method_map["Core ML Neural Engine (Fastest - Mac)"] = "coreml_realesrgan"
+            # Real-ESRGAN ncnn-vulkan is most stable and uses GPU via Vulkan
+            if realesrgan_available:
+                method_options.append("Real-ESRGAN Vulkan GPU (Recommended)")
+                method_map["Real-ESRGAN Vulkan GPU (Recommended)"] = "realesrgan"
 
-            # MPS Real-ESRGAN is second best for Apple Silicon (uses GPU)
+            # Core ML uses Neural Engine (experimental)
+            if coreml_available:
+                method_options.append("Core ML Neural Engine (Experimental)")
+                method_map["Core ML Neural Engine (Experimental)"] = "coreml_realesrgan"
+
+            # MPS Real-ESRGAN uses GPU via PyTorch
             if mps_available:
                 method_options.append("Real-ESRGAN MPS (GPU - Slower)")
                 method_map["Real-ESRGAN MPS (GPU - Slower)"] = "mps_realesrgan"
 
             # FFmpeg is always available as fallback
-            method_options.append("FFmpeg Lanczos (Fast, Universal)")
-            method_map["FFmpeg Lanczos (Fast, Universal)"] = "ffmpeg"
+            method_options.append("FFmpeg Lanczos (Fast, No AI)")
+            method_map["FFmpeg Lanczos (Fast, No AI)"] = "ffmpeg"
 
             # MetalFX is fast but doesn't add detail
             if fxupscale_available:
                 method_options.append("MetalFX (Fast, No Detail Enhancement)")
                 method_map["MetalFX (Fast, No Detail Enhancement)"] = "fxupscale"
-
-            # Other AI options (may have issues)
-            if realesrgan_available:
-                method_options.append("Real-ESRGAN ncnn (May crash on M1/M2)")
-                method_map["Real-ESRGAN ncnn (May crash on M1/M2)"] = "realesrgan"
 
             if video2x_available:
                 method_options.append("Video2X AI (Requires Docker)")
@@ -1359,26 +1359,25 @@ def render_upscale_only_page(state) -> None:
             selected_method = method_map.get(selected_method_display, "ffmpeg")
 
             # Show info for selected method
-            if "Core ML" in selected_method_display:
+            if "Vulkan" in selected_method_display:
                 st.success(
-                    "**Core ML Neural Engine:** ~10x FASTER than GPU. "
-                    "Uses Apple's dedicated Neural Engine for AI upscaling. "
-                    "Converts model on first use (~1 min), then blazing fast."
+                    "**Real-ESRGAN Vulkan:** Uses GPU via Vulkan (MoltenVK on Mac). "
+                    "Stable, well-tested. Processes entire folder in one command."
+                )
+            elif "Core ML" in selected_method_display:
+                st.warning(
+                    "**Core ML Neural Engine:** Experimental. Uses Apple's Neural Engine. "
+                    "May have issues with tile stitching. Vulkan is more reliable."
                 )
             elif "MPS" in selected_method_display:
                 st.info(
-                    "**Real-ESRGAN MPS:** Uses Apple GPU. Slower than Neural Engine. "
-                    "Consider Core ML for better performance."
+                    "**Real-ESRGAN MPS:** Uses Apple GPU via PyTorch. "
+                    "Works but slower than Vulkan. Good fallback option."
                 )
             elif "MetalFX" in selected_method_display:
                 st.info(
                     "**MetalFX:** Fast upscaling but doesn't add detail - "
-                    "just enlarges pixels. Use MPS for quality improvement."
-                )
-            elif "ncnn" in selected_method_display:
-                st.warning(
-                    "**Warning:** Real-ESRGAN ncnn may crash on Apple Silicon. "
-                    "Use MPS version instead for reliable results."
+                    "just enlarges pixels. Use Vulkan for AI enhancement."
                 )
 
         # Advanced settings for MPS upscaling
@@ -1450,34 +1449,40 @@ def render_upscale_only_page(state) -> None:
             model_col1, model_col2 = st.columns([1, 1])
 
             with model_col1:
-                # Built-in models that come with realesrgan-ncnn-vulkan
+                # Models available - faster general-content models listed first
                 model_options = {
-                    "realesrgan-x4plus": "Real-ESRGAN x4+ (General - Best for photos/video)",
-                    "realesrgan-x4plus-anime": "Real-ESRGAN x4+ Anime (Anime images)",
-                    "realesr-animevideov3": "Real-ESRGAN AnimeVideo v3 (Anime video - Fast)",
+                    "RealESRGAN_General_x4_v3": "General v3 (Recommended - 10x faster)",
+                    "4xLSDIRCompactC3": "Compact C3 (Fastest - 16x faster)",
+                    "realesrgan-x4plus": "Real-ESRGAN x4+ (Best quality - Slow)",
+                    "realesrgan-x4plus-anime": "Real-ESRGAN x4+ Anime",
+                    "realesr-animevideov3": "AnimeVideo v3 (For anime - Fast)",
                 }
 
                 selected_model_display = st.selectbox(
                     "Upscaling Model",
                     options=list(model_options.values()),
-                    index=0,  # Default to general-purpose
+                    index=0,  # Default to General v3 (fastest for cinematic)
                     key="upscale_only_model",
                 )
 
                 # Reverse lookup to get model key
                 selected_model = next(
                     (k for k, v in model_options.items() if v == selected_model_display),
-                    "realesrgan-x4plus"
+                    "RealESRGAN_General_x4_v3"
                 )
 
             with model_col2:
                 # Show model info based on selection
-                if "animevideo" in selected_model.lower():
-                    st.info("**Fast** - Optimized for anime video. Lightweight model with good speed.")
+                if selected_model == "RealESRGAN_General_x4_v3":
+                    st.success("**Recommended** - 10x faster than x4+, designed for cinematic/general content.")
+                elif selected_model == "4xLSDIRCompactC3":
+                    st.info("**Fastest** - 16x faster, compact architecture. Slightly lower quality.")
+                elif "animevideo" in selected_model.lower():
+                    st.info("**Anime** - Optimized for anime video. Lightweight and fast.")
                 elif "anime" in selected_model.lower():
-                    st.info("**Anime** - Sharper lines and vibrant colors for anime/cartoon content.")
-                else:
-                    st.info("**General** - Best for real-world photos and video. Highest quality.")
+                    st.info("**Anime** - Sharper lines for anime/cartoon content.")
+                elif selected_model == "realesrgan-x4plus":
+                    st.warning("**Slow** - Best quality but takes 10x longer than General v3.")
 
         # Map resolution selection to value
         resolution_map = {
@@ -1516,19 +1521,115 @@ def render_upscale_only_page(state) -> None:
 
         st.caption("Click Stop to cancel - progress is saved and you can resume later")
 
+        # ===== PERSISTENT PREVIEW SECTION =====
+        # Show preview outside the start_clicked block so it persists during button clicks
+        if "upscale_work_dir" in st.session_state and st.session_state["upscale_work_dir"]:
+            from pathlib import Path
+            work_dir = Path(st.session_state["upscale_work_dir"])
+            if work_dir.exists():
+                st.markdown("### Live Preview (Before / After)")
+
+                # Frame selector - use auto_latest flag
+                if "preview_auto_latest" not in st.session_state:
+                    st.session_state["preview_auto_latest"] = True
+                if "preview_frame_num" not in st.session_state:
+                    st.session_state["preview_frame_num"] = 1
+
+                frame_col1, frame_col2, frame_col3, frame_col4 = st.columns([2, 1, 1, 1])
+                with frame_col1:
+                    if not st.session_state["preview_auto_latest"]:
+                        # Get max frame count for validation
+                        upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
+                        max_frame = len(upscaled_frames) if upscaled_frames else 1
+                        selected_frame = st.number_input(
+                            "Frame #",
+                            min_value=1,
+                            max_value=max(1, max_frame),
+                            value=min(st.session_state["preview_frame_num"], max(1, max_frame)),
+                            step=100,
+                            key="frame_selector_input",
+                            help=f"Enter frame number (1-{max_frame})"
+                        )
+                        st.session_state["preview_frame_num"] = selected_frame
+                    else:
+                        st.info("🔄 Auto: showing latest upscaled frame")
+                with frame_col2:
+                    if st.button("⏮ First", key="first_frame"):
+                        st.session_state["preview_auto_latest"] = False
+                        st.session_state["preview_frame_num"] = 1
+                with frame_col3:
+                    if st.button("⏭ Latest", key="latest_frame"):
+                        st.session_state["preview_auto_latest"] = True
+                with frame_col4:
+                    if st.button("📝 Manual", key="manual_frame"):
+                        st.session_state["preview_auto_latest"] = False
+
+                # Show preview images
+                preview_cols = st.columns(2)
+                upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
+                if upscaled_frames:
+                    # Determine which frame to show
+                    if st.session_state["preview_auto_latest"]:
+                        frame_path = upscaled_frames[-1]
+                        frame_num = int(frame_path.stem.split("_")[-1])
+                    else:
+                        frame_num = st.session_state["preview_frame_num"]
+                        frame_path = work_dir / "upscaled" / f"frame_{frame_num:06d}.jpg"
+                        if not frame_path.exists():
+                            # Fall back to latest
+                            frame_path = upscaled_frames[-1]
+                            frame_num = int(frame_path.stem.split("_")[-1])
+
+                    orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
+
+                    with preview_cols[0]:
+                        st.caption("Original (1080p)")
+                        if orig_frame.exists():
+                            st.image(str(orig_frame), use_container_width=True)
+                    with preview_cols[1]:
+                        st.caption("Upscaled (4K)")
+                        if frame_path.exists():
+                            st.image(str(frame_path), use_container_width=True)
+
+                    st.caption(f"Frame {frame_num} of {len(upscaled_frames)} upscaled")
+                else:
+                    with preview_cols[0]:
+                        st.caption("Original (1080p)")
+                        st.info("Waiting for frames...")
+                    with preview_cols[1]:
+                        st.caption("Upscaled (4K)")
+                        st.info("Upscaling in progress...")
+
         if start_clicked:
             st.session_state.upscaling_in_progress = True
-            # Save uploaded file temporarily
+            # Save uploaded file (with deduplication)
             config.ensure_directories()
             upload_dir = config.output_dir / "uploads"
             upload_dir.mkdir(parents=True, exist_ok=True)
 
+            # Calculate content hash to avoid duplicate uploads
+            import hashlib
+            video_bytes = uploaded_video.getvalue()
+            hasher = hashlib.md5()
+            hasher.update(str(len(video_bytes)).encode())
+            hasher.update(video_bytes[:1024*1024])  # First 1MB
+            content_hash = hasher.hexdigest()[:12]
+
+            # Check if file with same content already exists
+            input_path = None
+            for existing in upload_dir.glob("upscale_input_*.mp4"):
+                if content_hash in str(existing):
+                    input_path = existing
+                    st.info(f"Reusing existing upload: {existing.name}")
+                    break
+
+            # Save if not found
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            input_path = upload_dir / f"upscale_input_{timestamp}_{uploaded_video.name}"
-
-            with open(input_path, "wb") as f:
-                f.write(uploaded_video.getvalue())
+            if input_path is None:
+                input_path = upload_dir / f"upscale_input_{timestamp}_{content_hash}_{uploaded_video.name}"
+                with open(input_path, "wb") as f:
+                    f.write(video_bytes)
 
             # Output path
             output_name = f"upscaled_{target_res}_{timestamp}_{Path(uploaded_video.name).stem}.mp4"
@@ -1538,9 +1639,104 @@ def render_upscale_only_page(state) -> None:
             progress_bar = st.progress(0, text="Starting upscaling...")
             status_text = st.empty()
 
+            # Live preview section
+            st.markdown("### Live Preview (Before / After)")
+
+            # Frame selector - use auto_latest flag to avoid min_value conflict
+            if "preview_auto_latest" not in st.session_state:
+                st.session_state["preview_auto_latest"] = True  # Start in auto mode
+            if "preview_frame_num" not in st.session_state:
+                st.session_state["preview_frame_num"] = 1
+
+            frame_col1, frame_col2, frame_col3, frame_col4 = st.columns([2, 1, 1, 1])
+            with frame_col1:
+                # Only show number input if NOT in auto mode
+                if not st.session_state["preview_auto_latest"]:
+                    selected_frame = st.number_input(
+                        "Frame #",
+                        min_value=1,
+                        value=st.session_state["preview_frame_num"],
+                        step=100,
+                        key="frame_selector_input",
+                        help="Enter frame number to preview"
+                    )
+                    st.session_state["preview_frame_num"] = selected_frame
+                else:
+                    st.info("🔄 Auto: showing latest upscaled frame")
+            with frame_col2:
+                if st.button("⏮ First", key="first_frame"):
+                    st.session_state["preview_auto_latest"] = False
+                    st.session_state["preview_frame_num"] = 1
+                    st.rerun()
+            with frame_col3:
+                if st.button("⏭ Latest", key="latest_frame"):
+                    st.session_state["preview_auto_latest"] = True
+                    st.rerun()
+            with frame_col4:
+                if st.button("📝 Manual", key="manual_frame"):
+                    st.session_state["preview_auto_latest"] = False
+                    st.rerun()
+
+            preview_cols = st.columns(2)
+            with preview_cols[0]:
+                st.caption("Original (1080p)")
+                original_preview = st.empty()
+            with preview_cols[1]:
+                st.caption("Upscaled (4K)")
+                upscaled_preview = st.empty()
+            frame_info = st.empty()
+
+            # Store work_dir for preview updates
+            work_dir_holder = {"path": None, "last_check": 0, "frame_num": 1, "max_upscaled": 0}
+
             def progress_callback(message: str, progress: float):
+                import time
                 progress_bar.progress(progress, text=message)
                 status_text.text(message)
+
+                # Extract work directory from progress message
+                if "Work:" in message:
+                    work_dir_holder["path"] = message.split("Work:")[-1].strip()
+
+                # Update preview during upscaling
+                if work_dir_holder["path"] and progress >= 0.22:
+                    current_time = time.time()
+                    if current_time - work_dir_holder["last_check"] > 2:  # Update every 2 seconds
+                        work_dir_holder["last_check"] = current_time
+                        from pathlib import Path
+                        work_dir = Path(work_dir_holder["path"])
+
+                        # Count upscaled frames
+                        upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
+                        if upscaled_frames:
+                            work_dir_holder["max_upscaled"] = len(upscaled_frames)
+
+                            # Use selected frame or latest if auto mode
+                            auto_latest = st.session_state.get("preview_auto_latest", True)
+                            user_frame = st.session_state.get("preview_frame_num", 1)
+                            if auto_latest or user_frame > work_dir_holder["max_upscaled"]:
+                                # Show latest
+                                latest_frame = upscaled_frames[-1]
+                                frame_num = int(latest_frame.stem.split("_")[-1])
+                            else:
+                                # Show user-selected frame
+                                frame_num = user_frame
+                                target_frame = work_dir / "upscaled" / f"frame_{frame_num:06d}.jpg"
+                                if not target_frame.exists():
+                                    # Fall back to latest if selected frame not yet upscaled
+                                    latest_frame = upscaled_frames[-1]
+                                    frame_num = int(latest_frame.stem.split("_")[-1])
+
+                            work_dir_holder["frame_num"] = frame_num
+                            orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
+                            up_frame = work_dir / "upscaled" / f"frame_{frame_num:06d}.jpg"
+
+                            frame_info.caption(f"Frame {frame_num} | {work_dir_holder['max_upscaled']} upscaled so far")
+
+                            if orig_frame.exists():
+                                original_preview.image(str(orig_frame), use_container_width=True)
+                            if up_frame.exists():
+                                upscaled_preview.image(str(up_frame), use_container_width=True)
 
             try:
                 upscaler = VideoUpscaler()
@@ -3536,23 +3732,24 @@ def _render_upscale_section(state) -> None:
     methods_available = []
     method_labels = {}
 
-    # Core ML is FASTEST on Apple Silicon (uses Neural Engine)
+    # Real-ESRGAN ncnn-vulkan is most stable and uses GPU via Vulkan
+    if check_realesrgan_available():
+        methods_available.append("realesrgan")
+        method_labels["realesrgan"] = "Real-ESRGAN Vulkan GPU (Recommended)"
+    # Core ML uses Neural Engine (experimental)
     if check_coreml_available():
         methods_available.append("coreml_realesrgan")
-        method_labels["coreml_realesrgan"] = "Core ML Neural Engine (FASTEST - Mac)"
-    # MPS is second best on Apple Silicon
+        method_labels["coreml_realesrgan"] = "Core ML Neural Engine (Experimental)"
+    # MPS is slower but works
     if check_mps_available():
         methods_available.append("mps_realesrgan")
         method_labels["mps_realesrgan"] = "Real-ESRGAN MPS (GPU - Slower)"
     if check_video2x_available():
         methods_available.append("video2x")
         method_labels["video2x"] = "Video2X (AI)"
-    if check_realesrgan_available():
-        methods_available.append("realesrgan")
-        method_labels["realesrgan"] = "Real-ESRGAN ncnn"
     if check_ffmpeg_available():
         methods_available.append("ffmpeg")
-        method_labels["ffmpeg"] = "FFmpeg Lanczos (Fast)"
+        method_labels["ffmpeg"] = "FFmpeg Lanczos (Fast, No AI)"
 
     if not methods_available:
         st.warning("No upscaling methods available. Install FFmpeg to enable upscaling.")
@@ -3584,9 +3781,10 @@ def _render_upscale_section(state) -> None:
         Upscale your video to 4K (3840x2160) resolution for maximum quality.
 
         **Methods (best first for Mac):**
-        - **Core ML Neural Engine**: FASTEST on Apple Silicon (~10x faster than GPU)
-        - **MPS Real-ESRGAN**: Good AI upscaling using GPU
-        - **FFmpeg**: Fast lanczos scaling. Acceptable quality.
+        - **Real-ESRGAN Vulkan**: Stable GPU upscaling via Vulkan (recommended)
+        - **Core ML Neural Engine**: Experimental, uses Apple's Neural Engine
+        - **MPS Real-ESRGAN**: Good AI upscaling using GPU (slower)
+        - **FFmpeg**: Fast lanczos scaling, no AI enhancement
         """)
 
         col1, col2 = st.columns(2)
