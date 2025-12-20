@@ -1625,6 +1625,7 @@ def render_upscale_only_page(state) -> None:
 
             # Save if not found
             from datetime import datetime
+            from pathlib import Path
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             if input_path is None:
                 input_path = upload_dir / f"upscale_input_{timestamp}_{content_hash}_{uploaded_video.name}"
