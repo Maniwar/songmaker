@@ -122,6 +122,31 @@ Use FFmpeg zoompan filter with these effect types:
 - Track workflow steps: CONCEPT → LYRICS → UPLOAD → GENERATE → COMPLETE
 - Use `st.status()` for long-running operations with detailed feedback
 
+## Movie Mode
+
+### Workflow
+SCRIPT → CHARACTERS → VOICES → VISUALS → RENDER → COMPLETE
+
+### Key Components
+- **ScriptAgent**: AI-powered screenplay development (like ConceptAgent for songs)
+- **TTSService**: Multi-provider TTS (OpenAI, ElevenLabs, Edge TTS)
+- **MovieImageGenerator**: Scene generation with character consistency
+
+### Character Consistency in Movies
+Include full character descriptions in every scene prompt:
+```python
+for char_id in scene.visible_characters:
+    character = script.get_character(char_id)
+    prompt += f"{character.name}: {character.description}"
+```
+
+### TTS Providers
+| Provider | Quality | Cost | Notes |
+|----------|---------|------|-------|
+| ElevenLabs | Best | $5+/mo | Most natural voices |
+| OpenAI | Good | Pay-per-use | Uses existing API key |
+| Edge TTS | OK | Free | Microsoft Azure voices |
+
 ## System Requirements
 
 - Python 3.11+
