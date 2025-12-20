@@ -1522,8 +1522,9 @@ def render_upscale_only_page(state) -> None:
         st.caption("Click Stop to cancel - progress is saved and you can resume later")
 
         # ===== PERSISTENT PREVIEW SECTION =====
-        # Show preview outside the start_clicked block so it persists during button clicks
-        if "upscale_work_dir" in st.session_state and st.session_state["upscale_work_dir"]:
+        # Show preview when NOT actively upscaling (for frame browsing between runs)
+        if (not st.session_state.get("upscaling_in_progress", False) and
+            "upscale_work_dir" in st.session_state and st.session_state["upscale_work_dir"]):
             from pathlib import Path
             work_dir = Path(st.session_state["upscale_work_dir"])
             if work_dir.exists():
@@ -1640,14 +1641,48 @@ def render_upscale_only_page(state) -> None:
             progress_bar = st.progress(0, text="Starting upscaling...")
             status_text = st.empty()
 
+            # Live preview during upscaling
+            st.markdown("### Live Preview (Before / After)")
+            preview_cols = st.columns(2)
+            with preview_cols[0]:
+                st.caption("Original (1080p)")
+                original_preview = st.empty()
+            with preview_cols[1]:
+                st.caption("Upscaled (4K)")
+                upscaled_preview = st.empty()
+            frame_info = st.empty()
+
+            # Track state for live updates
+            live_state = {"work_dir": None, "last_update": 0}
+
             def progress_callback(message: str, progress: float):
+                import time
                 progress_bar.progress(progress, text=message)
                 status_text.text(message)
 
-                # Extract work directory and store in session state for persistent preview
+                # Extract work directory and store in session state
                 if "Work:" in message:
                     work_dir_path = message.split("Work:")[-1].strip()
+                    live_state["work_dir"] = work_dir_path
                     st.session_state["upscale_work_dir"] = work_dir_path
+
+                # Update live preview every 2 seconds
+                if live_state["work_dir"] and progress >= 0.22:
+                    current_time = time.time()
+                    if current_time - live_state["last_update"] > 2:
+                        live_state["last_update"] = current_time
+                        work_dir = Path(live_state["work_dir"])
+                        upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
+                        if upscaled_frames:
+                            # Show latest frame
+                            latest = upscaled_frames[-1]
+                            frame_num = int(latest.stem.split("_")[-1])
+                            orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
+
+                            if orig_frame.exists():
+                                original_preview.image(str(orig_frame), use_container_width=True)
+                            upscaled_preview.image(str(latest), use_container_width=True)
+                            frame_info.caption(f"Frame {frame_num} | {len(upscaled_frames)} upscaled")
 
             try:
                 upscaler = VideoUpscaler()
