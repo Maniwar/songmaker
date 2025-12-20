@@ -10,7 +10,9 @@ Performance optimizations:
 - Memory management: Clear MPS cache periodically to prevent buildup
 """
 
+import hashlib
 import logging
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -57,6 +59,89 @@ MODEL_URLS = {
 
 # Cache directory for models
 MODELS_DIR = Path.home() / ".cache" / "songmaker" / "models"
+
+# Global model cache to avoid reloading between upscale jobs
+_model_cache: dict[str, tuple] = {}  # model_name -> (model, device)
+
+# Work directory base for resume capability
+WORK_DIR_BASE = Path.home() / ".cache" / "songmaker" / "upscale_work"
+
+
+def get_video_content_hash(video_path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
+    """Generate a hash based on video file content for resume detection.
+
+    Hashes the first 4MB + last 4MB + file size for speed while still
+    being unique enough to identify the same video file.
+
+    Args:
+        video_path: Path to the video file
+        chunk_size: Size of chunks to hash (default 4MB)
+
+    Returns:
+        8-character hex hash string
+    """
+    hasher = hashlib.md5()
+    file_size = video_path.stat().st_size
+
+    # Include file size in hash
+    hasher.update(str(file_size).encode())
+
+    with open(video_path, 'rb') as f:
+        # Hash first chunk
+        hasher.update(f.read(chunk_size))
+
+        # Hash last chunk if file is large enough
+        if file_size > chunk_size * 2:
+            f.seek(-chunk_size, 2)  # Seek from end
+            hasher.update(f.read(chunk_size))
+
+    return hasher.hexdigest()[:8]
+
+
+def find_existing_work_dir(video_path: Path) -> Optional[Path]:
+    """Find an existing work directory for the same video content.
+
+    Args:
+        video_path: Path to the video file
+
+    Returns:
+        Path to existing work directory, or None if not found
+    """
+    content_hash = get_video_content_hash(video_path)
+    WORK_DIR_BASE.mkdir(parents=True, exist_ok=True)
+
+    # Look for work directories with matching hash
+    for work_dir in WORK_DIR_BASE.glob(f"upscale_{content_hash}_*"):
+        if work_dir.is_dir():
+            frames_dir = work_dir / "frames"
+            if frames_dir.exists() and any(frames_dir.glob("*.png")):
+                logger.info(f"Found existing work directory: {work_dir}")
+                return work_dir
+
+    return None
+
+
+def get_work_dir(video_path: Path) -> Path:
+    """Get or create a work directory for the video based on content hash.
+
+    Args:
+        video_path: Path to the video file
+
+    Returns:
+        Path to the work directory
+    """
+    # Check for existing work directory first
+    existing = find_existing_work_dir(video_path)
+    if existing:
+        return existing
+
+    # Create new work directory with content hash
+    content_hash = get_video_content_hash(video_path)
+    timestamp = int(time.time())
+    work_dir = WORK_DIR_BASE / f"upscale_{content_hash}_{timestamp}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Created new work directory: {work_dir}")
+    return work_dir
 
 
 def get_device() -> torch.device:
@@ -199,8 +284,20 @@ class MPSUpscaler:
         )
 
     def load_model(self, progress_callback: Optional[Callable[[str, float], None]] = None):
-        """Load the model weights."""
+        """Load the model weights with optimizations.
+
+        Uses global cache to avoid reloading between upscale jobs.
+        """
         if self.model is not None:
+            return
+
+        # Check global cache first
+        cache_key = f"{self.model_name}_{self.device.type}"
+        if cache_key in _model_cache:
+            self.model = _model_cache[cache_key]
+            logger.info(f"Loaded model from cache: {cache_key}")
+            if progress_callback:
+                progress_callback("AI model loaded from cache", 0.2)
             return
 
         model_path = download_model(self.model_name, progress_callback)
@@ -224,7 +321,22 @@ class MPSUpscaler:
         self.model.eval()
         self.model.to(self.device)
 
-        logger.info(f"Model loaded on {self.device}")
+        # Optimization: Use channels_last memory format for better performance
+        if self.device.type in ("mps", "cuda"):
+            self.model = self.model.to(memory_format=torch.channels_last)
+            logger.info("Applied channels_last memory optimization")
+
+        # Optimization: Try to compile model for faster inference (PyTorch 2.0+)
+        if hasattr(torch, 'compile') and self.device.type == "cuda":
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                logger.info("Applied torch.compile optimization")
+            except Exception as e:
+                logger.debug(f"torch.compile not available: {e}")
+
+        # Cache the model globally
+        _model_cache[cache_key] = self.model
+        logger.info(f"Model loaded and cached on {self.device}")
 
     def upscale_image(self, img: np.ndarray) -> np.ndarray:
         """Upscale a single image.
@@ -380,13 +492,16 @@ class MPSUpscaler:
         input_path: Path,
         output_path: Path,
         progress_callback: Optional[Callable[[str, float], None]] = None,
+        work_dir: Optional[Path] = None,
     ) -> bool:
-        """Upscale a video file.
+        """Upscale a video file with resume support.
 
         Args:
             input_path: Path to input video
             output_path: Path for output video
             progress_callback: Optional progress callback
+            work_dir: Optional persistent work directory for resume capability.
+                     If None, creates one based on input filename in output dir.
 
         Returns:
             True if successful, False if failed or cancelled
@@ -396,38 +511,218 @@ class MPSUpscaler:
 
         self.load_model(progress_callback)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir_path = Path(tmpdir)
-            frames_dir = tmpdir_path / "frames"
-            upscaled_dir = tmpdir_path / "upscaled"
-            frames_dir.mkdir()
-            upscaled_dir.mkdir()
-
-            # Extract frames
+        # Create persistent work directory for resume capability using content hash
+        # This allows resuming even if the video is uploaded again with a different name
+        if work_dir is None:
+            work_dir = get_work_dir(input_path)
             if progress_callback:
-                progress_callback("Extracting frames...", 0.1)
+                # Check if this is a resume
+                frames_dir_check = work_dir / "frames"
+                if frames_dir_check.exists() and any(frames_dir_check.glob("*.png")):
+                    progress_callback("Found existing progress, resuming...", 0.1)
 
-            extract_cmd = [
-                "ffmpeg", "-y", "-i", str(input_path),
-                "-qscale:v", "2",
-                str(frames_dir / "frame_%06d.png"),
-            ]
-            result = subprocess.run(extract_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                logger.error(f"Frame extraction failed: {result.stderr}")
-                return False
+        frames_dir = work_dir / "frames"
+        upscaled_dir = work_dir / "upscaled"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        upscaled_dir.mkdir(parents=True, exist_ok=True)
 
-            # Get frame count
-            frames = sorted(frames_dir.glob("*.png"))
-            total_frames = len(frames)
+        # Get expected frame count from video for progress tracking
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-count_frames",
+            "-show_entries", "stream=nb_read_frames",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(input_path),
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        expected_frames = int(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip().isdigit() else 0
 
-            if total_frames == 0:
-                logger.error("No frames extracted")
-                return False
+        # Check if frames already extracted (for resume)
+        existing_frames = sorted(frames_dir.glob("*.png"))
+        extraction_complete = len(existing_frames) >= expected_frames if expected_frames > 0 else False
 
+        if extraction_complete:
+            if progress_callback:
+                progress_callback(f"Found {len(existing_frames)} extracted frames, skipping extraction...", 0.1)
+            logger.info(f"Resuming: all {len(existing_frames)} frames already extracted")
+        else:
+            # Check if FFmpeg extraction is already running for this video
+            ffmpeg_running = False
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", f"ffmpeg.*{frames_dir.name}"],
+                    capture_output=True, text=True
+                )
+                ffmpeg_running = result.returncode == 0
+            except Exception:
+                pass
+
+            if ffmpeg_running and existing_frames:
+                # FFmpeg is already extracting - just monitor progress
+                if progress_callback:
+                    progress_callback(f"Extraction in progress ({len(existing_frames)} frames so far)...", 0.05)
+                logger.info(f"Found running extraction, monitoring progress...")
+
+                start_time = time.time()
+                last_count = len(existing_frames)
+                while True:
+                    # Check for cancellation
+                    if is_cancelled():
+                        logger.info("Extraction monitoring cancelled")
+                        return False
+
+                    current_count = len(list(frames_dir.glob("*.png")))
+
+                    # Check if extraction is complete
+                    if expected_frames > 0 and current_count >= expected_frames:
+                        logger.info("Extraction complete!")
+                        break
+
+                    # Check if FFmpeg is still running
+                    result = subprocess.run(
+                        ["pgrep", "-f", f"ffmpeg.*{frames_dir.name}"],
+                        capture_output=True, text=True
+                    )
+                    if result.returncode != 0:
+                        # FFmpeg finished
+                        logger.info("FFmpeg extraction finished")
+                        break
+
+                    # Update progress
+                    if current_count != last_count:
+                        last_count = current_count
+                        if expected_frames > 0:
+                            pct = current_count / expected_frames
+                            elapsed = time.time() - start_time
+                            if current_count > 0:
+                                eta_seconds = (elapsed / current_count) * (expected_frames - current_count)
+                                eta_str = format_eta(eta_seconds)
+                            else:
+                                eta_str = "calculating..."
+                            if progress_callback:
+                                progress_callback(
+                                    f"Extracting frames: {current_count}/{expected_frames} ({pct*100:.1f}%) - ETA: {eta_str}",
+                                    0.05 + (0.1 * pct)
+                                )
+                    time.sleep(0.5)
+            else:
+                # Need to start fresh extraction
+                if existing_frames:
+                    # Partial extraction with no running FFmpeg - clear and restart
+                    if progress_callback:
+                        progress_callback(f"Found {len(existing_frames)} partial frames, re-extracting...", 0.05)
+                    logger.info(f"Partial extraction found ({len(existing_frames)} frames), restarting...")
+                    for f in existing_frames:
+                        f.unlink()
+
+                if progress_callback:
+                    progress_callback("Extracting frames (hardware accelerated)...", 0.05)
+
+                # Use VideoToolbox hardware decoding on macOS for faster extraction
+                # PNG with compression_level 1 (fast) instead of default 6
+                # Run in background with Popen so we can track progress
+                extract_cmd = [
+                    "ffmpeg", "-y",
+                    "-hwaccel", "videotoolbox",  # Hardware decoding on macOS
+                    "-i", str(input_path),
+                    "-compression_level", "1",  # Fast PNG compression (0-9, 0=none, 1=fast)
+                    "-threads", "0",  # Use all available CPU threads for encoding
+                    str(frames_dir / "frame_%06d.png"),
+                ]
+
+                # Start extraction in background
+                process = subprocess.Popen(
+                    extract_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+                # Track progress while extraction runs
+                last_count = 0
+                start_time = time.time()
+                while process.poll() is None:
+                    # Check for cancellation
+                    if is_cancelled():
+                        process.terminate()
+                        process.wait()
+                        logger.info("Frame extraction cancelled by user")
+                        if progress_callback:
+                            progress_callback("Extraction cancelled", 0.0)
+                        return False
+
+                    current_count = len(list(frames_dir.glob("*.png")))
+                    if current_count != last_count:
+                        last_count = current_count
+                        if expected_frames > 0:
+                            pct = current_count / expected_frames
+                            elapsed = time.time() - start_time
+                            if current_count > 0:
+                                eta_seconds = (elapsed / current_count) * (expected_frames - current_count)
+                                eta_str = format_eta(eta_seconds)
+                            else:
+                                eta_str = "calculating..."
+                            if progress_callback:
+                                # Extraction is 0-15% of total progress
+                                progress_callback(
+                                    f"Extracting frames: {current_count}/{expected_frames} ({pct*100:.1f}%) - ETA: {eta_str}",
+                                    0.05 + (0.1 * pct)
+                                )
+                    time.sleep(0.5)
+
+                # Check if extraction succeeded
+                if process.returncode != 0:
+                    logger.warning("Hardware decoding failed, falling back to software")
+                    # Fallback to software decoding
+                    extract_cmd = [
+                        "ffmpeg", "-y", "-i", str(input_path),
+                        "-compression_level", "1",  # Fast PNG compression
+                        "-threads", "0",
+                        str(frames_dir / "frame_%06d.png"),
+                    ]
+                    process = subprocess.Popen(extract_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    while process.poll() is None:
+                        if is_cancelled():
+                            process.terminate()
+                            process.wait()
+                            return False
+                        current_count = len(list(frames_dir.glob("*.png")))
+                        if progress_callback and expected_frames > 0:
+                            pct = current_count / expected_frames
+                            progress_callback(f"Extracting frames: {current_count}/{expected_frames}", 0.05 + (0.1 * pct))
+                        time.sleep(0.5)
+
+                    if process.returncode != 0:
+                        logger.error("Frame extraction failed")
+                        return False
+
+        # Get frame count
+        frames = sorted(frames_dir.glob("*.png"))
+        total_frames = len(frames)
+
+        if total_frames == 0:
+            logger.error("No frames extracted")
+            return False
+
+        # Check which frames are already upscaled (for resume)
+        existing_upscaled = set(f.name for f in upscaled_dir.glob("*.png"))
+        frames_to_process = [f for f in frames if f.name not in existing_upscaled]
+        already_done = total_frames - len(frames_to_process)
+
+        if already_done > 0:
+            logger.info(f"Resuming: {already_done}/{total_frames} frames already upscaled, {len(frames_to_process)} remaining")
+            if progress_callback:
+                progress_callback(f"Resuming: {already_done}/{total_frames} frames done, {len(frames_to_process)} to go...", 0.15)
+
+        if len(frames_to_process) == 0:
+            logger.info("All frames already upscaled, skipping to reassembly")
+            if progress_callback:
+                progress_callback("All frames done, reassembling video...", 0.85)
+        else:
             # Use configured batch size
             batch_size = self.batch_size
-            logger.info(f"Upscaling {total_frames} frames with AI on {self.device} (batch_size={batch_size})...")
+            logger.info(f"Upscaling {len(frames_to_process)} frames with AI on {self.device} (batch_size={batch_size})...")
 
             # Track timing for ETA calculation
             start_time = time.time()
@@ -441,36 +736,37 @@ class MPSUpscaler:
 
             def save_frame(data: tuple[Path, np.ndarray]) -> None:
                 """Save a frame in a worker thread."""
-                output_path, img = data
-                Image.fromarray(img).save(output_path)
+                out_path, img = data
+                Image.fromarray(img).save(out_path)
 
             # Process frames in batches with parallel I/O
             with ThreadPoolExecutor(max_workers=IO_WORKERS) as io_executor:
-                for batch_start in range(0, total_frames, batch_size):
+                for batch_start in range(0, len(frames_to_process), batch_size):
                     # Check for cancellation
                     if is_cancelled():
-                        logger.info("Upscaling cancelled by user")
+                        logger.info("Upscaling cancelled by user - progress saved for resume")
                         if progress_callback:
-                            progress_callback("Upscaling cancelled", 0.0)
+                            progress_callback(f"Cancelled - {already_done + frames_processed}/{total_frames} frames saved", 0.0)
                         return False
 
-                    batch_end = min(batch_start + batch_size, total_frames)
-                    batch_frames = frames[batch_start:batch_end]
+                    batch_end = min(batch_start + batch_size, len(frames_to_process))
+                    batch_frames = frames_to_process[batch_start:batch_end]
 
                     # Calculate ETA
                     elapsed = time.time() - start_time
                     if frames_processed > 0:
                         time_per_frame = elapsed / frames_processed
-                        remaining_frames = total_frames - frames_processed
+                        remaining_frames = len(frames_to_process) - frames_processed
                         eta_seconds = time_per_frame * remaining_frames
                         eta_str = format_eta(eta_seconds)
                     else:
                         eta_str = "calculating..."
 
+                    total_done = already_done + frames_processed
                     if progress_callback:
-                        progress = 0.2 + (0.6 * frames_processed / total_frames)
+                        progress = 0.2 + (0.6 * total_done / total_frames)
                         progress_callback(
-                            f"AI upscaling frames {batch_start+1}-{batch_end}/{total_frames} (ETA: {eta_str})",
+                            f"AI upscaling frame {total_done+1}/{total_frames} (ETA: {eta_str})",
                             progress
                         )
 
@@ -504,24 +800,50 @@ class MPSUpscaler:
 
             # Final cancellation check before reassembly
             if is_cancelled():
-                logger.info("Upscaling cancelled by user")
+                logger.info("Upscaling cancelled by user - progress saved")
                 return False
 
-            # Get FPS from original video
+        # Get FPS from original video
+        if progress_callback:
+            progress_callback("Reassembling video...", 0.85)
+
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(input_path),
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        fps = result.stdout.strip() if result.returncode == 0 else "30"
+
+        # Reassemble video with audio using hardware encoding if available
+        # Try VideoToolbox H.264 hardware encoding first (macOS)
+        reassemble_cmd = [
+            "ffmpeg", "-y",
+            "-framerate", fps,
+            "-i", str(upscaled_dir / "frame_%06d.png"),
+            "-i", str(input_path),
+            "-map", "0:v", "-map", "1:a?",
+            "-c:v", "h264_videotoolbox",  # Hardware encoding on macOS
+            "-q:v", "65",  # Quality (1-100, higher is better)
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+            str(output_path),
+        ]
+
+        if progress_callback:
+            progress_callback("Reassembling video (hardware encoding)...", 0.88)
+
+        result = subprocess.run(reassemble_cmd, capture_output=True, text=True)
+
+        # Fallback to software encoding if hardware fails
+        if result.returncode != 0:
+            logger.warning("Hardware encoding failed, falling back to software (libx264)")
             if progress_callback:
-                progress_callback("Reassembling video...", 0.85)
+                progress_callback("Reassembling video (software encoding)...", 0.88)
 
-            probe_cmd = [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=r_frame_rate",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(input_path),
-            ]
-            result = subprocess.run(probe_cmd, capture_output=True, text=True)
-            fps = result.stdout.strip() if result.returncode == 0 else "30"
-
-            # Reassemble video with audio
             reassemble_cmd = [
                 "ffmpeg", "-y",
                 "-framerate", fps,
@@ -529,27 +851,31 @@ class MPSUpscaler:
                 "-i", str(input_path),
                 "-map", "0:v", "-map", "1:a?",
                 "-c:v", "libx264",
-                "-preset", "medium",
+                "-preset", "fast",  # Faster preset for software encoding
                 "-crf", "18",
                 "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "192k",
                 "-shortest",
                 str(output_path),
             ]
-
             result = subprocess.run(reassemble_cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 logger.error(f"Video reassembly failed: {result.stderr}")
                 return False
 
-            # Log total time
-            total_time = time.time() - start_time
-            logger.info(f"Upscaling complete in {format_eta(total_time)}")
+        # Clean up work directory after successful completion
+        try:
+            shutil.rmtree(work_dir)
+            logger.info(f"Cleaned up work directory: {work_dir}")
+        except Exception as e:
+            logger.warning(f"Could not clean up work directory: {e}")
 
-            if progress_callback:
-                progress_callback("AI upscaling complete!", 1.0)
+        logger.info("Upscaling complete!")
 
-            return output_path.exists()
+        if progress_callback:
+            progress_callback("AI upscaling complete!", 1.0)
+
+        return output_path.exists()
 
 
 def check_mps_upscaler_available() -> bool:
