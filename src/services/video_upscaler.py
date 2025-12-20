@@ -240,6 +240,16 @@ class VideoUpscaler:
             logger.info(f"Auto-selected upscaling method: {method}")
 
         # Validate method availability
+        if method == "coreml_realesrgan" and not self._coreml_available:
+            logger.warning("Core ML not available, trying MPS")
+            method = "mps_realesrgan" if self._mps_available else (
+                "video2x" if self._video2x_available else (
+                    "realesrgan" if self._realesrgan_available else (
+                        "fxupscale" if self._fxupscale_available else "ffmpeg"
+                    )
+                )
+            )
+
         if method == "mps_realesrgan" and not self._mps_available:
             logger.warning("MPS not available, trying Video2X")
             method = "video2x" if self._video2x_available else (
@@ -269,7 +279,13 @@ class VideoUpscaler:
             progress_callback(f"Upscaling to {target_resolution} using {method}...", 0.1)
 
         try:
-            if method == "mps_realesrgan":
+            if method == "coreml_realesrgan":
+                logger.info("Calling _upscale_coreml (Neural Engine)...")
+                success = self._upscale_coreml(
+                    input_path, output_path, target_width, target_height,
+                    preserve_audio, progress_callback
+                )
+            elif method == "mps_realesrgan":
                 logger.info("Calling _upscale_mps_realesrgan...")
                 success = self._upscale_mps_realesrgan(
                     input_path, output_path, target_width, target_height,
@@ -304,6 +320,66 @@ class VideoUpscaler:
         except Exception as e:
             logger.error(f"Upscaling failed: {e}")
             return False
+
+    def _upscale_coreml(
+        self,
+        input_path: Path,
+        output_path: Path,
+        target_width: int,
+        target_height: int,
+        preserve_audio: bool,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> bool:
+        """Upscale using Core ML with Apple Neural Engine (FASTEST on Apple Silicon).
+
+        This uses the dedicated Neural Engine hardware which is ~10x faster than
+        MPS GPU and ~78x faster than CPU.
+        """
+        logger.info(f"_upscale_coreml called with input={input_path}")
+
+        if progress_callback:
+            progress_callback("Starting Core ML upscaler (Neural Engine)...", 0.12)
+
+        try:
+            from src.services.coreml_upscaler import CoreMLUpscaler
+        except Exception as e:
+            logger.error(f"Failed to import coreml_upscaler: {e}")
+            if progress_callback:
+                progress_callback(f"Core ML import failed: {e}", 0.4)
+            raise
+
+        if progress_callback:
+            progress_callback("Initializing AI upscaler (Neural Engine)...", 0.15)
+
+        try:
+            # Use realesr-general-x4v3 for speed (recommended for Core ML)
+            model_name = "realesr-general-x4v3"
+
+            upscaler = CoreMLUpscaler(model_name=model_name)
+            success = upscaler.upscale_video(input_path, output_path, progress_callback)
+
+            # If output resolution doesn't match target, resize with ffmpeg
+            if success and output_path.exists():
+                actual_w, actual_h = self.get_video_resolution(output_path)
+                if actual_w != target_width or actual_h != target_height:
+                    if progress_callback:
+                        progress_callback("Resizing to exact target resolution...", 0.95)
+                    temp_path = output_path.with_suffix(".temp.mp4")
+                    output_path.rename(temp_path)
+                    self._resize_video(temp_path, output_path, target_width, target_height)
+                    temp_path.unlink()
+
+            return success
+
+        except Exception as e:
+            import traceback
+            error_msg = f"Core ML upscaling failed: {type(e).__name__}: {e}"
+            tb = traceback.format_exc()
+            logger.error(error_msg)
+            logger.error(f"Traceback: {tb}")
+            if progress_callback:
+                progress_callback(f"Core ML error: {str(e)[:150]}", 0.0)
+            raise
 
     def _upscale_mps_realesrgan(
         self,

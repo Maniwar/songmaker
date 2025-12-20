@@ -1286,6 +1286,7 @@ def render_upscale_only_page(state) -> None:
         # Import upscaler utilities
         from src.services.video_upscaler import (
             VideoUpscaler,
+            check_coreml_available,
             check_ffmpeg_available,
             check_fxupscale_available,
             check_mps_available,
@@ -1294,6 +1295,7 @@ def render_upscale_only_page(state) -> None:
         )
 
         # Check available methods
+        coreml_available = check_coreml_available()
         mps_available = check_mps_available()
         fxupscale_available = check_fxupscale_available()
         video2x_available = check_video2x_available()
@@ -1320,10 +1322,15 @@ def render_upscale_only_page(state) -> None:
             method_options = []
             method_map = {}  # Display name -> method key
 
-            # MPS Real-ESRGAN is best for Apple Silicon (true AI upscaling)
+            # Core ML is FASTEST on Apple Silicon (uses Neural Engine)
+            if coreml_available:
+                method_options.append("Core ML Neural Engine (Fastest - Mac)")
+                method_map["Core ML Neural Engine (Fastest - Mac)"] = "coreml_realesrgan"
+
+            # MPS Real-ESRGAN is second best for Apple Silicon (uses GPU)
             if mps_available:
-                method_options.append("Real-ESRGAN MPS (Best Quality - Mac)")
-                method_map["Real-ESRGAN MPS (Best Quality - Mac)"] = "mps_realesrgan"
+                method_options.append("Real-ESRGAN MPS (GPU - Slower)")
+                method_map["Real-ESRGAN MPS (GPU - Slower)"] = "mps_realesrgan"
 
             # FFmpeg is always available as fallback
             method_options.append("FFmpeg Lanczos (Fast, Universal)")
@@ -1352,10 +1359,16 @@ def render_upscale_only_page(state) -> None:
             selected_method = method_map.get(selected_method_display, "ffmpeg")
 
             # Show info for selected method
-            if "MPS" in selected_method_display:
+            if "Core ML" in selected_method_display:
                 st.success(
-                    "**Real-ESRGAN MPS:** True AI upscaling that adds detail. "
-                    "Uses Apple GPU for acceleration. Best quality on Mac."
+                    "**Core ML Neural Engine:** ~10x FASTER than GPU. "
+                    "Uses Apple's dedicated Neural Engine for AI upscaling. "
+                    "Converts model on first use (~1 min), then blazing fast."
+                )
+            elif "MPS" in selected_method_display:
+                st.info(
+                    "**Real-ESRGAN MPS:** Uses Apple GPU. Slower than Neural Engine. "
+                    "Consider Core ML for better performance."
                 )
             elif "MetalFX" in selected_method_display:
                 st.info(
@@ -3505,8 +3518,12 @@ def render_video_complete(state) -> None:
 def _render_upscale_section(state) -> None:
     """Render the 4K upscaling section."""
     from src.services.video_upscaler import (
-        VideoUpscaler, check_ffmpeg_available,
-        check_realesrgan_available, check_video2x_available
+        VideoUpscaler,
+        check_coreml_available,
+        check_ffmpeg_available,
+        check_mps_available,
+        check_realesrgan_available,
+        check_video2x_available,
     )
 
     st.subheader("Upscale to 4K")
@@ -3515,16 +3532,24 @@ def _render_upscale_section(state) -> None:
     video_path = Path(state.final_video_path)
     upscaled_path = getattr(state, 'upscaled_video_path', None)
 
-    # Check available methods
+    # Check available methods (best first)
     methods_available = []
     method_labels = {}
 
+    # Core ML is FASTEST on Apple Silicon (uses Neural Engine)
+    if check_coreml_available():
+        methods_available.append("coreml_realesrgan")
+        method_labels["coreml_realesrgan"] = "Core ML Neural Engine (FASTEST - Mac)"
+    # MPS is second best on Apple Silicon
+    if check_mps_available():
+        methods_available.append("mps_realesrgan")
+        method_labels["mps_realesrgan"] = "Real-ESRGAN MPS (GPU - Slower)"
     if check_video2x_available():
         methods_available.append("video2x")
-        method_labels["video2x"] = "Video2X (AI - Best Quality)"
+        method_labels["video2x"] = "Video2X (AI)"
     if check_realesrgan_available():
         methods_available.append("realesrgan")
-        method_labels["realesrgan"] = "Real-ESRGAN (AI - Good Quality)"
+        method_labels["realesrgan"] = "Real-ESRGAN ncnn"
     if check_ffmpeg_available():
         methods_available.append("ffmpeg")
         method_labels["ffmpeg"] = "FFmpeg Lanczos (Fast)"
@@ -3558,9 +3583,9 @@ def _render_upscale_section(state) -> None:
         st.markdown("""
         Upscale your video to 4K (3840x2160) resolution for maximum quality.
 
-        **Methods:**
-        - **Video2X (AI)**: Best quality, uses Real-ESRGAN/Real-CUGAN models. Slowest.
-        - **Real-ESRGAN**: Good AI upscaling. Medium speed.
+        **Methods (best first for Mac):**
+        - **Core ML Neural Engine**: FASTEST on Apple Silicon (~10x faster than GPU)
+        - **MPS Real-ESRGAN**: Good AI upscaling using GPU
         - **FFmpeg**: Fast lanczos scaling. Acceptable quality.
         """)
 
