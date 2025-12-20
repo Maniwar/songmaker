@@ -527,16 +527,44 @@ class MPSUpscaler:
         upscaled_dir.mkdir(parents=True, exist_ok=True)
 
         # Get expected frame count from video for progress tracking
-        probe_cmd = [
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-count_frames",
-            "-show_entries", "stream=nb_read_frames",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(input_path),
-        ]
-        result = subprocess.run(probe_cmd, capture_output=True, text=True)
-        expected_frames = int(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip().isdigit() else 0
+        # Use duration * fps instead of -count_frames which reads the entire video (slow!)
+        expected_frames = 0
+        try:
+            # Get duration
+            duration_cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(input_path),
+            ]
+            duration_result = subprocess.run(duration_cmd, capture_output=True, text=True, timeout=10)
+
+            # Get FPS
+            fps_cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(input_path),
+            ]
+            fps_result = subprocess.run(fps_cmd, capture_output=True, text=True, timeout=10)
+
+            if duration_result.returncode == 0 and fps_result.returncode == 0:
+                duration = float(duration_result.stdout.strip())
+                fps_str = fps_result.stdout.strip()
+                # Parse fps (could be "30" or "30000/1001")
+                if "/" in fps_str:
+                    num, den = map(float, fps_str.split("/"))
+                    fps = num / den
+                else:
+                    fps = float(fps_str)
+                expected_frames = int(duration * fps)
+                logger.info(f"Video: {duration:.2f}s @ {fps:.2f}fps = ~{expected_frames} frames")
+        except subprocess.TimeoutExpired:
+            logger.warning("Timed out getting video duration/fps - will estimate from extracted frames")
+        except Exception as e:
+            logger.warning(f"Could not determine frame count: {e}")
 
         # Check if frames already extracted (for resume)
         existing_frames = sorted(frames_dir.glob("*.png"))

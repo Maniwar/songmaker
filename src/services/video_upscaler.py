@@ -329,10 +329,12 @@ class VideoUpscaler:
             return success
 
         except Exception as e:
+            import traceback
             logger.error(f"MPS Real-ESRGAN failed: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             # Fall back to ffmpeg
             if progress_callback:
-                progress_callback("MPS failed, falling back to FFmpeg...", 0.5)
+                progress_callback(f"MPS failed ({type(e).__name__}), falling back to FFmpeg...", 0.5)
             return self._upscale_ffmpeg(
                 input_path, output_path, target_width, target_height,
                 preserve_audio, progress_callback
