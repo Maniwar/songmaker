@@ -305,11 +305,18 @@ class CoreMLUpscaler:
         # Get output image
         output_img = result["output"]
 
-        # Convert back to numpy
+        # Convert back to numpy, ensuring RGB (strip alpha if present)
         if isinstance(output_img, Image.Image):
+            # Convert to RGB to strip any alpha channel
+            if output_img.mode == 'RGBA':
+                output_img = output_img.convert('RGB')
             return np.array(output_img)
         else:
-            return output_img
+            # Handle numpy array output - strip alpha if present
+            arr = np.array(output_img)
+            if arr.ndim == 3 and arr.shape[2] == 4:
+                return arr[:, :, :3]  # Take only RGB channels
+            return arr
 
     def upscale_image(self, img: np.ndarray) -> np.ndarray:
         """Upscale a full image using tile-based processing.
@@ -574,10 +581,6 @@ class CoreMLUpscaler:
             progress_callback("Upscaling complete!", 1.0)
 
         return output_path.exists()
-
-    except Exception as e:
-        logger.error(f"Core ML upscaling failed: {e}")
-        raise
 
 
 def format_eta(seconds: float) -> str:
