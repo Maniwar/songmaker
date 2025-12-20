@@ -125,15 +125,19 @@ Use FFmpeg zoompan filter with these effect types:
 ## Movie Mode
 
 ### Workflow
+
 SCRIPT → CHARACTERS → VOICES → VISUALS → RENDER → COMPLETE
 
 ### Key Components
+
 - **ScriptAgent**: AI-powered screenplay development (like ConceptAgent for songs)
 - **TTSService**: Multi-provider TTS (OpenAI, ElevenLabs, Edge TTS)
 - **MovieImageGenerator**: Scene generation with character consistency
 
 ### Character Consistency in Movies
+
 Include full character descriptions in every scene prompt:
+
 ```python
 for char_id in scene.visible_characters:
     character = script.get_character(char_id)
@@ -141,6 +145,7 @@ for char_id in scene.visible_characters:
 ```
 
 ### TTS Providers
+
 | Provider | Quality | Cost | Notes |
 |----------|---------|------|-------|
 | ElevenLabs | Best | $5+/mo | Most natural voices |
