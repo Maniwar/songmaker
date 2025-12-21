@@ -1546,7 +1546,17 @@ def render_upscale_only_page(state) -> None:
                 except Exception:
                     is_upscaling = st.session_state.get("upscaling_in_progress", False)
                 expander_label = "🖼️ Browse Upscale Sessions" + (" (upscaling in background...)" if is_upscaling else "")
-                with st.expander(expander_label, expanded=False):
+
+                # Auto-refresh when upscaling is in progress
+                if is_upscaling:
+                    import time
+                    # Add auto-refresh every 5 seconds using HTML meta refresh
+                    st.markdown(
+                        """<meta http-equiv="refresh" content="5">""",
+                        unsafe_allow_html=True
+                    )
+
+                with st.expander(expander_label, expanded=is_upscaling):
                     # Show current upscaling status if active
                     if is_upscaling:
                         current_work_dir = st.session_state.get("upscale_work_dir")
