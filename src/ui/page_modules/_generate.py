@@ -1743,11 +1743,12 @@ def render_upscale_only_page(state) -> None:
                         with col_enc:
                             encoder = st.selectbox(
                                 "Encoder",
-                                options=["hevc_videotoolbox", "h264_videotoolbox", "libx264"],
+                                options=["hevc_videotoolbox", "libvpx-vp9", "h264_videotoolbox", "libx264"],
                                 format_func=lambda x: {
                                     "hevc_videotoolbox": "H.265 Hardware (Fast)",
-                                    "h264_videotoolbox": "H.264 Hardware (Fast)",
-                                    "libx264": "H.264 Software (Compatible)",
+                                    "libvpx-vp9": "VP9 (YouTube 8K Native)",
+                                    "h264_videotoolbox": "H.264 Hardware (max 4K)",
+                                    "libx264": "H.264 Software (max 4K)",
                                 }.get(x, x),
                                 key="assembly_encoder",
                             )

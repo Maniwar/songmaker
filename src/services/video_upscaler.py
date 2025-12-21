@@ -1707,10 +1707,13 @@ class VideoUpscaler:
             reassemble_cmd.extend(["-i", str(original_input)])
 
         # Quality mapping for different encoders
+        # YouTube 8K recommends 80-160 Mbps for SDR @ 30fps
         quality_map = {
-            "hevc_videotoolbox": {"high": 80, "medium": 65, "low": 50},
-            "h264_videotoolbox": {"high": 80, "medium": 65, "low": 50},
+            # VideoToolbox: lower q:v = higher quality/bitrate
+            "hevc_videotoolbox": {"high": 40, "medium": 55, "low": 70},  # High ~80+ Mbps for YouTube
+            "h264_videotoolbox": {"high": 40, "medium": 55, "low": 70},
             "libx264": {"high": 18, "medium": 23, "low": 28},  # CRF (lower = better)
+            "libvpx-vp9": {"high": 15, "medium": 25, "low": 35},  # CQ for YouTube 8K
         }
 
         # Add video filter for scaling (skip if native)
@@ -1736,6 +1739,17 @@ class VideoUpscaler:
             if encoder == "hevc_videotoolbox":
                 reassemble_cmd.extend(["-tag:v", "hvc1"])  # Compatibility tag for HEVC
             encoder_label = "Hardware"
+        elif encoder == "libvpx-vp9":
+            # VP9 encoding (YouTube 8K native format)
+            cq = quality_map.get("libvpx-vp9", {}).get(quality, 30)
+            reassemble_cmd.extend([
+                "-c:v", "libvpx-vp9",
+                "-crf", str(cq),
+                "-b:v", "0",  # Use CRF mode (constant quality)
+                "-pix_fmt", "yuv420p",
+                "-row-mt", "1",  # Enable row-based multithreading
+            ])
+            encoder_label = "VP9"
         else:
             # Software encoding (libx264)
             crf = quality_map.get("libx264", {}).get(quality, 23)
