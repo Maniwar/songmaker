@@ -1523,11 +1523,28 @@ def render_upscale_only_page(state) -> None:
 
         # Browse existing work directories - available anytime (browsing doesn't interrupt upscaling)
         from pathlib import Path
+        import subprocess
         work_dir_base = Path.home() / ".cache" / "songmaker" / "upscale_work"
         if work_dir_base.exists():
             existing_dirs = sorted(work_dir_base.glob("realesrgan_*"), key=lambda p: p.stat().st_mtime, reverse=True)
             if existing_dirs:
-                is_upscaling = st.session_state.get("upscaling_in_progress", False)
+                # Auto-detect if upscaling is in progress by checking for running process
+                try:
+                    result = subprocess.run(
+                        ["pgrep", "-f", "realesrgan-ncnn-vulkan"],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    is_upscaling = result.returncode == 0
+                    if is_upscaling:
+                        st.session_state.upscaling_in_progress = True
+                        # Find which work dir is active (has lock file)
+                        for d in existing_dirs:
+                            lock_file = d / "upscale.lock"
+                            if lock_file.exists():
+                                st.session_state["upscale_work_dir"] = str(d)
+                                break
+                except Exception:
+                    is_upscaling = st.session_state.get("upscaling_in_progress", False)
                 expander_label = "🖼️ Browse Upscale Sessions" + (" (upscaling in background...)" if is_upscaling else "")
                 with st.expander(expander_label, expanded=False):
                     # Show current upscaling status if active
