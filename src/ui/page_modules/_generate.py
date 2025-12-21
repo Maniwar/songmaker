@@ -1547,14 +1547,18 @@ def render_upscale_only_page(state) -> None:
                     is_upscaling = st.session_state.get("upscaling_in_progress", False)
                 expander_label = "🖼️ Browse Upscale Sessions" + (" (upscaling in background...)" if is_upscaling else "")
 
-                # Auto-refresh when upscaling is in progress
+                # Auto-refresh when upscaling is in progress using Streamlit's native rerun
                 if is_upscaling:
                     import time
-                    # Add auto-refresh every 5 seconds using HTML meta refresh
-                    st.markdown(
-                        """<meta http-equiv="refresh" content="5">""",
-                        unsafe_allow_html=True
-                    )
+                    # Use session state to track last refresh time
+                    if "last_upscale_refresh" not in st.session_state:
+                        st.session_state.last_upscale_refresh = time.time()
+
+                    # Auto-rerun every 5 seconds (preserves session state unlike meta refresh)
+                    time_since_refresh = time.time() - st.session_state.last_upscale_refresh
+                    if time_since_refresh > 5:
+                        st.session_state.last_upscale_refresh = time.time()
+                        st.rerun()
 
                 with st.expander(expander_label, expanded=is_upscaling):
                     # Show current upscaling status if active
