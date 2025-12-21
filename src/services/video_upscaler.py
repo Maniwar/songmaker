@@ -1081,11 +1081,10 @@ class VideoUpscaler:
                 if progress_callback and remaining_frames:
                     progress_callback(f"📷 {len(remaining_frames)} frames remaining to upscale...", 0.23)
 
-                # Process frames in batches to avoid GPU hangs
-                # Using smaller batches due to ncnn-vulkan stability issues on Apple Silicon
-                BATCH_SIZE = 50  # Small batches for stability
-                SMALL_BATCH_SIZE = 25  # Even smaller after stalls
-                pending_dir = work_dir / "pending"
+                # PARALLEL PROCESSING: Run multiple realesrgan workers simultaneously
+                # This significantly speeds up processing by utilizing more GPU/CPU resources
+                NUM_WORKERS = 8  # Run 8 parallel processes (configurable 5-10)
+                FRAMES_PER_WORKER = 100  # Each worker processes 100 frames at a time
 
                 # Find models directory once
                 home = Path.home()
@@ -1094,12 +1093,11 @@ class VideoUpscaler:
                     bin_path = Path(realesrgan_bin).parent
                     models_dir = bin_path / "models"
 
-                # Process in batches
+                # Process in parallel batches
                 start_time = time.time()
-                total_to_process = len(remaining_frames)
-                batch_num = 0
+                round_num = 0
                 consecutive_stalls = 0
-                max_consecutive_stalls = 10  # Give up after 10 consecutive stalls
+                max_consecutive_stalls = 20  # Higher threshold for parallel processing
 
                 while remaining_frames:
                     # Check for too many consecutive stalls
@@ -1108,95 +1106,122 @@ class VideoUpscaler:
                         if progress_callback:
                             current_done = len(list(upscaled_dir.glob("*.jpg")))
                             progress_callback(
-                                f"❌ Process keeps stalling. {current_done}/{total_frames} done. Try smaller batches or different model.",
+                                f"❌ Process keeps stalling. {current_done}/{total_frames} done.",
                                 0.22 + (0.58 * current_done / total_frames)
                             )
                         break
 
-                    batch_num += 1
-                    # Use smaller batch after stalls for better stability
-                    current_batch_size = SMALL_BATCH_SIZE if consecutive_stalls > 0 else BATCH_SIZE
-                    batch = remaining_frames[:current_batch_size]
-                    remaining_frames = remaining_frames[current_batch_size:]
+                    round_num += 1
 
-                    # Create pending directory with hard links for this batch
-                    if pending_dir.exists():
-                        shutil.rmtree(pending_dir)
-                    pending_dir.mkdir(parents=True, exist_ok=True)
+                    # Determine how many workers to use this round
+                    num_workers_this_round = min(NUM_WORKERS, len(remaining_frames) // 10 + 1)
+                    num_workers_this_round = max(1, min(num_workers_this_round, NUM_WORKERS))
 
-                    for frame in batch:
-                        os.link(str(frame.absolute()), str(pending_dir / frame.name))
+                    # Divide frames among workers
+                    frames_this_round = remaining_frames[:num_workers_this_round * FRAMES_PER_WORKER]
+                    remaining_frames = remaining_frames[num_workers_this_round * FRAMES_PER_WORKER:]
+
+                    # Split frames evenly among workers
+                    worker_frames = []
+                    frames_per = len(frames_this_round) // num_workers_this_round
+                    for i in range(num_workers_this_round):
+                        start_idx = i * frames_per
+                        end_idx = start_idx + frames_per if i < num_workers_this_round - 1 else len(frames_this_round)
+                        worker_frames.append(frames_this_round[start_idx:end_idx])
 
                     current_done = len(list(upscaled_dir.glob("*.jpg")))
                     if progress_callback:
                         progress_callback(
-                            f"📷 Batch {batch_num}: Processing {len(batch)} frames ({current_done}/{total_frames} total done)...",
+                            f"🚀 Round {round_num}: {num_workers_this_round} parallel workers, {len(frames_this_round)} frames ({current_done}/{total_frames} done)",
                             0.22 + (0.58 * current_done / total_frames)
                         )
 
-                    upscale_cmd = [
-                        realesrgan_bin,
-                        "-i", str(pending_dir),
-                        "-o", str(upscaled_dir),
-                        "-n", model_name,
-                        "-f", "jpg",
-                        "-j", "2:4:2",  # Parallel: 2 load, 4 process, 2 save threads
-                    ]
-                    if models_dir.exists():
-                        upscale_cmd.extend(["-m", str(models_dir)])
+                    # Create pending directories and start all workers
+                    processes = []
+                    pending_dirs = []
 
-                    logger.info(f"Batch {batch_num}: Processing {len(batch)} frames")
+                    for worker_id, frames in enumerate(worker_frames):
+                        if not frames:
+                            continue
 
-                    # Run this batch
-                    process = subprocess.Popen(
-                        upscale_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True
-                    )
+                        # Create unique pending directory for this worker
+                        pending_dir = work_dir / f"pending_{worker_id}"
+                        if pending_dir.exists():
+                            shutil.rmtree(pending_dir)
+                        pending_dir.mkdir(parents=True, exist_ok=True)
+                        pending_dirs.append(pending_dir)
 
-                    # Write lock file
-                    lock_file.write_text(f"{process.pid}\n{work_dir}")
+                        # Hard link frames to worker's pending dir
+                        for frame in frames:
+                            os.link(str(frame.absolute()), str(pending_dir / frame.name))
 
-                    # Monitor this batch with watchdog for stall detection
-                    batch_start = len(list(upscaled_dir.glob("*.jpg")))
-                    last_progress_count = batch_start
+                        # Start worker process
+                        upscale_cmd = [
+                            realesrgan_bin,
+                            "-i", str(pending_dir),
+                            "-o", str(upscaled_dir),
+                            "-n", model_name,
+                            "-f", "jpg",
+                            "-j", "1:2:1",  # Conservative per-worker (total: 8x this)
+                        ]
+                        if models_dir.exists():
+                            upscale_cmd.extend(["-m", str(models_dir)])
+
+                        process = subprocess.Popen(
+                            upscale_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True
+                        )
+                        processes.append((worker_id, process, len(frames)))
+                        logger.info(f"Started worker {worker_id} (PID {process.pid}) with {len(frames)} frames")
+
+                    # Write lock file with first worker PID
+                    if processes:
+                        lock_file.write_text(f"{processes[0][1].pid}\n{work_dir}")
+
+                    # Monitor all workers with watchdog
+                    last_progress_count = len(list(upscaled_dir.glob("*.jpg")))
                     last_progress_time = time.time()
-                    STALL_TIMEOUT_FIRST = 10  # First frame needs model load time
-                    STALL_TIMEOUT = 5  # Subsequent frames: 5 seconds
+                    STALL_TIMEOUT_FIRST = 15  # First frame needs model load time (per worker)
+                    STALL_TIMEOUT = 8  # Subsequent: 8 seconds (more lenient for parallel)
                     first_frame_done = False
-                    process_stalled = False
+                    any_stalled = False
 
-                    if progress_callback:
-                        while process.poll() is None:
-                            upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
-                            batch_done = upscaled_count - batch_start
-                            total_done_now = upscaled_count
+                    while any(p.poll() is None for _, p, _ in processes):
+                        upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+                        total_done_now = upscaled_count
 
-                            # Watchdog: check for stall
-                            if upscaled_count > last_progress_count:
-                                last_progress_count = upscaled_count
-                                last_progress_time = time.time()
-                                first_frame_done = True
-                            else:
-                                stall_duration = time.time() - last_progress_time
-                                current_timeout = STALL_TIMEOUT_FIRST if not first_frame_done else STALL_TIMEOUT
-                                if stall_duration > current_timeout:
-                                    logger.warning(f"Process stalled for {stall_duration:.0f}s, killing and restarting...")
-                                    if progress_callback:
-                                        progress_callback(
-                                            f"⚠️ Process stalled, auto-restarting... ({total_done_now}/{total_frames} done)",
-                                            0.22 + (0.58 * total_done_now / total_frames)
-                                        )
-                                    process.kill()
-                                    process_stalled = True
-                                    break
+                        # Watchdog: check for stall (global progress)
+                        if upscaled_count > last_progress_count:
+                            last_progress_count = upscaled_count
+                            last_progress_time = time.time()
+                            first_frame_done = True
+                        else:
+                            stall_duration = time.time() - last_progress_time
+                            current_timeout = STALL_TIMEOUT_FIRST if not first_frame_done else STALL_TIMEOUT
+                            if stall_duration > current_timeout:
+                                logger.warning(f"Workers stalled for {stall_duration:.0f}s, killing all...")
+                                if progress_callback:
+                                    progress_callback(
+                                        f"⚠️ Workers stalled, restarting... ({total_done_now}/{total_frames} done)",
+                                        0.22 + (0.58 * total_done_now / total_frames)
+                                    )
+                                # Kill all workers
+                                for _, p, _ in processes:
+                                    try:
+                                        p.kill()
+                                    except Exception:
+                                        pass
+                                any_stalled = True
+                                break
 
-                            if total_done_now > already_done and total_frames > 0:
-                                elapsed = time.time() - start_time
-                                frames_this_session = total_done_now - already_done
-                                time_per_frame = elapsed / frames_this_session
-                                remaining_count = total_frames - total_done_now
+                        # Progress update
+                        if total_done_now > already_done and total_frames > 0:
+                            elapsed = time.time() - start_time
+                            frames_this_session = total_done_now - already_done
+                            time_per_frame = elapsed / frames_this_session
+                            remaining_count = total_frames - total_done_now
                                 remaining_time = time_per_frame * remaining_count
 
                                 if remaining_time < 60:
