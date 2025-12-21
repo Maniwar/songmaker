@@ -1563,26 +1563,27 @@ def render_upscale_only_page(state) -> None:
                 with st.expander(expander_label, expanded=is_upscaling):
                     # Show current upscaling status if active
                     if is_upscaling:
+                        # Count active workers
+                        try:
+                            result = subprocess.run(
+                                ["pgrep", "-f", "realesrgan-ncnn-vulkan"],
+                                capture_output=True, text=True, timeout=2
+                            )
+                            worker_count = len(result.stdout.strip().split('\n')) if result.stdout.strip() else 0
+                        except Exception:
+                            worker_count = 0
+
                         current_work_dir = st.session_state.get("upscale_work_dir")
                         if current_work_dir:
                             cwd = Path(current_work_dir)
                             if cwd.exists():
                                 upscaled = len(list(cwd.glob("upscaled/*.jpg")))
                                 total = len(list(cwd.glob("frames/*.png")))
-                                # Count active workers
-                                try:
-                                    result = subprocess.run(
-                                        ["pgrep", "-f", "realesrgan-ncnn-vulkan"],
-                                        capture_output=True, text=True, timeout=2
-                                    )
-                                    worker_count = len(result.stdout.strip().split('\n')) if result.stdout.strip() else 0
-                                except Exception:
-                                    worker_count = 0
 
                                 if total > 0:
                                     pct = int(100 * upscaled / total)
                                     remaining = total - upscaled
-                                    # Estimate ETA based on ~2 frames/sec with workers
+                                    # Estimate ETA
                                     if worker_count > 0:
                                         eta_sec = remaining / (worker_count * 0.25)  # ~0.25 fps per worker
                                         if eta_sec < 60:
@@ -1598,6 +1599,7 @@ def render_upscale_only_page(state) -> None:
                                     # Refresh button
                                     if st.button("🔄 Refresh", key="refresh_upscale_progress"):
                                         st.rerun()
+
                         if worker_count > 0:
                             st.info("💡 Upscaling in progress. Browse frames while waiting.")
                         else:
