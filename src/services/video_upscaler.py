@@ -1222,56 +1222,57 @@ class VideoUpscaler:
                             frames_this_session = total_done_now - already_done
                             time_per_frame = elapsed / frames_this_session
                             remaining_count = total_frames - total_done_now
-                                remaining_time = time_per_frame * remaining_count
+                            remaining_time = time_per_frame * remaining_count
 
-                                if remaining_time < 60:
-                                    eta = f"{int(remaining_time)}s"
-                                elif remaining_time < 3600:
-                                    eta = f"{int(remaining_time/60)}m {int(remaining_time%60)}s"
-                                else:
-                                    eta = f"{int(remaining_time/3600)}h {int((remaining_time%3600)/60)}m"
+                            if remaining_time < 60:
+                                eta = f"{int(remaining_time)}s"
+                            elif remaining_time < 3600:
+                                eta = f"{int(remaining_time/60)}m {int(remaining_time%60)}s"
+                            else:
+                                eta = f"{int(remaining_time/3600)}h {int((remaining_time%3600)/60)}m"
 
-                                upscale_progress = 0.22 + (0.58 * total_done_now / total_frames)
+                            upscale_progress = 0.22 + (0.58 * total_done_now / total_frames)
+                            if progress_callback:
                                 progress_callback(
-                                    f"Batch {batch_num}: {batch_done}/{len(batch)} | Total: {total_done_now}/{total_frames} (ETA: {eta})",
+                                    f"🚀 {num_workers_this_round} workers | {total_done_now}/{total_frames} (ETA: {eta})",
                                     min(0.80, upscale_progress)
                                 )
-                            time.sleep(1.0)
+                        time.sleep(1.0)
 
-                    stdout, stderr = process.communicate(timeout=5) if not process_stalled else ("", "Process killed due to stall")
+                    # Wait for all workers to finish and collect results
+                    for worker_id, process, _ in processes:
+                        try:
+                            process.communicate(timeout=5)
+                        except Exception:
+                            pass
 
                     # Clean up lock file
                     if lock_file.exists():
                         lock_file.unlink()
 
-                    if process.returncode != 0 or process_stalled:
-                        if process_stalled:
-                            consecutive_stalls += 1
-                            logger.warning(f"Batch {batch_num} stalled (stall #{consecutive_stalls}) - will retry remaining frames")
-                        else:
-                            logger.error(f"Batch {batch_num} failed: {stderr}")
-                            consecutive_stalls += 1  # Also count failures
+                    # Handle stalls
+                    if any_stalled:
+                        consecutive_stalls += 1
+                        logger.warning(f"Round {round_num} stalled (stall #{consecutive_stalls})")
 
-                        # Re-check which frames still need processing and add to remaining
+                        # Re-check which frames still need processing
                         upscaled_files = {f.stem for f in upscaled_dir.glob("*.jpg")}
-                        frames_from_this_batch = [f for f in batch if f.stem not in upscaled_files]
-                        if frames_from_this_batch:
-                            # Add un-processed frames back to beginning of queue
-                            remaining_frames = frames_from_this_batch + remaining_frames
-                            logger.info(f"Re-queued {len(frames_from_this_batch)} frames for retry")
+                        unprocessed = [f for f in frames_this_round if f.stem not in upscaled_files]
+                        if unprocessed:
+                            remaining_frames = unprocessed + remaining_frames
+                            logger.info(f"Re-queued {len(unprocessed)} frames for retry")
 
-                        # Brief delay before restart to let GPU recover
-                        time.sleep(2)
+                        time.sleep(2)  # GPU recovery
                     else:
-                        # Successful batch - reset stall counter
-                        consecutive_stalls = 0
+                        consecutive_stalls = 0  # Reset on success
 
-                    # Clean up pending directory after each batch
-                    if pending_dir.exists():
-                        shutil.rmtree(pending_dir)
+                    # Clean up all pending directories
+                    for pending_dir in pending_dirs:
+                        if pending_dir.exists():
+                            shutil.rmtree(pending_dir)
 
                     current_done = len(list(upscaled_dir.glob("*.jpg")))
-                    logger.info(f"Batch {batch_num} complete: {current_done}/{total_frames} frames done")
+                    logger.info(f"Round {round_num} complete: {current_done}/{total_frames} frames done")
 
         upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
         logger.info(f"Upscaled {upscaled_count} frames total")
