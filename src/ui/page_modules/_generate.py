@@ -1277,6 +1277,7 @@ def render_upscale_only_page(state) -> None:
             quality = st.session_state.get("assembly_quality", "medium")
             threads = st.session_state.get("assembly_threads", 0)
             buffer_size = st.session_state.get("assembly_buffer", 128)
+            selected_upscaled_dir = st.session_state.get("selected_upscaled_dir", None)
 
             # Clear flags IMMEDIATELY to prevent re-triggering on page refresh
             # The check_assembly_status() logic will handle showing progress
@@ -1295,6 +1296,7 @@ def render_upscale_only_page(state) -> None:
                 quality=quality,
                 threads=threads,
                 buffer_size=buffer_size,
+                upscaled_dir=selected_upscaled_dir,
             )
 
             if success and output_path.exists():
@@ -1724,6 +1726,34 @@ def render_upscale_only_page(state) -> None:
                         max_threads = os.cpu_count() or 8
 
                         st.markdown("**Encoding Settings:**")
+
+                        # Check for multiple upscaled model versions
+                        upscaled_versions = list(completed_dir.glob("upscaled_*"))
+                        # Also check legacy "upscaled" directory
+                        legacy_upscaled = completed_dir / "upscaled"
+                        if legacy_upscaled.exists() and len(list(legacy_upscaled.glob("*.jpg"))) > 0:
+                            upscaled_versions.append(legacy_upscaled)
+
+                        # Show model selector if multiple versions exist
+                        if len(upscaled_versions) > 1:
+                            model_options = []
+                            for udir in upscaled_versions:
+                                count = len(list(udir.glob("*.jpg")))
+                                name = udir.name.replace("upscaled_", "") if udir.name != "upscaled" else "legacy"
+                                model_options.append((str(udir), f"{name} ({count:,} frames)"))
+
+                            selected_model_dir = st.selectbox(
+                                "🤖 Upscaled Version",
+                                options=[m[0] for m in model_options],
+                                format_func=lambda x: next((m[1] for m in model_options if m[0] == x), x),
+                                key="assembly_model_dir",
+                                help="Select which upscaled version to encode"
+                            )
+                            # Store the selected upscaled directory
+                            st.session_state["selected_upscaled_dir"] = selected_model_dir
+                        elif len(upscaled_versions) == 1:
+                            st.session_state["selected_upscaled_dir"] = str(upscaled_versions[0])
+
                         col_res, col_enc, col_qual = st.columns([1, 1, 1])
 
                         with col_res:

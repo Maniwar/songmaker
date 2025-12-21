@@ -788,8 +788,12 @@ class VideoUpscaler:
         except Exception:
             return 0
 
-    def get_upscaling_status(self) -> dict:
+    def get_upscaling_status(self, model_suffix: Optional[str] = None) -> dict:
         """Get current upscaling status for UI polling.
+
+        Args:
+            model_suffix: Optional model suffix to get status for specific model.
+                         If None, returns status for most recent/active model.
 
         Returns dict with:
         - status: "idle", "running", "complete", or "error"
@@ -797,35 +801,84 @@ class VideoUpscaler:
         - upscaled: number of upscaled frames
         - total: total number of frames
         - work_dir: path to work directory
+        - upscaled_dir: path to model-specific upscaled directory
+        - model: model name/suffix
+        - available_models: list of available model sessions for this video
         - progress: float 0-1
         """
         work_dir_base = Path.home() / ".cache" / "songmaker" / "upscale_work"
 
-        # Find active work directory
+        # Find active work directory (look for lock files in upscaled_* subdirs)
         active_work_dir = None
-        for lock_file in work_dir_base.glob("*/upscale.lock"):
-            active_work_dir = lock_file.parent
-            break
+        active_upscaled_dir = None
+
+        # First check for any running upscale (lock file in upscaled_* subdir)
+        for lock_file in work_dir_base.glob("*/upscaled_*/upscale.lock"):
+            if model_suffix is None or model_suffix in lock_file.parent.name:
+                active_upscaled_dir = lock_file.parent
+                active_work_dir = lock_file.parent.parent
+                break
 
         if not active_work_dir:
             # No lock file, find most recent work dir
             for work_dir in sorted(work_dir_base.glob("realesrgan_*"), key=lambda p: p.stat().st_mtime, reverse=True):
-                if (work_dir / "upscaled").exists():
+                # Look for any upscaled_* subdirectory
+                upscaled_dirs = list(work_dir.glob("upscaled_*"))
+                if upscaled_dirs:
                     active_work_dir = work_dir
+                    # If model specified, find matching; otherwise use most recent
+                    if model_suffix:
+                        matching = [d for d in upscaled_dirs if model_suffix in d.name]
+                        active_upscaled_dir = matching[0] if matching else upscaled_dirs[0]
+                    else:
+                        # Use most recently modified
+                        active_upscaled_dir = max(upscaled_dirs, key=lambda p: p.stat().st_mtime)
+                    break
+                # Legacy: check for old "upscaled" directory (no model suffix)
+                elif (work_dir / "upscaled").exists():
+                    active_work_dir = work_dir
+                    active_upscaled_dir = work_dir / "upscaled"
                     break
 
         if not active_work_dir:
-            return {"status": "idle", "workers": 0, "upscaled": 0, "total": 0, "work_dir": None, "progress": 0}
+            return {"status": "idle", "workers": 0, "upscaled": 0, "total": 0,
+                    "work_dir": None, "upscaled_dir": None, "model": None,
+                    "available_models": [], "progress": 0}
 
         frames_dir = active_work_dir / "frames"
-        upscaled_dir = active_work_dir / "upscaled"
+
+        # Get list of all available models for this video
+        available_models = []
+        for upscaled_subdir in active_work_dir.glob("upscaled_*"):
+            model_name = upscaled_subdir.name.replace("upscaled_", "")
+            count = len(list(upscaled_subdir.glob("*.jpg")))
+            available_models.append({
+                "suffix": model_name,
+                "dir": str(upscaled_subdir),
+                "count": count,
+            })
+        # Also check legacy "upscaled" directory
+        legacy_dir = active_work_dir / "upscaled"
+        if legacy_dir.exists() and legacy_dir.is_dir():
+            count = len(list(legacy_dir.glob("*.jpg")))
+            if count > 0:
+                available_models.append({
+                    "suffix": "legacy",
+                    "dir": str(legacy_dir),
+                    "count": count,
+                })
 
         total = len(list(frames_dir.glob("*.png"))) if frames_dir.exists() else 0
-        upscaled = len(list(upscaled_dir.glob("*.jpg"))) if upscaled_dir.exists() else 0
+        upscaled = len(list(active_upscaled_dir.glob("*.jpg"))) if active_upscaled_dir and active_upscaled_dir.exists() else 0
         workers = self._get_running_worker_count()
 
+        # Extract model name from directory
+        current_model = active_upscaled_dir.name.replace("upscaled_", "") if active_upscaled_dir else None
+
         if total == 0:
-            return {"status": "idle", "workers": workers, "upscaled": upscaled, "total": total, "work_dir": str(active_work_dir), "progress": 0}
+            return {"status": "idle", "workers": workers, "upscaled": upscaled, "total": total,
+                    "work_dir": str(active_work_dir), "upscaled_dir": str(active_upscaled_dir) if active_upscaled_dir else None,
+                    "model": current_model, "available_models": available_models, "progress": 0}
 
         progress = upscaled / total
 
@@ -842,6 +895,9 @@ class VideoUpscaler:
             "upscaled": upscaled,
             "total": total,
             "work_dir": str(active_work_dir),
+            "upscaled_dir": str(active_upscaled_dir) if active_upscaled_dir else None,
+            "model": current_model,
+            "available_models": available_models,
             "progress": progress,
         }
 
@@ -948,6 +1004,7 @@ class VideoUpscaler:
         # 4. Add audio back
 
         # Use persistent work directory for resume capability
+        # Structure: realesrgan_{hash}/frames/ (shared) + upscaled_{model}/ (per model)
         work_dir_base = Path.home() / ".cache" / "songmaker" / "upscale_work"
 
         # Create unique work dir based on input file content (not mtime or filename which change)
@@ -963,12 +1020,19 @@ class VideoUpscaler:
 
         logger.info(f"Input: {input_path.name}, size: {file_stat.st_size}, hash: {work_hash}")
 
+        # Use model from instance or default to RealESRGAN_General_x4_v3
+        model_name = getattr(self, '_realesrgan_model', 'RealESRGAN_General_x4_v3')
+        # Create short model suffix for directory name
+        model_suffix = model_name.replace("RealESRGAN_", "").replace("realesrgan-", "")
+
+        # Shared frames directory (extracted once, reused across models)
         frames_dir = work_dir / "frames"
-        upscaled_dir = work_dir / "upscaled"
+        # Model-specific upscaled directory (allows multiple models per video)
+        upscaled_dir = work_dir / f"upscaled_{model_suffix}"
         frames_dir.mkdir(parents=True, exist_ok=True)
         upscaled_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"Work directory: {work_dir}")
+        logger.info(f"Work directory: {work_dir}, model: {model_name}")
 
         # Get expected frame count first
         probe_cmd = [
@@ -1037,19 +1101,16 @@ class VideoUpscaler:
             logger.error("Real-ESRGAN binary not found")
             return False
 
-        # Use model from instance or default to RealESRGAN_General_x4_v3
-        model_name = getattr(self, '_realesrgan_model', 'RealESRGAN_General_x4_v3')
-
-        # Save metadata for reliable completion detection and resume
-        # This prevents false "complete" detection if frames dir is corrupted
-        # Also stores model name so corrupted frame fixes use the same model
-        metadata_file = work_dir / "metadata.json"
+        # Save metadata in model-specific directory for reliable completion detection
+        # This allows multiple models per video with independent progress tracking
+        metadata_file = upscaled_dir / "metadata.json"
         import json
         from datetime import datetime
         metadata = {
             "total_frames": total_frames,
             "input_file": str(input_path),
             "model_name": model_name,  # Store model for corrupted frame fixes
+            "model_suffix": model_suffix,
             "created_at": datetime.now().isoformat(),
         }
         metadata_file.write_text(json.dumps(metadata, indent=2))
@@ -1077,7 +1138,8 @@ class VideoUpscaler:
             # Check for existing realesrgan processes (not just lock file PID)
             # This properly handles multiple parallel workers
             import os
-            lock_file = work_dir / "upscale.lock"
+            # Model-specific lock file (allows parallel upscaling with different models)
+            lock_file = upscaled_dir / "upscale.lock"
 
             # Check if ANY realesrgan process is running (handles multiple workers)
             try:
@@ -1499,6 +1561,7 @@ class VideoUpscaler:
         quality: str = "medium",
         threads: int = 0,
         buffer_size: int = 128,
+        upscaled_dir: Optional[Path] = None,
     ) -> bool:
         """
         Assemble upscaled frames from a work directory into final video.
@@ -1507,24 +1570,41 @@ class VideoUpscaler:
         but the video hasn't been reassembled yet.
 
         Args:
-            work_dir: Path to work directory containing frames/ and upscaled/
+            work_dir: Path to work directory containing frames/ and upscaled_*/
             output_path: Path for final output video
             original_input: Path to original input video (for fps and audio).
                           If None, will try to find it from the work dir hash.
             target_resolution: Target resolution ("native", "1080p", "2K", "4K")
             preserve_audio: Whether to copy audio from original
             progress_callback: Optional callback for progress updates
-            encoder: Video encoder ("hevc_videotoolbox", "h264_videotoolbox", "libx264")
-            quality: Quality level ("high", "medium", "low")
+            encoder: Video encoder ("hevc_videotoolbox", "h264_videotoolbox", "libx264", "libvpx-vp9")
+            quality: Quality level ("maximum", "high", "medium", "low")
             threads: Number of threads (0=auto)
             buffer_size: I/O buffer size in frames for thread_queue_size
+            upscaled_dir: Optional specific upscaled directory to use.
+                         If None, will auto-detect (legacy "upscaled" or most recent upscaled_*)
 
         Returns:
             True if successful, False otherwise
         """
         work_dir = Path(work_dir)
-        upscaled_dir = work_dir / "upscaled"
         frames_dir = work_dir / "frames"
+
+        # Determine which upscaled directory to use
+        if upscaled_dir:
+            upscaled_dir = Path(upscaled_dir)
+        else:
+            # Auto-detect: try legacy "upscaled" first, then find upscaled_* directories
+            legacy_dir = work_dir / "upscaled"
+            if legacy_dir.exists() and len(list(legacy_dir.glob("*.jpg"))) > 0:
+                upscaled_dir = legacy_dir
+            else:
+                # Find most recent upscaled_* directory
+                upscaled_dirs = list(work_dir.glob("upscaled_*"))
+                if upscaled_dirs:
+                    upscaled_dir = max(upscaled_dirs, key=lambda p: p.stat().st_mtime)
+                else:
+                    upscaled_dir = legacy_dir  # Fall back to legacy path for error message
 
         if not upscaled_dir.exists():
             logger.error(f"Upscaled directory not found: {upscaled_dir}")
