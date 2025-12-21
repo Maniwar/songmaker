@@ -1140,7 +1140,7 @@ class VideoUpscaler:
                         "-o", str(upscaled_dir),
                         "-n", model_name,
                         "-f", "jpg",
-                        "-j", "1:2:2",  # Conservative parallelism
+                        "-j", "2:4:2",  # Parallel: 2 load, 4 process, 2 save threads
                     ]
                     if models_dir.exists():
                         upscale_cmd.extend(["-m", str(models_dir)])
