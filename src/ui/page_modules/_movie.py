@@ -77,6 +77,8 @@ def render_movie_mode_page() -> None:
         render_script_page()
     elif state.current_step == MovieWorkflowStep.CHARACTERS:
         render_characters_page()
+    elif state.current_step == MovieWorkflowStep.SCENES:
+        render_scenes_page()
     elif state.current_step == MovieWorkflowStep.VOICES:
         render_voices_page()
     elif state.current_step == MovieWorkflowStep.VISUALS:
@@ -92,9 +94,10 @@ def render_movie_progress(current_step: MovieWorkflowStep) -> None:
     steps = [
         ("📝", "Script", MovieWorkflowStep.SCRIPT),
         ("👥", "Characters", MovieWorkflowStep.CHARACTERS),
+        ("🎬", "Scenes", MovieWorkflowStep.SCENES),
         ("🎙️", "Voices", MovieWorkflowStep.VOICES),
         ("🎨", "Visuals", MovieWorkflowStep.VISUALS),
-        ("🎬", "Render", MovieWorkflowStep.RENDER),
+        ("🔧", "Render", MovieWorkflowStep.RENDER),
         ("✅", "Complete", MovieWorkflowStep.COMPLETE),
     ]
 
@@ -359,6 +362,274 @@ def render_characters_page() -> None:
             go_to_movie_step(MovieWorkflowStep.SCRIPT)
             st.rerun()
     with col2:
+        if st.button("Continue to Scenes →", type="primary"):
+            advance_movie_step()
+            st.rerun()
+
+
+def render_scenes_page() -> None:
+    """Render the scene and dialogue editor page."""
+    from src.models.schemas import Emotion, DialogueLine, SceneDirection
+
+    state = get_movie_state()
+
+    if not state.script:
+        st.warning("Please create a script first.")
+        return
+
+    st.subheader("Scene & Dialogue Editor")
+    st.markdown(
+        """
+        Review and edit your scenes, dialogue, and visual descriptions.
+        Make sure everything is perfect before generating voices and visuals.
+        """
+    )
+
+    script = state.script
+
+    # Scene tabs for easy navigation
+    if not script.scenes:
+        st.info("No scenes in script yet. Go back and add scenes to your script.")
+        if st.button("← Back to Script"):
+            go_to_movie_step(MovieWorkflowStep.SCRIPT)
+            st.rerun()
+        return
+
+    scene_tabs = st.tabs([f"Scene {s.index}: {s.title or 'Untitled'}" for s in script.scenes])
+
+    for tab_idx, (tab, scene) in enumerate(zip(scene_tabs, script.scenes)):
+        with tab:
+            # Scene header with title edit
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                new_title = st.text_input(
+                    "Scene Title",
+                    value=scene.title or "",
+                    key=f"scene_title_{scene.index}",
+                    placeholder="e.g., INT. OFFICE - NIGHT"
+                )
+                if new_title != scene.title:
+                    scene.title = new_title
+
+            with col2:
+                # Delete scene button (if more than 1 scene)
+                if len(script.scenes) > 1:
+                    if st.button("🗑️ Delete", key=f"delete_scene_{scene.index}"):
+                        script.scenes.remove(scene)
+                        st.rerun()
+
+            # Scene Direction (visual settings)
+            with st.expander("🎬 Scene Direction", expanded=True):
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    new_setting = st.text_area(
+                        "Setting/Location",
+                        value=scene.direction.setting,
+                        key=f"scene_setting_{scene.index}",
+                        height=80,
+                        help="Describe the location and environment"
+                    )
+                    if new_setting != scene.direction.setting:
+                        scene.direction.setting = new_setting
+
+                    camera_options = [
+                        "wide shot", "medium shot", "close-up",
+                        "extreme close-up", "over-the-shoulder", "POV",
+                        "establishing shot", "two-shot"
+                    ]
+                    current_camera = scene.direction.camera if scene.direction.camera in camera_options else camera_options[1]
+                    new_camera = st.selectbox(
+                        "Camera Angle",
+                        options=camera_options,
+                        index=camera_options.index(current_camera),
+                        key=f"scene_camera_{scene.index}"
+                    )
+                    if new_camera != scene.direction.camera:
+                        scene.direction.camera = new_camera
+
+                with col2:
+                    new_lighting = st.text_input(
+                        "Lighting",
+                        value=scene.direction.lighting or "",
+                        key=f"scene_lighting_{scene.index}",
+                        placeholder="e.g., warm sunset glow, harsh fluorescent"
+                    )
+                    if new_lighting != (scene.direction.lighting or ""):
+                        scene.direction.lighting = new_lighting if new_lighting else None
+
+                    mood_options = ["neutral", "tense", "happy", "sad", "mysterious", "romantic", "action", "comedic"]
+                    current_mood = scene.direction.mood if scene.direction.mood in mood_options else mood_options[0]
+                    new_mood = st.selectbox(
+                        "Mood",
+                        options=mood_options,
+                        index=mood_options.index(current_mood),
+                        key=f"scene_mood_{scene.index}"
+                    )
+                    if new_mood != scene.direction.mood:
+                        scene.direction.mood = new_mood
+
+                # Visible characters
+                all_char_ids = [c.id for c in script.characters]
+                all_char_names = {c.id: c.name for c in script.characters}
+
+                current_visible = scene.direction.visible_characters or []
+                new_visible = st.multiselect(
+                    "Characters in Scene",
+                    options=all_char_ids,
+                    default=[c for c in current_visible if c in all_char_ids],
+                    format_func=lambda x: all_char_names.get(x, x),
+                    key=f"scene_chars_{scene.index}"
+                )
+                if set(new_visible) != set(current_visible):
+                    scene.direction.visible_characters = new_visible
+
+            # Visual Prompt Preview
+            with st.expander("🎨 Visual Prompt", expanded=False):
+                # Build and show what the image generation prompt will look like
+                prompt_parts = []
+                prompt_parts.append(f"Scene: {scene.direction.setting}")
+                if scene.direction.lighting:
+                    prompt_parts.append(f"Lighting: {scene.direction.lighting}")
+                prompt_parts.append(f"Mood: {scene.direction.mood}")
+                prompt_parts.append(f"Camera: {scene.direction.camera}")
+
+                # Add visible characters
+                for char_id in scene.direction.visible_characters:
+                    char = script.get_character(char_id)
+                    if char:
+                        prompt_parts.append(f"Character - {char.name}: {char.description}")
+
+                auto_prompt = "\n".join(prompt_parts)
+
+                st.text_area(
+                    "Auto-generated prompt (for reference)",
+                    value=auto_prompt,
+                    height=120,
+                    disabled=True,
+                    key=f"auto_prompt_{scene.index}"
+                )
+
+                # Custom override
+                new_visual_prompt = st.text_area(
+                    "Custom Visual Prompt (optional - overrides auto-generated)",
+                    value=scene.visual_prompt or "",
+                    key=f"scene_visual_prompt_{scene.index}",
+                    height=100,
+                    placeholder="Leave empty to use auto-generated prompt"
+                )
+                if new_visual_prompt != (scene.visual_prompt or ""):
+                    scene.visual_prompt = new_visual_prompt if new_visual_prompt else None
+
+            # Dialogue Editor
+            st.markdown("##### 💬 Dialogue")
+
+            if not scene.dialogue:
+                st.info("No dialogue in this scene yet.")
+
+            for d_idx, dialogue in enumerate(scene.dialogue):
+                with st.container():
+                    cols = st.columns([2, 4, 2, 1])
+
+                    with cols[0]:
+                        # Character selection
+                        char_options = [c.id for c in script.characters]
+                        char_names = {c.id: c.name for c in script.characters}
+                        current_char_idx = char_options.index(dialogue.character_id) if dialogue.character_id in char_options else 0
+                        new_char = st.selectbox(
+                            "Character",
+                            options=char_options,
+                            index=current_char_idx,
+                            format_func=lambda x: char_names.get(x, x),
+                            key=f"dialogue_char_{scene.index}_{d_idx}",
+                            label_visibility="collapsed"
+                        )
+                        if new_char != dialogue.character_id:
+                            dialogue.character_id = new_char
+
+                    with cols[1]:
+                        # Dialogue text
+                        new_text = st.text_area(
+                            "Line",
+                            value=dialogue.text,
+                            key=f"dialogue_text_{scene.index}_{d_idx}",
+                            height=68,
+                            label_visibility="collapsed"
+                        )
+                        if new_text != dialogue.text:
+                            dialogue.text = new_text
+
+                    with cols[2]:
+                        # Emotion
+                        emotion_options = [e.value for e in Emotion]
+                        current_emotion_idx = emotion_options.index(dialogue.emotion.value) if dialogue.emotion.value in emotion_options else 0
+                        new_emotion = st.selectbox(
+                            "Emotion",
+                            options=emotion_options,
+                            index=current_emotion_idx,
+                            key=f"dialogue_emotion_{scene.index}_{d_idx}",
+                            label_visibility="collapsed"
+                        )
+                        if new_emotion != dialogue.emotion.value:
+                            dialogue.emotion = Emotion(new_emotion)
+
+                        # Action/stage direction
+                        new_action = st.text_input(
+                            "Action",
+                            value=dialogue.action or "",
+                            key=f"dialogue_action_{scene.index}_{d_idx}",
+                            placeholder="e.g., sighs, looks away",
+                            label_visibility="collapsed"
+                        )
+                        if new_action != (dialogue.action or ""):
+                            dialogue.action = new_action if new_action else None
+
+                    with cols[3]:
+                        # Delete dialogue button
+                        if st.button("🗑️", key=f"delete_dialogue_{scene.index}_{d_idx}"):
+                            scene.dialogue.remove(dialogue)
+                            st.rerun()
+
+                    st.markdown("---")
+
+            # Add new dialogue button
+            if st.button("➕ Add Dialogue Line", key=f"add_dialogue_{scene.index}"):
+                default_char = script.characters[0].id if script.characters else "narrator"
+                new_dialogue = DialogueLine(
+                    character_id=default_char,
+                    text="",
+                    emotion=Emotion.NEUTRAL
+                )
+                scene.dialogue.append(new_dialogue)
+                st.rerun()
+
+    # Add new scene
+    st.markdown("---")
+    if st.button("➕ Add New Scene"):
+        new_scene_idx = len(script.scenes) + 1
+        from src.models.schemas import MovieScene
+        new_scene = MovieScene(
+            index=new_scene_idx,
+            title=f"Scene {new_scene_idx}",
+            direction=SceneDirection(
+                setting="Describe the location...",
+                camera="medium shot",
+                mood="neutral",
+                visible_characters=[]
+            ),
+            dialogue=[]
+        )
+        script.scenes.append(new_scene)
+        st.rerun()
+
+    # Navigation
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("← Back to Characters"):
+            go_to_movie_step(MovieWorkflowStep.CHARACTERS)
+            st.rerun()
+    with col2:
         if st.button("Continue to Voices →", type="primary"):
             advance_movie_step()
             st.rerun()
@@ -442,10 +713,21 @@ def render_voices_page() -> None:
         total = total_dialogue
         completed = 0
 
-        for scene in state.script.scenes:
+        # Track cumulative time for dialogue timing
+        running_time = 0.0
+        pause_between_lines = 0.3  # 300ms pause between dialogue lines
+        pause_between_scenes = 1.0  # 1s pause between scenes
+        failed_count = 0
+
+        for scene_idx, scene in enumerate(state.script.scenes):
+            # Mark scene start time
+            scene.start_time = running_time
+
             for dialogue in scene.dialogue:
                 char = state.script.get_character(dialogue.character_id)
                 if not char:
+                    st.warning(f"Character '{dialogue.character_id}' not found, skipping dialogue")
+                    failed_count += 1
                     continue
 
                 try:
@@ -455,9 +737,12 @@ def render_voices_page() -> None:
                         output_dir=output_dir,
                     )
 
-                    # Get duration
+                    # Get duration and set timing
                     duration = tts.get_audio_duration(audio_path)
                     dialogue.audio_path = audio_path
+                    dialogue.start_time = running_time
+                    dialogue.end_time = running_time + duration
+                    running_time = dialogue.end_time + pause_between_lines
 
                     completed += 1
                     progress_bar.progress(
@@ -467,9 +752,27 @@ def render_voices_page() -> None:
 
                 except Exception as e:
                     st.error(f"Failed to generate voice for {char.name}: {e}")
+                    failed_count += 1
+                    # Clear timing for failed dialogue so it's excluded from video
+                    dialogue.audio_path = None
+                    dialogue.start_time = None
+                    dialogue.end_time = None
+
+            # Mark scene end time
+            scene.end_time = running_time
+            # Add pause between scenes (except for last scene)
+            if scene_idx < len(state.script.scenes) - 1:
+                running_time += pause_between_scenes
 
         progress_bar.progress(1.0, text="Voice generation complete!")
-        st.success(f"Generated {completed} voice clips!")
+        total_duration = running_time
+        minutes = int(total_duration // 60)
+        seconds = int(total_duration % 60)
+
+        if failed_count > 0:
+            st.warning(f"Generated {completed} voice clips ({failed_count} failed). Total duration: {minutes}m {seconds}s")
+        else:
+            st.success(f"Generated {completed} voice clips! Total duration: {minutes}m {seconds}s")
 
         # Continue button
         if st.button("Continue to Visuals →", type="primary"):
@@ -478,8 +781,8 @@ def render_voices_page() -> None:
 
     # Navigation
     st.markdown("---")
-    if st.button("← Back to Characters"):
-        go_to_movie_step(MovieWorkflowStep.CHARACTERS)
+    if st.button("← Back to Scenes"):
+        go_to_movie_step(MovieWorkflowStep.SCENES)
         st.rerun()
 
 
@@ -593,7 +896,7 @@ def render_render_page() -> None:
     )
 
     # Render settings
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         resolution = st.selectbox(
             "Resolution",
@@ -608,6 +911,19 @@ def render_render_page() -> None:
     with col2:
         show_subtitles = st.checkbox("Show Subtitles", value=True)
         add_music = st.checkbox("Add Background Music", value=False)
+    with col3:
+        use_lip_sync = st.checkbox(
+            "Lip Sync Animation",
+            value=False,
+            help="Animate character faces with lip sync (slower, uses Wan2.2-S2V)"
+        )
+        if use_lip_sync:
+            lip_sync_resolution = st.selectbox(
+                "Lip Sync Quality",
+                options=["480P", "720P"],
+                index=0,
+                help="Higher quality = longer processing time"
+            )
 
     # Asset check
     st.markdown("### Asset Check")
@@ -640,32 +956,306 @@ def render_render_page() -> None:
     st.markdown("---")
 
     if st.button("🎬 Render Video", type="primary", use_container_width=True):
-        st.info(
-            """
-            **Video rendering coming soon!**
+        import subprocess
+        import tempfile
+        from datetime import datetime
+        from src.services.video_generator import VideoGenerator
+        from src.models.schemas import KenBurnsEffect
 
-            This will:
-            1. Combine scene images with Ken Burns effects
-            2. Sync dialogue audio with visuals
-            3. Add subtitles and transitions
-            4. Export final video
-            """
-        )
+        video_gen = VideoGenerator()
+        output_dir = config.output_dir / "movie" / "videos"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Placeholder for actual rendering
+        # Resolution mapping
+        res_map = {
+            "1080p": (1920, 1080),
+            "2K": (2560, 1440),
+            "4K": (3840, 2160),
+        }
+        target_res = res_map.get(resolution, (1920, 1080))
+
         progress_bar = st.progress(0, text="Preparing assets...")
+        status_text = st.empty()
 
-        # Simulate progress
-        import time
-        for i in range(100):
-            time.sleep(0.05)
-            progress_bar.progress(i / 100, text=f"Rendering... {i}%")
+        try:
+            # Step 1: Create scene video clips
+            scene_clips = []
+            ken_burns_effects = [
+                KenBurnsEffect.ZOOM_IN, KenBurnsEffect.PAN_RIGHT,
+                KenBurnsEffect.ZOOM_OUT, KenBurnsEffect.PAN_LEFT,
+                KenBurnsEffect.PAN_UP, KenBurnsEffect.PAN_DOWN,
+            ]
 
-        progress_bar.progress(1.0, text="Render complete!")
+            # Initialize lip sync animator if enabled
+            lip_sync_animator = None
+            if use_lip_sync:
+                from src.services.lip_sync_animator import Wan2S2VAnimator
+                lip_sync_animator = Wan2S2VAnimator()
+                status_text.text("Creating lip-synced scene animations (this may take a while)...")
 
-        # For now, just advance to complete
-        advance_movie_step()
-        st.rerun()
+                # First, create master audio track for lip sync
+                audio_clips_for_sync = []
+                for scene in state.script.scenes:
+                    for dialogue in scene.dialogue:
+                        if dialogue.audio_path and Path(dialogue.audio_path).exists():
+                            audio_clips_for_sync.append((Path(dialogue.audio_path), dialogue.start_time or 0))
+
+                if audio_clips_for_sync:
+                    # Build master audio with FFmpeg
+                    master_audio_for_sync = output_dir / f"master_audio_sync_{datetime.now().strftime('%H%M%S')}.mp3"
+                    filter_parts = []
+                    inputs_cmd = []
+
+                    for idx, (audio_path, start_time) in enumerate(audio_clips_for_sync):
+                        inputs_cmd.extend(["-i", str(audio_path)])
+                        delay_ms = int(start_time * 1000)
+                        filter_parts.append(f"[{idx}]adelay={delay_ms}|{delay_ms}[a{idx}]")
+
+                    mix_inputs = "".join(f"[a{i}]" for i in range(len(audio_clips_for_sync)))
+                    filter_parts.append(f"{mix_inputs}amix=inputs={len(audio_clips_for_sync)}:normalize=0[aout]")
+                    filter_complex = ";".join(filter_parts)
+
+                    audio_cmd = [
+                        "ffmpeg", "-y", *inputs_cmd,
+                        "-filter_complex", filter_complex,
+                        "-map", "[aout]", "-ac", "2", "-ar", "44100",
+                        str(master_audio_for_sync)
+                    ]
+                    subprocess.run(audio_cmd, check=True, capture_output=True)
+            else:
+                status_text.text("Creating scene video clips with Ken Burns effects...")
+
+            total_scenes = len(state.script.scenes)
+            for i, scene in enumerate(state.script.scenes):
+                if not scene.image_path or not Path(scene.image_path).exists():
+                    st.warning(f"Scene {scene.index} missing image, skipping...")
+                    continue
+
+                # Calculate scene duration from dialogue timing
+                scene_duration = scene.end_time - scene.start_time
+                if scene_duration <= 0:
+                    scene_duration = 5.0
+
+                clip_path = output_dir / f"scene_{scene.index:03d}.mp4"
+
+                if use_lip_sync and lip_sync_animator and audio_clips_for_sync:
+                    # Use lip sync animation
+                    def lip_sync_progress(msg, prog):
+                        progress_bar.progress(
+                            0.1 + 0.5 * (i + prog) / total_scenes,
+                            text=f"Scene {scene.index}: {msg}"
+                        )
+
+                    result = lip_sync_animator.animate_scene(
+                        image_path=Path(scene.image_path),
+                        audio_path=master_audio_for_sync,
+                        start_time=scene.start_time,
+                        duration=scene_duration,
+                        output_path=clip_path,
+                        resolution=lip_sync_resolution if 'lip_sync_resolution' in dir() else "480P",
+                        progress_callback=lip_sync_progress,
+                    )
+
+                    if result and result.exists():
+                        scene_clips.append(result)
+                    else:
+                        # Fallback to Ken Burns if lip sync fails
+                        st.warning(f"Lip sync failed for scene {scene.index}, using Ken Burns fallback")
+                        effect = ken_burns_effects[i % len(ken_burns_effects)]
+                        video_gen.create_scene_clip(
+                            image_path=Path(scene.image_path),
+                            duration=scene_duration,
+                            effect=effect,
+                            output_path=clip_path,
+                            resolution=target_res,
+                            fps=fps,
+                        )
+                        scene_clips.append(clip_path)
+                else:
+                    # Standard Ken Burns effect
+                    effect = ken_burns_effects[i % len(ken_burns_effects)]
+                    video_gen.create_scene_clip(
+                        image_path=Path(scene.image_path),
+                        duration=scene_duration,
+                        effect=effect,
+                        output_path=clip_path,
+                        resolution=target_res,
+                        fps=fps,
+                    )
+                    scene_clips.append(clip_path)
+
+                # Update progress (only for non-lip-sync, lip sync has its own progress)
+                if not use_lip_sync:
+                    progress_bar.progress(
+                        0.3 * (i + 1) / total_scenes,
+                        text=f"Created clip for scene {scene.index}"
+                    )
+
+            if not scene_clips:
+                st.error("No scene clips could be created. Please generate scene images first.")
+                return
+
+            # Step 2: Concatenate scene clips
+            status_text.text("Concatenating video clips...")
+            progress_bar.progress(0.4, text="Concatenating video clips...")
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            video_only_path = output_dir / f"video_only_{timestamp}.mp4"
+            video_gen.concatenate_clips(
+                clip_paths=scene_clips,
+                output_path=video_only_path,
+                crossfade_duration=0.5,
+            )
+
+            # Step 3: Concatenate audio clips
+            status_text.text("Assembling audio track...")
+            progress_bar.progress(0.5, text="Assembling audio track...")
+
+            # Collect all dialogue audio paths in order
+            audio_clips = []
+            for scene in state.script.scenes:
+                for dialogue in scene.dialogue:
+                    if dialogue.audio_path and Path(dialogue.audio_path).exists():
+                        audio_clips.append((Path(dialogue.audio_path), dialogue.start_time))
+
+            if audio_clips:
+                # Create master audio with proper timing using FFmpeg
+                master_audio_path = output_dir / f"master_audio_{timestamp}.mp3"
+
+                # Build FFmpeg filter for audio mixing with delays
+                # This places each audio clip at its start_time
+                filter_parts = []
+                inputs_cmd = []
+
+                for idx, (audio_path, start_time) in enumerate(audio_clips):
+                    inputs_cmd.extend(["-i", str(audio_path)])
+                    delay_ms = int(start_time * 1000)
+                    filter_parts.append(f"[{idx}]adelay={delay_ms}|{delay_ms}[a{idx}]")
+
+                # Mix all delayed audio streams
+                mix_inputs = "".join(f"[a{i}]" for i in range(len(audio_clips)))
+                filter_parts.append(f"{mix_inputs}amix=inputs={len(audio_clips)}:normalize=0[aout]")
+
+                filter_complex = ";".join(filter_parts)
+
+                audio_cmd = [
+                    "ffmpeg", "-y",
+                    *inputs_cmd,
+                    "-filter_complex", filter_complex,
+                    "-map", "[aout]",
+                    "-ac", "2",
+                    "-ar", "44100",
+                    str(master_audio_path)
+                ]
+
+                subprocess.run(audio_cmd, check=True, capture_output=True)
+
+                # Step 4: Combine video and audio
+                status_text.text("Combining video and audio...")
+                progress_bar.progress(0.7, text="Combining video and audio...")
+
+                final_output = output_dir / f"{state.script.title.replace(' ', '_')}_{timestamp}.mp4"
+
+                combine_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", str(video_only_path),
+                    "-i", str(master_audio_path),
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-shortest",
+                    str(final_output)
+                ]
+
+                subprocess.run(combine_cmd, check=True, capture_output=True)
+            else:
+                # No audio - just use video
+                final_output = video_only_path
+
+            # Step 5: Generate subtitles if enabled
+            if show_subtitles and audio_clips:
+                status_text.text("Generating subtitles...")
+                progress_bar.progress(0.85, text="Generating subtitles...")
+
+                # Create ASS subtitle file
+                subtitle_path = output_dir / f"subtitles_{timestamp}.ass"
+                with open(subtitle_path, "w", encoding="utf-8") as f:
+                    f.write("[Script Info]\n")
+                    f.write(f"Title: {state.script.title}\n")
+                    f.write("ScriptType: v4.00+\n")
+                    f.write(f"PlayResX: {target_res[0]}\n")
+                    f.write(f"PlayResY: {target_res[1]}\n\n")
+
+                    f.write("[V4+ Styles]\n")
+                    f.write("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n")
+                    f.write("Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,20,20,40,1\n\n")
+
+                    f.write("[Events]\n")
+                    f.write("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+
+                    for scene in state.script.scenes:
+                        for dialogue in scene.dialogue:
+                            if dialogue.start_time is not None and dialogue.end_time is not None:
+                                char = state.script.get_character(dialogue.character_id)
+                                char_name = char.name if char else dialogue.character_id
+
+                                # Convert seconds to ASS timestamp format (H:MM:SS.CC)
+                                def to_ass_time(seconds):
+                                    h = int(seconds // 3600)
+                                    m = int((seconds % 3600) // 60)
+                                    s = int(seconds % 60)
+                                    cs = int((seconds % 1) * 100)
+                                    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+                                start = to_ass_time(dialogue.start_time)
+                                end = to_ass_time(dialogue.end_time)
+                                text = dialogue.text.replace("\n", "\\N")
+
+                                f.write(f"Dialogue: 0,{start},{end},Default,{char_name},0,0,0,,{char_name}: {text}\n")
+
+                # Burn subtitles into video
+                from src.services.video_generator import _escape_ffmpeg_path
+                subtitled_output = output_dir / f"{state.script.title.replace(' ', '_')}_subtitled_{timestamp}.mp4"
+                escaped_subtitle_path = _escape_ffmpeg_path(subtitle_path)
+                sub_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", str(final_output),
+                    "-vf", f"ass='{escaped_subtitle_path}'",
+                    "-c:a", "copy",
+                    str(subtitled_output)
+                ]
+
+                try:
+                    subprocess.run(sub_cmd, check=True, capture_output=True)
+                    final_output = subtitled_output
+                except subprocess.CalledProcessError:
+                    st.warning("Subtitle overlay failed, using video without burned-in subtitles.")
+
+            progress_bar.progress(1.0, text="Render complete!")
+            status_text.text("")
+
+            # Save final video path to state
+            state.final_video_path = str(final_output)
+
+            st.success(f"Video rendered successfully!")
+            st.info(f"Saved to: `{final_output}`")
+
+            # Clean up intermediate files
+            for clip in scene_clips:
+                if clip.exists() and clip != final_output:
+                    clip.unlink()
+            if video_only_path.exists() and video_only_path != final_output:
+                video_only_path.unlink()
+
+            # Advance to complete
+            if st.button("View Results →", type="primary"):
+                advance_movie_step()
+                st.rerun()
+
+        except subprocess.CalledProcessError as e:
+            st.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
+        except Exception as e:
+            st.error(f"Render failed: {e}")
 
     # Navigation
     st.markdown("---")
@@ -685,19 +1275,81 @@ def render_movie_complete_page() -> None:
         if state.script.description:
             st.markdown(f"**Description:** {state.script.description}")
 
-    st.info(
-        """
-        **Coming soon:** Video preview and download!
+        # Calculate total duration
+        if state.script.scenes:
+            last_scene = state.script.scenes[-1]
+            total_duration = last_scene.end_time
+            minutes = int(total_duration // 60)
+            seconds = int(total_duration % 60)
+            st.markdown(f"**Duration:** {minutes}m {seconds}s")
+            st.markdown(f"**Scenes:** {len(state.script.scenes)}")
+            st.markdown(f"**Characters:** {len(state.script.characters)}")
 
-        For now, your generated assets are saved in the `output/movie/` directory:
-        - `audio/` - Generated voice clips
-        - `images/` - Generated scene images
-        """
-    )
+    # Video preview
+    if state.final_video_path and Path(state.final_video_path).exists():
+        st.markdown("### Video Preview")
+        st.video(state.final_video_path)
 
-    # Start over button
-    if st.button("Create Another Movie", type="primary"):
-        if "script_agent" in st.session_state:
-            st.session_state.script_agent.reset()
-        st.session_state.movie_state = MovieModeState()
-        st.rerun()
+        # Download button
+        with open(state.final_video_path, "rb") as f:
+            video_bytes = f.read()
+
+        file_name = Path(state.final_video_path).name
+        st.download_button(
+            label="📥 Download Video",
+            data=video_bytes,
+            file_name=file_name,
+            mime="video/mp4",
+            type="primary",
+            use_container_width=True,
+        )
+
+        st.success(f"Video saved to: `{state.final_video_path}`")
+    else:
+        st.warning("Video not found. Please go back to Render and generate the video.")
+        if st.button("← Back to Render"):
+            go_to_movie_step(MovieWorkflowStep.RENDER)
+            st.rerun()
+
+    # Project assets summary
+    with st.expander("📁 Project Assets", expanded=False):
+        output_dir = config.output_dir / "movie"
+
+        # Audio files
+        audio_dir = output_dir / "audio"
+        if audio_dir.exists():
+            audio_files = list(audio_dir.glob("*.mp3")) + list(audio_dir.glob("*.wav"))
+            st.markdown(f"**Voice clips:** {len(audio_files)} files in `{audio_dir}`")
+
+        # Image files
+        images_dir = output_dir / "images"
+        if images_dir.exists():
+            image_files = list(images_dir.glob("*.png")) + list(images_dir.glob("*.jpg"))
+            st.markdown(f"**Scene images:** {len(image_files)} files in `{images_dir}`")
+
+        # Character portraits
+        chars_dir = output_dir / "characters"
+        if chars_dir.exists():
+            char_files = list(chars_dir.glob("*.png")) + list(chars_dir.glob("*.jpg"))
+            st.markdown(f"**Character portraits:** {len(char_files)} files in `{chars_dir}`")
+
+        # Videos
+        videos_dir = output_dir / "videos"
+        if videos_dir.exists():
+            video_files = list(videos_dir.glob("*.mp4"))
+            st.markdown(f"**Videos:** {len(video_files)} files in `{videos_dir}`")
+
+    st.markdown("---")
+
+    # Action buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("← Edit & Re-render"):
+            go_to_movie_step(MovieWorkflowStep.SCENES)
+            st.rerun()
+    with col2:
+        if st.button("Create Another Movie", type="primary"):
+            if "script_agent" in st.session_state:
+                st.session_state.script_agent.reset()
+            st.session_state.movie_state = MovieModeState()
+            st.rerun()

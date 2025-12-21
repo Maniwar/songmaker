@@ -1248,6 +1248,129 @@ CINEMATOGRAPHY_STYLES = {
 
 def render_upscale_only_page(state) -> None:
     """Render dedicated upscale page for Skip to Upscale mode."""
+
+    # Handle assembly request from "Assemble Final Video" button
+    if st.session_state.get("ready_for_assembly"):
+        work_dir_str = st.session_state.get("assembly_work_dir")
+        if work_dir_str:
+            from src.services.video_upscaler import VideoUpscaler
+
+            work_dir = Path(work_dir_str)
+            st.header("🎬 Assembling Final Video")
+
+            # Generate output path
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_name = f"upscaled_4K_{timestamp}.mp4"
+            output_path = config.output_dir / output_name
+
+            # Create progress UI
+            progress_bar = st.progress(0, text="Starting assembly...")
+            status_text = st.empty()
+
+            def assembly_progress(message: str, progress: float):
+                progress_bar.progress(progress, text=message)
+                status_text.text(message)
+
+            # Get encoder settings from session state
+            output_res = st.session_state.get("assembly_resolution", "4K")
+            encoder = st.session_state.get("assembly_encoder", "hevc_videotoolbox")
+            quality = st.session_state.get("assembly_quality", "medium")
+            threads = st.session_state.get("assembly_threads", 0)
+            buffer_size = st.session_state.get("assembly_buffer", 128)
+
+            # Run assembly
+            upscaler = VideoUpscaler()
+            success = upscaler.assemble_video(
+                work_dir=work_dir,
+                output_path=output_path,
+                target_resolution=output_res,
+                preserve_audio=True,
+                progress_callback=assembly_progress,
+                encoder=encoder,
+                quality=quality,
+                threads=threads,
+                buffer_size=buffer_size,
+            )
+
+            # Clear the assembly flags (don't clear widget keys - they're managed by Streamlit)
+            st.session_state["ready_for_assembly"] = False
+            st.session_state["assembly_work_dir"] = None
+
+            if success and output_path.exists():
+                file_size_mb = output_path.stat().st_size / 1024 / 1024
+                file_size_gb = file_size_mb / 1024
+
+                st.success(f"✅ Video assembled successfully!")
+
+                # Find original video for comparison
+                work_hash = work_dir.name.replace("realesrgan_", "")
+                upload_dir = config.output_dir / "uploads"
+                original_video = None
+                for f in upload_dir.glob(f"upscale_input_*{work_hash}*.mp4"):
+                    original_video = f
+                    break
+
+                # Show file info prominently
+                st.markdown(f"**Output:** `{output_path}`")
+                if file_size_gb >= 1:
+                    st.markdown(f"**Size:** {file_size_gb:.2f} GB")
+                else:
+                    st.markdown(f"**Size:** {file_size_mb:.1f} MB")
+
+                # For large files (>500MB), skip embedded preview to avoid memory issues
+                if file_size_mb > 500:
+                    st.warning("⚠️ File is too large for browser preview. Use the path above to open in your video player.")
+                    st.code(str(output_path), language=None)
+
+                    # Show original for comparison if available
+                    if original_video and original_video.exists():
+                        st.subheader("📊 Original (for reference)")
+                        orig_size = original_video.stat().st_size / 1024 / 1024
+                        if orig_size < 500:
+                            st.video(str(original_video))
+                        st.caption(f"Original: {orig_size:.1f} MB → Upscaled: {file_size_mb:.1f} MB")
+                else:
+                    # Side-by-side comparison for smaller files
+                    st.subheader("📊 Before & After Comparison")
+                    col_orig, col_upscaled = st.columns(2)
+
+                    with col_orig:
+                        st.markdown("**Original**")
+                        if original_video and original_video.exists():
+                            st.video(str(original_video))
+                            orig_size = original_video.stat().st_size / 1024 / 1024
+                            st.caption(f"{orig_size:.1f} MB")
+                        else:
+                            st.info("Original video not found")
+
+                    with col_upscaled:
+                        st.markdown("**Upscaled**")
+                        st.video(str(output_path))
+                        st.caption(f"{file_size_mb:.1f} MB")
+
+                    st.markdown("---")
+
+                    # Download button only for smaller files
+                    with open(output_path, "rb") as f:
+                        st.download_button(
+                            label="⬇️ Download Video",
+                            data=f.read(),
+                            file_name=output_name,
+                            mime="video/mp4",
+                            type="primary",
+                        )
+
+                if st.button("🔄 Upscale Another Video", type="secondary"):
+                    st.rerun()
+            else:
+                st.error("❌ Video assembly failed. Check logs for details.")
+                if st.button("🔄 Try Again"):
+                    st.session_state["ready_for_assembly"] = True
+                    st.session_state["assembly_work_dir"] = work_dir_str
+                    st.rerun()
+
+            return  # Don't render the rest of the page
+
     st.header("Upscale Video to 4K")
 
     # Exit button
@@ -1522,12 +1645,100 @@ def render_upscale_only_page(state) -> None:
         st.caption("Click Stop to cancel - progress is saved and you can resume later")
 
         # Browse existing work directories - available anytime (browsing doesn't interrupt upscaling)
-        from pathlib import Path
         import subprocess
         work_dir_base = Path.home() / ".cache" / "songmaker" / "upscale_work"
         if work_dir_base.exists():
             existing_dirs = sorted(work_dir_base.glob("realesrgan_*"), key=lambda p: p.stat().st_mtime, reverse=True)
             if existing_dirs:
+                # Check for completed sessions and show prominent assembly button
+                for completed_dir in existing_dirs[:3]:  # Check recent 3 dirs
+                    total_frames = len(list(completed_dir.glob("frames/*.png")))
+                    upscaled_frames = len(list(completed_dir.glob("upscaled/*.jpg")))
+                    if total_frames > 0 and upscaled_frames >= total_frames:
+                        # Found a completed session - show prominent banner
+                        st.success(f"✅ **Upscaling Complete!** {upscaled_frames:,} frames ready for assembly")
+                        st.info(f"Session: `{completed_dir.name}`")
+
+                        # Encoding options
+                        import os
+                        max_threads = os.cpu_count() or 8
+
+                        st.markdown("**Encoding Settings:**")
+                        col_res, col_enc, col_qual = st.columns([1, 1, 1])
+
+                        with col_res:
+                            output_res = st.selectbox(
+                                "Output Resolution",
+                                options=["native", "4K", "2K", "1080p"],
+                                format_func=lambda x: {
+                                    "native": "Native (No scaling - fastest)",
+                                    "4K": "4K (3840×2160)",
+                                    "2K": "2K (2560×1440)",
+                                    "1080p": "1080p (1920×1080)",
+                                }.get(x, x),
+                                key="assembly_resolution",
+                                help="Native skips scaling for fastest encoding"
+                            )
+
+                        with col_enc:
+                            encoder = st.selectbox(
+                                "Encoder",
+                                options=["hevc_videotoolbox", "h264_videotoolbox", "libx264"],
+                                format_func=lambda x: {
+                                    "hevc_videotoolbox": "H.265 Hardware (Fast)",
+                                    "h264_videotoolbox": "H.264 Hardware (Fast)",
+                                    "libx264": "H.264 Software (Compatible)",
+                                }.get(x, x),
+                                key="assembly_encoder",
+                            )
+
+                        with col_qual:
+                            quality = st.selectbox(
+                                "Quality",
+                                options=["high", "medium", "low"],
+                                format_func=lambda x: {
+                                    "high": "High (larger file)",
+                                    "medium": "Medium (balanced)",
+                                    "low": "Low (smaller file)",
+                                }.get(x, x),
+                                index=1,
+                                key="assembly_quality",
+                            )
+
+                        # Second row for advanced options
+                        col_threads, col_buffer, col_btn = st.columns([1, 1, 1])
+
+                        with col_threads:
+                            threads = st.slider(
+                                "Threads",
+                                min_value=0,
+                                max_value=max_threads,
+                                value=0,
+                                key="assembly_threads",
+                                help="0=Auto"
+                            )
+
+                        with col_buffer:
+                            buffer_size = st.slider(
+                                "I/O Buffer (frames)",
+                                min_value=32,
+                                max_value=512,
+                                value=128,
+                                step=32,
+                                key="assembly_buffer",
+                                help="Higher = faster but uses more RAM"
+                            )
+
+                        with col_btn:
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            if st.button("🎬 Assemble", type="primary", key="assemble_prominent"):
+                                st.session_state["ready_for_assembly"] = True
+                                st.session_state["assembly_work_dir"] = str(completed_dir)
+                                st.rerun()
+
+                        st.markdown("---")
+                        break  # Only show one completed session banner
+
                 # Auto-detect if upscaling is in progress by checking for running process
                 try:
                     result = subprocess.run(
@@ -1631,6 +1842,12 @@ def render_upscale_only_page(state) -> None:
                                                     st.error("Could not find original input file")
                                     else:
                                         st.success(f"✅ All {total_frames} frames upscaled!")
+                                        # Add button to proceed to assembly
+                                        if st.button("🎬 Assemble Final Video", type="primary", key="assemble_after_upscale"):
+                                            # Store the work dir for assembly (cwd is the Path from current_work_dir)
+                                            st.session_state["ready_for_assembly"] = True
+                                            st.session_state["assembly_work_dir"] = str(cwd)
+                                            st.rerun()
                             else:
                                 st.warning("⏸️ Workers stopped. Select a session to continue.")
 
@@ -1769,10 +1986,18 @@ def render_upscale_only_page(state) -> None:
                                     st.warning(f"⏳ Frame {frame_num} not yet upscaled")
                             st.caption(f"Frame {frame_num} of {total_frames:,} total")
 
+                            # Show assembly button if all frames are done
+                            if upscaled_count >= total_frames:
+                                st.markdown("---")
+                                st.success(f"✅ All {total_frames:,} frames upscaled!")
+                                if st.button("🎬 Assemble Final Video", type="primary", key="assemble_from_browser"):
+                                    st.session_state["ready_for_assembly"] = True
+                                    st.session_state["assembly_work_dir"] = str(work_dir)
+                                    st.rerun()
+
         # Handle continue button from browse section
         continue_input = st.session_state.pop("_continue_upscale_input", None)
         if continue_input:
-            from datetime import datetime
             input_path = Path(continue_input)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_name = f"upscaled_{target_res}_{timestamp}_{input_path.stem}.mp4"
@@ -1836,8 +2061,6 @@ def render_upscale_only_page(state) -> None:
                     break
 
             # Save if not found
-            from datetime import datetime
-            from pathlib import Path
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             if input_path is None:
                 input_path = upload_dir / f"upscale_input_{timestamp}_{content_hash}_{uploaded_video.name}"
@@ -2087,7 +2310,6 @@ def render_storyboard_setup(state, is_demo_mode: bool) -> None:
                 upload_dir.mkdir(parents=True, exist_ok=True)
 
                 # Generate unique filename
-                from datetime import datetime
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 safe_name = _sanitize_filename(uploaded_video.name.rsplit('.', 1)[0])
                 ext = uploaded_video.name.rsplit('.', 1)[-1] if '.' in uploaded_video.name else 'mp4'

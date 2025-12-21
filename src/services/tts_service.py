@@ -40,6 +40,36 @@ DEFAULT_VOICES = {
 }
 
 
+def infer_voice_id_from_name(voice_name: str, provider: str) -> str:
+    """Infer a voice ID from a voice name description.
+
+    Parses voice descriptions like "female, 30s, British accent" or
+    "male narrator" to select an appropriate voice ID.
+
+    Args:
+        voice_name: Human-readable voice description
+        provider: TTS provider name
+
+    Returns:
+        Voice ID for the specified provider
+    """
+    if not voice_name:
+        return DEFAULT_VOICES.get(provider, {}).get("narrator", "")
+
+    voice_lower = voice_name.lower()
+
+    # Check for gender keywords
+    if any(kw in voice_lower for kw in ["female", "woman", "girl", "she", "her"]):
+        return DEFAULT_VOICES.get(provider, {}).get("female", "")
+    elif any(kw in voice_lower for kw in ["male", "man", "boy", "he", "him"]):
+        return DEFAULT_VOICES.get(provider, {}).get("male", "")
+    elif any(kw in voice_lower for kw in ["narrator", "narration", "announcer"]):
+        return DEFAULT_VOICES.get(provider, {}).get("narrator", "")
+
+    # Default to narrator if no gender detected
+    return DEFAULT_VOICES.get(provider, {}).get("narrator", "")
+
+
 class TTSService:
     """Text-to-Speech service supporting multiple providers."""
 
@@ -132,8 +162,10 @@ class TTSService:
         """Generate speech using ElevenLabs."""
         client = self._get_elevenlabs_client()
 
-        # Get voice ID (use default if not specified)
+        # Get voice ID - infer from voice_name if not explicitly set
         voice_id = voice_settings.voice_id
+        if not voice_id:
+            voice_id = infer_voice_id_from_name(voice_settings.voice_name, "elevenlabs")
         if not voice_id:
             voice_id = DEFAULT_VOICES["elevenlabs"]["narrator"]
 
@@ -170,8 +202,12 @@ class TTSService:
         """Generate speech using OpenAI TTS."""
         client = self._get_openai_client()
 
-        # Get voice (use default if not specified)
-        voice = voice_settings.voice_id or DEFAULT_VOICES["openai"]["narrator"]
+        # Get voice - infer from voice_name if not explicitly set
+        voice = voice_settings.voice_id
+        if not voice:
+            voice = infer_voice_id_from_name(voice_settings.voice_name, "openai")
+        if not voice:
+            voice = DEFAULT_VOICES["openai"]["narrator"]
 
         try:
             response = client.audio.speech.create(
@@ -205,8 +241,12 @@ class TTSService:
                 "edge-tts package not installed. Run: pip install edge-tts"
             ) from exc
 
-        # Get voice (use default if not specified)
-        voice = voice_settings.voice_id or DEFAULT_VOICES["edge"]["narrator"]
+        # Get voice - infer from voice_name if not explicitly set
+        voice = voice_settings.voice_id
+        if not voice:
+            voice = infer_voice_id_from_name(voice_settings.voice_name, "edge")
+        if not voice:
+            voice = DEFAULT_VOICES["edge"]["narrator"]
 
         # Adjust rate (Edge TTS accepts percentage like "+10%" or "-10%")
         rate_pct = int((voice_settings.speed - 1) * 100)
@@ -246,9 +286,10 @@ class TTSService:
         """
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Generate unique filename
-        text_hash = hash(dialogue.text) % 10000
-        filename = f"dialogue_{character.id}_{text_hash:04d}.mp3"
+        # Generate unique filename using UUID to avoid collisions
+        import uuid
+        unique_id = uuid.uuid4().hex[:8]
+        filename = f"dialogue_{character.id}_{unique_id}.mp3"
         output_path = output_dir / filename
 
         if progress_callback:

@@ -102,8 +102,12 @@ class MovieImageGenerator:
         """
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build the prompt
-        prompt = self.build_scene_prompt(scene, script)
+        # Use custom visual prompt if provided, otherwise build from scene data
+        if scene.visual_prompt and scene.visual_prompt.strip():
+            prompt = scene.visual_prompt
+            logger.info(f"Using custom visual prompt for scene {scene.index}")
+        else:
+            prompt = self.build_scene_prompt(scene, script)
 
         if progress_callback:
             progress_callback(f"Generating image for scene {scene.index + 1}...", 0.0)
@@ -171,15 +175,26 @@ class MovieImageGenerator:
             scene_reference = reference_image
 
             # Use character portrait as reference if available
+            # Note: Image generators typically only support one reference image,
+            # so we use the first character's portrait. All character descriptions
+            # are still included in the prompt via build_scene_prompt().
             if use_character_references and scene.direction.visible_characters:
+                chars_with_portraits = []
                 for char_id in scene.direction.visible_characters:
                     character = script.get_character(char_id)
                     if character and character.reference_image_path:
                         char_ref_path = Path(character.reference_image_path)
                         if char_ref_path.exists():
-                            scene_reference = char_ref_path
-                            logger.info(f"Using {character.name}'s portrait as reference for scene {i+1}")
-                            break  # Use first character with portrait
+                            chars_with_portraits.append((character, char_ref_path))
+
+                if chars_with_portraits:
+                    # Use first character's portrait as reference
+                    first_char, scene_reference = chars_with_portraits[0]
+                    logger.info(f"Using {first_char.name}'s portrait as reference for scene {i+1}")
+
+                    if len(chars_with_portraits) > 1:
+                        other_chars = ", ".join(c.name for c, _ in chars_with_portraits[1:])
+                        logger.info(f"Note: {other_chars} also in scene - descriptions included in prompt")
 
             image_path = self.generate_scene_image(
                 scene=scene,

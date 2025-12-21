@@ -31,6 +31,8 @@ import shutil
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
+from src.config import config
+
 logger = logging.getLogger(__name__)
 
 # Target resolutions
@@ -1022,6 +1024,18 @@ class VideoUpscaler:
             total_frames = len(list(frames_dir.glob("*.png")))
             logger.info(f"Extracted {total_frames} frames")
 
+        # Save metadata for reliable completion detection
+        # This prevents false "complete" detection if frames dir is corrupted
+        metadata_file = work_dir / "metadata.json"
+        import json
+        metadata = {
+            "total_frames": total_frames,
+            "input_file": str(input_path),
+            "created_at": datetime.now().isoformat(),
+        }
+        metadata_file.write_text(json.dumps(metadata, indent=2))
+        logger.info(f"Saved metadata: {total_frames} frames expected")
+
         # Step 2: Upscale frames with Real-ESRGAN (with resume support)
         # Get Real-ESRGAN binary path
         realesrgan_bin = get_realesrgan_path()
@@ -1443,10 +1457,11 @@ class VideoUpscaler:
         ])
 
         if preserve_audio:
+            # NOTE: Don't use -shortest as it can truncate video/audio if durations differ
+            # Use all video frames AND full audio track
             reassemble_cmd.extend([
                 "-map", "0:v", "-map", "1:a",
                 "-c:a", "aac", "-b:a", "192k",
-                "-shortest",
             ])
         else:
             reassemble_cmd.extend(["-an"])
@@ -1459,6 +1474,399 @@ class VideoUpscaler:
             return False
 
         return output_path.exists()
+
+    def assemble_video(
+        self,
+        work_dir: Path,
+        output_path: Path,
+        original_input: Optional[Path] = None,
+        target_resolution: str = "4K",
+        preserve_audio: bool = True,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+        encoder: str = "hevc_videotoolbox",
+        quality: str = "medium",
+        threads: int = 0,
+        buffer_size: int = 128,
+    ) -> bool:
+        """
+        Assemble upscaled frames from a work directory into final video.
+
+        This is a standalone assembly operation for when frames are upscaled
+        but the video hasn't been reassembled yet.
+
+        Args:
+            work_dir: Path to work directory containing frames/ and upscaled/
+            output_path: Path for final output video
+            original_input: Path to original input video (for fps and audio).
+                          If None, will try to find it from the work dir hash.
+            target_resolution: Target resolution ("native", "1080p", "2K", "4K")
+            preserve_audio: Whether to copy audio from original
+            progress_callback: Optional callback for progress updates
+            encoder: Video encoder ("hevc_videotoolbox", "h264_videotoolbox", "libx264")
+            quality: Quality level ("high", "medium", "low")
+            threads: Number of threads (0=auto)
+            buffer_size: I/O buffer size in frames for thread_queue_size
+
+        Returns:
+            True if successful, False otherwise
+        """
+        work_dir = Path(work_dir)
+        upscaled_dir = work_dir / "upscaled"
+        frames_dir = work_dir / "frames"
+
+        if not upscaled_dir.exists():
+            logger.error(f"Upscaled directory not found: {upscaled_dir}")
+            return False
+
+        # Count frames
+        upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+        total_frames = len(list(frames_dir.glob("*.png")))
+
+        if upscaled_count == 0:
+            logger.error("No upscaled frames found")
+            return False
+
+        if upscaled_count < total_frames:
+            logger.warning(f"Only {upscaled_count}/{total_frames} frames upscaled")
+            if progress_callback:
+                progress_callback(f"⚠️ Only {upscaled_count}/{total_frames} frames upscaled", 0.1)
+
+        if progress_callback:
+            progress_callback(f"🎬 Assembling {upscaled_count} upscaled frames...", 0.1)
+
+        # Find original input if not provided
+        if original_input is None:
+            # Extract hash from work dir name (e.g., "realesrgan_abc123" -> "abc123")
+            work_hash = work_dir.name.replace("realesrgan_", "")
+            upload_dir = Path(config.output_dir) / "uploads"
+
+            # Search for any video format
+            for ext in ["mp4", "mov", "webm", "mkv", "avi"]:
+                for f in upload_dir.glob(f"upscale_input_*{work_hash}*.{ext}"):
+                    original_input = f
+                    logger.info(f"Found original input: {original_input}")
+                    break
+                if original_input:
+                    break
+
+        if original_input and original_input.exists():
+            if progress_callback:
+                progress_callback(f"🔊 Audio source: {original_input.name}", 0.15)
+        else:
+            logger.warning("No original video found - output will have no audio")
+            if progress_callback:
+                progress_callback("⚠️ No audio source found", 0.15)
+
+        # Get FPS from original or use default
+        fps = "30"
+        if original_input and original_input.exists():
+            probe_cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(original_input),
+            ]
+            result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                fps = result.stdout.strip()
+                logger.info(f"Using FPS from original: {fps}")
+
+        if progress_callback:
+            progress_callback(f"📹 Using framerate: {fps}", 0.2)
+
+        # Kill any stale FFmpeg processes using this work directory
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", f"ffmpeg.*{work_dir.name}"],
+                capture_output=True, text=True, timeout=2
+            )
+            if result.stdout.strip():
+                stale_pids = result.stdout.strip().split('\n')
+                logger.warning(f"Found {len(stale_pids)} stale FFmpeg processes for this session, killing...")
+                if progress_callback:
+                    progress_callback(f"🧹 Cleaning up {len(stale_pids)} stale processes...", 0.25)
+                for pid in stale_pids:
+                    try:
+                        subprocess.run(["kill", "-9", pid.strip()], timeout=2)
+                    except Exception:
+                        pass
+                import time
+                time.sleep(1)  # Brief pause for cleanup
+        except Exception as e:
+            logger.debug(f"Process cleanup check failed: {e}")
+
+        # Get target dimensions (None for native = no scaling)
+        if target_resolution == "native":
+            target_width, target_height = None, None
+            res_label = "Native"
+        else:
+            target_width, target_height = RESOLUTIONS.get(target_resolution, (3840, 2160))
+            res_label = f"{target_width}x{target_height}"
+
+        if progress_callback:
+            progress_callback(f"📐 Output: {res_label}", 0.22)
+
+        # Build FFmpeg reassembly command
+        reassemble_cmd = ["ffmpeg", "-y"]
+
+        # Only add threads if user specified (0 = auto/let FFmpeg decide)
+        if threads > 0:
+            reassemble_cmd.extend(["-threads", str(threads)])
+
+        # Add thread_queue_size for better I/O buffering
+        reassemble_cmd.extend([
+            "-thread_queue_size", str(buffer_size),
+            "-framerate", fps,
+            "-i", str(upscaled_dir / "frame_%06d.jpg"),
+        ])
+
+        if preserve_audio and original_input and original_input.exists():
+            reassemble_cmd.extend(["-i", str(original_input)])
+
+        # Quality mapping for different encoders
+        quality_map = {
+            "hevc_videotoolbox": {"high": 80, "medium": 65, "low": 50},
+            "h264_videotoolbox": {"high": 80, "medium": 65, "low": 50},
+            "libx264": {"high": 18, "medium": 23, "low": 28},  # CRF (lower = better)
+        }
+
+        # Add video filter for scaling (skip if native)
+        if target_width and target_height:
+            reassemble_cmd.extend(["-vf", f"scale={target_width}:{target_height}:flags=lanczos"])
+
+        # Apply encoder-specific settings
+        if encoder in ["hevc_videotoolbox", "h264_videotoolbox"]:
+            # Hardware encoding (VideoToolbox)
+            q_value = quality_map.get(encoder, {}).get(quality, 65)
+            reassemble_cmd.extend([
+                "-c:v", encoder,
+                "-q:v", str(q_value),
+            ])
+            if encoder == "hevc_videotoolbox":
+                reassemble_cmd.extend(["-tag:v", "hvc1"])  # Compatibility tag for HEVC
+            encoder_label = "Hardware"
+        else:
+            # Software encoding (libx264)
+            crf = quality_map.get("libx264", {}).get(quality, 23)
+            preset = "medium" if quality == "high" else "fast" if quality == "medium" else "veryfast"
+            reassemble_cmd.extend([
+                "-c:v", "libx264",
+                "-preset", preset,
+                "-crf", str(crf),
+                "-pix_fmt", "yuv420p",
+            ])
+            encoder_label = "Software"
+
+        if preserve_audio and original_input and original_input.exists():
+            # NOTE: Don't use -shortest as it can truncate video if audio duration differs
+            # Let FFmpeg use all video frames - audio will end naturally if shorter
+            reassemble_cmd.extend([
+                "-map", "0:v", "-map", "1:a",
+                "-c:a", "aac", "-b:a", "192k",
+            ])
+        else:
+            reassemble_cmd.extend(["-an"])
+
+        reassemble_cmd.append(str(output_path))
+
+        if progress_callback:
+            progress_callback(f"🔄 Encoding {upscaled_count:,} frames ({encoder_label} - {quality})...", 0.3)
+
+        logger.info(f"Running assembly: {' '.join(reassemble_cmd)}")
+
+        import re
+        import time
+
+        # Use a log file for FFmpeg progress - allows monitoring from detached process
+        ffmpeg_log = work_dir / "ffmpeg_assembly.log"
+        lock_file = work_dir / "assembly.lock"
+
+        # Kill any existing FFmpeg assembly processes for this work dir before starting new one
+        try:
+            # Find and kill any FFmpeg processes using this work directory
+            result = subprocess.run(
+                ["pgrep", "-f", f"ffmpeg.*{work_dir.name}"],
+                capture_output=True, text=True, timeout=2
+            )
+            if result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                if progress_callback:
+                    progress_callback(f"🧹 Killing {len(pids)} existing FFmpeg process(es)...", 0.25)
+                logger.warning(f"Killing {len(pids)} existing FFmpeg processes before starting new assembly")
+                for pid in pids:
+                    try:
+                        subprocess.run(["kill", "-9", pid.strip()], timeout=2)
+                    except Exception:
+                        pass
+                time.sleep(1)  # Wait for cleanup
+        except Exception as e:
+            logger.debug(f"Process cleanup check failed: {e}")
+
+        # Clean up stale lock file
+        if lock_file.exists():
+            lock_file.unlink()
+
+        # Check if output already complete
+        if output_path.exists():
+            # Verify it has the expected frames
+            probe_cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=nb_frames",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(output_path),
+            ]
+            result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            is_complete = False
+            if result.returncode == 0:
+                try:
+                    existing_frames = int(result.stdout.strip())
+                    if existing_frames >= upscaled_count * 0.99:  # Allow 1% tolerance
+                        file_size_mb = output_path.stat().st_size / 1024 / 1024
+                        if progress_callback:
+                            progress_callback(f"✅ Video already assembled: {file_size_mb:.1f} MB ({existing_frames:,} frames)", 1.0)
+                        return True
+                    else:
+                        # Incomplete - remove and restart
+                        logger.warning(f"Incomplete output: {existing_frames}/{upscaled_count} frames, removing")
+                except ValueError:
+                    logger.warning("Could not parse frame count from existing output, removing")
+
+            if not is_complete:
+                # Remove incomplete/corrupted output before restarting
+                if progress_callback:
+                    progress_callback("🗑️ Removing incomplete output file...", 0.28)
+                output_path.unlink()
+                time.sleep(0.5)
+
+        # Start FFmpeg in detached session so it survives Streamlit restarts
+        with open(ffmpeg_log, 'w') as log_file:
+            # Add -progress pipe:1 to get structured progress output
+            cmd_with_progress = reassemble_cmd.copy()
+            # Insert -progress before output path
+            output_idx = cmd_with_progress.index(str(output_path))
+            cmd_with_progress.insert(output_idx, "pipe:1")
+            cmd_with_progress.insert(output_idx, "-progress")
+
+            process = subprocess.Popen(
+                cmd_with_progress,
+                stdout=log_file,  # Progress goes here
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,  # SURVIVES STREAMLIT RESTARTS
+            )
+
+        # Write lock file
+        lock_file.write_text(f"{process.pid}\n{output_path}")
+        logger.info(f"Started detached FFmpeg assembly: PID {process.pid}")
+
+        if progress_callback:
+            progress_callback(f"🚀 Assembly started (PID {process.pid}) - survives page refresh", 0.35)
+
+        # Monitor progress for a while (but don't block forever)
+        start_time = time.time()
+        last_update = time.time()
+        max_monitor_time = 600  # Monitor for up to 10 minutes, then return anyway
+
+        while time.time() - start_time < max_monitor_time:
+            # Check if process still running
+            result = subprocess.run(["ps", "-p", str(process.pid)], capture_output=True)
+            if result.returncode != 0:
+                # Process finished - check result
+                break
+
+            # Parse progress from log file
+            if ffmpeg_log.exists():
+                try:
+                    log_content = ffmpeg_log.read_text()
+                    # FFmpeg progress format: frame=1234\n
+                    frame_matches = re.findall(r'frame=(\d+)', log_content)
+                    fps_matches = re.findall(r'fps=([\d.]+)', log_content)
+
+                    if frame_matches:
+                        current_frame = int(frame_matches[-1])  # Get latest
+                        current_fps = float(fps_matches[-1]) if fps_matches else 0
+                        pct = min(0.95, 0.35 + 0.60 * (current_frame / upscaled_count))
+
+                        # Calculate ETA
+                        remaining_frames = upscaled_count - current_frame
+                        if current_fps > 0:
+                            eta_seconds = remaining_frames / current_fps
+                            if eta_seconds > 3600:
+                                eta_str = f"{int(eta_seconds/3600)}h {int((eta_seconds%3600)/60)}m"
+                            elif eta_seconds > 60:
+                                eta_str = f"{int(eta_seconds/60)}m {int(eta_seconds%60)}s"
+                            else:
+                                eta_str = f"{int(eta_seconds)}s"
+                        else:
+                            eta_str = "calculating..."
+
+                        # Update every 1 second
+                        if time.time() - last_update > 1.0:
+                            if progress_callback:
+                                progress_callback(
+                                    f"🎬 Encoding: {current_frame:,}/{upscaled_count:,} | {current_fps:.1f} fps | ETA: {eta_str}",
+                                    pct
+                                )
+                            last_update = time.time()
+
+                            # Check if done
+                            if current_frame >= upscaled_count * 0.99:
+                                break
+                except Exception:
+                    pass
+
+            time.sleep(1.0)
+
+        # Check final result
+        # Give it a moment to finalize
+        time.sleep(2)
+
+        # Clean up lock file
+        if lock_file.exists():
+            lock_file.unlink()
+
+        if output_path.exists():
+            file_size_mb = output_path.stat().st_size / 1024 / 1024
+
+            # Verify frame count
+            probe_cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=nb_frames",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(output_path),
+            ]
+            result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            actual_frames = 0
+            try:
+                actual_frames = int(result.stdout.strip()) if result.returncode == 0 else 0
+            except ValueError:
+                pass
+
+            if actual_frames >= upscaled_count * 0.99:
+                if progress_callback:
+                    progress_callback(f"✅ Video assembled: {output_path.name} ({file_size_mb:.1f} MB, {actual_frames:,} frames)", 1.0)
+                logger.info(f"Successfully assembled video: {output_path}")
+                return True
+            else:
+                logger.warning(f"Assembly may be incomplete: {actual_frames}/{upscaled_count} frames")
+                if progress_callback:
+                    progress_callback(f"⚠️ Assembly in progress: {actual_frames:,}/{upscaled_count:,} frames", 0.8)
+                return True  # Still return True - process may still be running
+
+        else:
+            # Check if process is still running
+            result = subprocess.run(["ps", "-p", str(process.pid)], capture_output=True)
+            if result.returncode == 0:
+                if progress_callback:
+                    progress_callback(f"🔄 Assembly still running (PID {process.pid})...", 0.5)
+                return True  # Process is running
+            else:
+                logger.error("Assembly failed - no output file created")
+                if progress_callback:
+                    progress_callback("❌ Assembly failed - check logs", 0.5)
+                return False
 
     def get_video_resolution(self, video_path: Path) -> tuple[int, int]:
         """Get the current resolution of a video."""
