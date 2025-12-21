@@ -1083,8 +1083,8 @@ class VideoUpscaler:
 
                 # PARALLEL PROCESSING: Run multiple realesrgan workers simultaneously
                 # This significantly speeds up processing by utilizing more GPU/CPU resources
-                NUM_WORKERS = 16  # Run 16 parallel processes for maximum throughput
-                FRAMES_PER_WORKER = 50  # Each worker processes 50 frames at a time
+                NUM_WORKERS = 16  # Run 16 parallel processes
+                FRAMES_PER_WORKER = 25  # Each worker processes 25 frames at a time
 
                 # Find models directory once
                 home = Path.home()
