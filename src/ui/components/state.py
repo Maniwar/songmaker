@@ -708,9 +708,9 @@ def render_project_sidebar() -> None:
         with st.expander("Settings", expanded=False):
             # Claude model selection
             claude_models = {
-                "claude-3-5-haiku-20241022": "Haiku (Fast & Cheap)",
-                "claude-sonnet-4-5-20250929": "Sonnet (Balanced)",
-                "claude-opus-4-5-20251101": "Opus (Best Quality)",
+                "claude-haiku-4-5-20251001": "Haiku 4.5 (Fast & Cheap)",
+                "claude-sonnet-4-5-20250929": "Sonnet 4.5 (Balanced)",
+                "claude-opus-4-5-20251101": "Opus 4.5 (Best Quality)",
             }
 
             state = get_state()
