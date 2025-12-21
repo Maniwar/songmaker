@@ -747,10 +747,15 @@ class VideoUpscaler:
         Uses persistent work directory for resume capability.
         """
         import hashlib
+        import os
         import time
 
         if progress_callback:
             progress_callback("Starting Real-ESRGAN Vulkan upscaler...", 0.1)
+
+        # HEALTH CHECK: Detect and kill any stalled realesrgan processes
+        # This runs every time the function is called (on button click or page reload)
+        self._kill_stalled_realesrgan_processes(progress_callback)
 
         # Real-ESRGAN works on images, so we need to:
         # 1. Extract frames (or reuse existing)
