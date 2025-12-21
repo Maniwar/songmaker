@@ -1030,18 +1030,6 @@ class VideoUpscaler:
             total_frames = len(list(frames_dir.glob("*.png")))
             logger.info(f"Extracted {total_frames} frames")
 
-        # Save metadata for reliable completion detection
-        # This prevents false "complete" detection if frames dir is corrupted
-        metadata_file = work_dir / "metadata.json"
-        import json
-        metadata = {
-            "total_frames": total_frames,
-            "input_file": str(input_path),
-            "created_at": datetime.now().isoformat(),
-        }
-        metadata_file.write_text(json.dumps(metadata, indent=2))
-        logger.info(f"Saved metadata: {total_frames} frames expected")
-
         # Step 2: Upscale frames with Real-ESRGAN (with resume support)
         # Get Real-ESRGAN binary path
         realesrgan_bin = get_realesrgan_path()
@@ -1051,6 +1039,21 @@ class VideoUpscaler:
 
         # Use model from instance or default to RealESRGAN_General_x4_v3
         model_name = getattr(self, '_realesrgan_model', 'RealESRGAN_General_x4_v3')
+
+        # Save metadata for reliable completion detection and resume
+        # This prevents false "complete" detection if frames dir is corrupted
+        # Also stores model name so corrupted frame fixes use the same model
+        metadata_file = work_dir / "metadata.json"
+        import json
+        from datetime import datetime
+        metadata = {
+            "total_frames": total_frames,
+            "input_file": str(input_path),
+            "model_name": model_name,  # Store model for corrupted frame fixes
+            "created_at": datetime.now().isoformat(),
+        }
+        metadata_file.write_text(json.dumps(metadata, indent=2))
+        logger.info(f"Saved metadata: {total_frames} frames, model={model_name}")
 
         # Check which frames still need to be upscaled (for resume capability)
         all_frames = sorted(frames_dir.glob("*.png"))
@@ -1549,6 +1552,28 @@ class VideoUpscaler:
 
             realesrgan_bin = get_realesrgan_path()
             if realesrgan_bin:
+                # Read model from metadata (if available) to use the same model as original upscaling
+                import json
+                metadata_file = work_dir / "metadata.json"
+                model_name = "RealESRGAN_General_x4_v3"  # Default fallback
+                if metadata_file.exists():
+                    try:
+                        metadata = json.loads(metadata_file.read_text())
+                        model_name = metadata.get("model_name", model_name)
+                        logger.info(f"Using model from metadata: {model_name}")
+                    except Exception as e:
+                        logger.warning(f"Could not read metadata: {e}, using default model")
+
+                if progress_callback:
+                    progress_callback(f"🔧 Fixing {len(corrupted_frames)} frame(s) with {model_name}...", 0.12)
+
+                # Find models directory
+                home = Path.home()
+                models_dir = home / ".local" / "share" / "realesrgan-ncnn-vulkan" / "models"
+                if not models_dir.exists():
+                    bin_path = Path(realesrgan_bin).parent
+                    models_dir = bin_path / "models"
+
                 for corrupted in corrupted_frames:
                     frame_name = corrupted.stem  # e.g., "frame_006767"
                     source_png = frames_dir / f"{frame_name}.png"
@@ -1556,16 +1581,19 @@ class VideoUpscaler:
                     if source_png.exists():
                         # Remove corrupted file
                         corrupted.unlink()
-                        logger.info(f"Re-upscaling {frame_name}...")
+                        logger.info(f"Re-upscaling {frame_name} with {model_name}...")
 
-                        # Re-upscale this frame
+                        # Re-upscale this frame (same params as main upscaling)
                         upscale_cmd = [
                             realesrgan_bin,
                             "-i", str(source_png),
                             "-o", str(upscaled_dir / f"{frame_name}.jpg"),
-                            "-n", "realesrgan-x4plus",
+                            "-n", model_name,
                             "-f", "jpg",
                         ]
+                        if models_dir.exists():
+                            upscale_cmd.extend(["-m", str(models_dir)])
+
                         result = subprocess.run(upscale_cmd, capture_output=True, text=True, timeout=120)
                         if result.returncode == 0:
                             new_size = (upscaled_dir / f"{frame_name}.jpg").stat().st_size
@@ -1856,6 +1884,11 @@ class VideoUpscaler:
         last_update = time.time()
         max_monitor_time = 600  # Monitor for up to 10 minutes, then return anyway
 
+        # Track frames for our own fps calculation (more accurate than FFmpeg's average)
+        last_frame_count = 0
+        last_fps_check_time = time.time()
+        calculated_fps = 0.0
+
         while time.time() - start_time < max_monitor_time:
             # Check if process still running
             result = subprocess.run(["ps", "-p", str(process.pid)], capture_output=True)
@@ -1869,12 +1902,22 @@ class VideoUpscaler:
                     log_content = ffmpeg_log.read_text()
                     # FFmpeg progress format: frame=1234\n
                     frame_matches = re.findall(r'frame=(\d+)', log_content)
-                    fps_matches = re.findall(r'fps=([\d.]+)', log_content)
 
                     if frame_matches:
                         current_frame = int(frame_matches[-1])  # Get latest
-                        current_fps = float(fps_matches[-1]) if fps_matches else 0
                         pct = min(0.95, 0.35 + 0.60 * (current_frame / upscaled_count))
+
+                        # Calculate our own fps (more accurate than FFmpeg's slow-updating average)
+                        now = time.time()
+                        fps_interval = now - last_fps_check_time
+                        if fps_interval >= 2.0:  # Update fps every 2 seconds
+                            frames_done = current_frame - last_frame_count
+                            if frames_done > 0:
+                                calculated_fps = frames_done / fps_interval
+                            last_frame_count = current_frame
+                            last_fps_check_time = now
+
+                        current_fps = calculated_fps if calculated_fps > 0 else 0
 
                         # Calculate ETA
                         remaining_frames = upscaled_count - current_frame
