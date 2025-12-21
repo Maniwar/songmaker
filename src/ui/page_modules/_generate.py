@@ -1591,12 +1591,18 @@ def render_upscale_only_page(state) -> None:
                         upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
                         if upscaled_frames:
                             max_frame = len(upscaled_frames)
+                            # Preserve slider position in session state
+                            slider_key = "browse_frame_slider_top"
+                            if slider_key not in st.session_state:
+                                st.session_state[slider_key] = min(max_frame, 1)
+                            # Clamp to valid range if frames changed
+                            if st.session_state[slider_key] > max_frame:
+                                st.session_state[slider_key] = max_frame
                             frame_num = st.slider(
                                 "Select frame",
                                 min_value=1,
                                 max_value=max_frame,
-                                value=1,
-                                key="browse_frame_slider_top"
+                                key=slider_key
                             )
                             frame_path = work_dir / "upscaled" / f"frame_{frame_num:06d}.jpg"
                             orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
@@ -1651,9 +1657,8 @@ def render_upscale_only_page(state) -> None:
             progress_bar = st.progress(0, text="Starting upscaling...")
             status_text = st.empty()
 
-            # Live preview during upscaling
+            # Live preview section
             st.markdown("### Live Preview (Before / After)")
-            work_dir_display = st.empty()  # Shows work directory path
             preview_cols = st.columns(2)
             with preview_cols[0]:
                 st.caption("Original (1080p)")
@@ -1663,7 +1668,7 @@ def render_upscale_only_page(state) -> None:
                 upscaled_preview = st.empty()
             frame_info = st.empty()
 
-            # Track state for live updates
+            # Track for live updates
             live_state = {"work_dir": None, "last_update": 0}
 
             def progress_callback(message: str, progress: float):
@@ -1671,12 +1676,11 @@ def render_upscale_only_page(state) -> None:
                 progress_bar.progress(progress, text=message)
                 status_text.text(message)
 
-                # Extract work directory and store in session state
+                # Extract and store work directory
                 if "Work:" in message:
                     work_dir_path = message.split("Work:")[-1].strip()
                     live_state["work_dir"] = work_dir_path
                     st.session_state["upscale_work_dir"] = work_dir_path
-                    work_dir_display.code(work_dir_path, language=None)
 
                 # Update live preview every 2 seconds
                 if live_state["work_dir"] and progress >= 0.22:
@@ -1686,25 +1690,16 @@ def render_upscale_only_page(state) -> None:
                         try:
                             work_dir = Path(live_state["work_dir"])
                             upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
-                            if upscaled_frames:
-                                # Show a frame that's not the very latest (to avoid reading partial writes)
-                                # Use second-to-last if available, or skip if only one frame
-                                if len(upscaled_frames) >= 3:
-                                    preview_frame = upscaled_frames[-3]  # Use 3rd from last
-                                elif len(upscaled_frames) >= 2:
-                                    preview_frame = upscaled_frames[-2]  # Use 2nd from last
-                                else:
-                                    preview_frame = upscaled_frames[0]  # First frame only
-
+                            if len(upscaled_frames) >= 3:
+                                preview_frame = upscaled_frames[-3]
                                 frame_num = int(preview_frame.stem.split("_")[-1])
                                 orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
 
                                 if orig_frame.exists():
-                                    original_preview.image(str(orig_frame), use_container_width=True)
-                                upscaled_preview.image(str(preview_frame), use_container_width=True)
+                                    original_preview.image(str(orig_frame), width="stretch")
+                                upscaled_preview.image(str(preview_frame), width="stretch")
                                 frame_info.caption(f"Frame {frame_num} | {len(upscaled_frames)} upscaled")
-                        except Exception as e:
-                            # Ignore errors from reading partial files during live preview
+                        except Exception:
                             pass
 
             try:

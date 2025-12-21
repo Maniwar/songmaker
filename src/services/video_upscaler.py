@@ -1083,8 +1083,8 @@ class VideoUpscaler:
 
                 # PARALLEL PROCESSING: Run multiple realesrgan workers simultaneously
                 # This significantly speeds up processing by utilizing more GPU/CPU resources
-                NUM_WORKERS = 16  # Run 16 parallel processes
-                FRAMES_PER_WORKER = 25  # Each worker processes 25 frames at a time
+                NUM_WORKERS = 8  # Run 8 parallel processes
+                FRAMES_PER_WORKER = 50  # Each worker processes 50 frames at a time
 
                 # Find models directory once
                 home = Path.home()
@@ -1234,7 +1234,7 @@ class VideoUpscaler:
                             upscale_progress = 0.22 + (0.58 * total_done_now / total_frames)
                             if progress_callback:
                                 progress_callback(
-                                    f"🚀 {num_workers_this_round} workers | {total_done_now}/{total_frames} (ETA: {eta})",
+                                    f"🚀 {num_workers_this_round} workers | {total_done_now}/{total_frames} (ETA: {eta}) | Work: {work_dir}",
                                     min(0.80, upscale_progress)
                                 )
                         time.sleep(1.0)
