@@ -1652,18 +1652,29 @@ def render_upscale_only_page(state) -> None:
                     current_time = time.time()
                     if current_time - live_state["last_update"] > 2:
                         live_state["last_update"] = current_time
-                        work_dir = Path(live_state["work_dir"])
-                        upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
-                        if upscaled_frames:
-                            # Show latest frame
-                            latest = upscaled_frames[-1]
-                            frame_num = int(latest.stem.split("_")[-1])
-                            orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
+                        try:
+                            work_dir = Path(live_state["work_dir"])
+                            upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
+                            if upscaled_frames:
+                                # Show a frame that's not the very latest (to avoid reading partial writes)
+                                # Use second-to-last if available, or skip if only one frame
+                                if len(upscaled_frames) >= 3:
+                                    preview_frame = upscaled_frames[-3]  # Use 3rd from last
+                                elif len(upscaled_frames) >= 2:
+                                    preview_frame = upscaled_frames[-2]  # Use 2nd from last
+                                else:
+                                    preview_frame = upscaled_frames[0]  # First frame only
 
-                            if orig_frame.exists():
-                                original_preview.image(str(orig_frame), use_container_width=True)
-                            upscaled_preview.image(str(latest), use_container_width=True)
-                            frame_info.caption(f"Frame {frame_num} | {len(upscaled_frames)} upscaled")
+                                frame_num = int(preview_frame.stem.split("_")[-1])
+                                orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
+
+                                if orig_frame.exists():
+                                    original_preview.image(str(orig_frame), use_container_width=True)
+                                upscaled_preview.image(str(preview_frame), use_container_width=True)
+                                frame_info.caption(f"Frame {frame_num} | {len(upscaled_frames)} upscaled")
+                        except Exception as e:
+                            # Ignore errors from reading partial files during live preview
+                            pass
 
             try:
                 upscaler = VideoUpscaler()

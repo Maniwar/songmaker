@@ -870,90 +870,185 @@ class VideoUpscaler:
                 progress_callback(f"✅ All {total_frames} frames already upscaled!", 0.80)
             logger.info(f"All {total_frames} frames already upscaled, skipping to reassembly")
         else:
-            # Create temp directory with symlinks to only the remaining frames
-            # This is faster than copying and allows realesrgan to process only what's needed
-            pending_dir = work_dir / "pending"
-            if pending_dir.exists():
-                shutil.rmtree(pending_dir)
-            pending_dir.mkdir(parents=True, exist_ok=True)
-
-            for frame in remaining_frames:
-                # Use absolute path for symlink target to avoid issues
-                (pending_dir / frame.name).symlink_to(frame.absolute())
-
-            if progress_callback:
-                progress_callback(f"📷 Processing {len(remaining_frames)} remaining frames...", 0.22)
-
-            # Find models directory
-            home = Path.home()
-            models_dir = home / ".local" / "share" / "realesrgan-ncnn-vulkan" / "models"
-            if not models_dir.exists():
-                # Check next to binary
-                bin_path = Path(realesrgan_bin).parent
-                models_dir = bin_path / "models"
-
-            upscale_cmd = [
-                realesrgan_bin,
-                "-i", str(pending_dir),  # Only process remaining frames
-                "-o", str(upscaled_dir),
-                "-n", model_name,
-                "-f", "jpg",  # JPEG is ~10x smaller/faster than PNG (3-5MB vs 43MB per frame)
-                "-j", "4:4:4",  # Parallel: 4 threads for load, 4 for process, 4 for save
-            ]
-
-            # Add models path if it exists
-            if models_dir.exists():
-                upscale_cmd.extend(["-m", str(models_dir)])
-
-            logger.info(f"Running Real-ESRGAN on {len(remaining_frames)} remaining frames: {' '.join(upscale_cmd)}")
-
-            # Run upscaling in background and monitor progress
-            process = subprocess.Popen(
-                upscale_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-
-            # Monitor upscaling progress - use total already done + new upscaled for accurate ETA
-            start_time = time.time()
-            initial_upscaled = already_done
-            if progress_callback:
-                while process.poll() is None:
-                    upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
-                    new_this_run = upscaled_count - initial_upscaled
-                    if new_this_run > 0 and total_frames > 0:
-                        # Calculate ETA based on new frames processed this run
-                        elapsed = time.time() - start_time
-                        time_per_frame = elapsed / new_this_run
-                        remaining_count = total_frames - upscaled_count
-                        remaining_time = time_per_frame * remaining_count
-
-                        if remaining_time < 60:
-                            eta = f"{int(remaining_time)}s"
-                        elif remaining_time < 3600:
-                            eta = f"{int(remaining_time/60)}m {int(remaining_time%60)}s"
-                        else:
-                            eta = f"{int(remaining_time/3600)}h {int((remaining_time%3600)/60)}m"
-
-                        upscale_progress = 0.22 + (0.58 * upscaled_count / total_frames)
-                        progress_callback(
-                            f"Upscaling: {upscaled_count}/{total_frames} (ETA: {eta})",
-                            min(0.80, upscale_progress)
+            # Check for existing process via lock file to prevent duplicates
+            import os
+            lock_file = work_dir / "upscale.lock"
+            if lock_file.exists():
+                try:
+                    lock_data = lock_file.read_text().strip().split("\n")
+                    existing_pid = int(lock_data[0])
+                    # Check if process is still running
+                    try:
+                        os.kill(existing_pid, 0)  # Signal 0 = check if process exists
+                        # Process exists - check if it's actually realesrgan
+                        result = subprocess.run(
+                            ["ps", "-p", str(existing_pid), "-o", "comm="],
+                            capture_output=True, text=True
                         )
-                    time.sleep(1.0)
+                        if "realesrgan" in result.stdout.lower():
+                            logger.info(f"Upscaling already in progress (PID {existing_pid}), attaching to existing process")
+                            if progress_callback:
+                                progress_callback(f"⏳ Upscaling already running (PID {existing_pid}), monitoring...", 0.22)
+                            # Monitor the existing process instead of starting a new one
+                            start_time = time.time()
+                            initial_upscaled = already_done
+                            while True:
+                                # Check if process still running
+                                try:
+                                    os.kill(existing_pid, 0)
+                                except OSError:
+                                    break  # Process finished
+                                upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+                                new_this_run = upscaled_count - initial_upscaled
+                                if new_this_run > 0 and total_frames > 0:
+                                    elapsed = time.time() - start_time
+                                    time_per_frame = elapsed / new_this_run
+                                    remaining_count = total_frames - upscaled_count
+                                    remaining_time = time_per_frame * remaining_count
+                                    if remaining_time < 60:
+                                        eta = f"{int(remaining_time)}s"
+                                    elif remaining_time < 3600:
+                                        eta = f"{int(remaining_time/60)}m {int(remaining_time%60)}s"
+                                    else:
+                                        eta = f"{int(remaining_time/3600)}h {int((remaining_time%3600)/60)}m"
+                                    upscale_progress = 0.22 + (0.58 * upscaled_count / total_frames)
+                                    if progress_callback:
+                                        progress_callback(
+                                            f"Upscaling: {upscaled_count}/{total_frames} (ETA: {eta})",
+                                            min(0.80, upscale_progress)
+                                        )
+                                time.sleep(1.0)
+                            # Process finished, clean up lock file
+                            if lock_file.exists():
+                                lock_file.unlink()
+                            # Skip to validation - frames should be done
+                            upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+                            logger.info(f"Attached process finished: {upscaled_count} frames total")
+                            # Jump to validation section
+                            if upscaled_count < total_frames:
+                                logger.error(f"Not all frames upscaled: {upscaled_count}/{total_frames}")
+                                if progress_callback:
+                                    progress_callback(f"⚠️ Only {upscaled_count}/{total_frames} frames upscaled. Restart to continue.", 0.25)
+                                return False
+                            # Skip to reassembly
+                            goto_reassembly = True
+                        else:
+                            # PID exists but not realesrgan - stale lock
+                            lock_file.unlink()
+                            goto_reassembly = False
+                    except OSError:
+                        # Process doesn't exist - stale lock file
+                        lock_file.unlink()
+                        goto_reassembly = False
+                except (ValueError, IndexError):
+                    # Invalid lock file
+                    lock_file.unlink()
+                    goto_reassembly = False
+            else:
+                goto_reassembly = False
 
-            stdout, stderr = process.communicate()
-            if process.returncode != 0:
-                logger.error(f"Real-ESRGAN failed: {stderr}")
-                return False
+            if goto_reassembly:
+                pass  # Skip to reassembly section below
+            else:
+                # Create temp directory with hard links to only the remaining frames
+                pending_dir = work_dir / "pending"
+                if pending_dir.exists():
+                    shutil.rmtree(pending_dir)
+                pending_dir.mkdir(parents=True, exist_ok=True)
 
-            # Clean up pending symlink directory
-            if pending_dir.exists():
-                shutil.rmtree(pending_dir)
+                for frame in remaining_frames:
+                    # Use hard links - realesrgan doesn't follow symlinks
+                    os.link(str(frame.absolute()), str(pending_dir / frame.name))
+
+                if progress_callback:
+                    progress_callback(f"📷 Processing {len(remaining_frames)} remaining frames...", 0.22)
+
+                # Find models directory
+                home = Path.home()
+                models_dir = home / ".local" / "share" / "realesrgan-ncnn-vulkan" / "models"
+                if not models_dir.exists():
+                    # Check next to binary
+                    bin_path = Path(realesrgan_bin).parent
+                    models_dir = bin_path / "models"
+
+                upscale_cmd = [
+                    realesrgan_bin,
+                    "-i", str(pending_dir),  # Only process remaining frames
+                    "-o", str(upscaled_dir),
+                    "-n", model_name,
+                    "-f", "jpg",  # JPEG is ~10x smaller/faster than PNG (3-5MB vs 43MB per frame)
+                    "-j", "4:4:4",  # Parallel: 4 threads for load, 4 for process, 4 for save
+                ]
+
+                # Add models path if it exists
+                if models_dir.exists():
+                    upscale_cmd.extend(["-m", str(models_dir)])
+
+                logger.info(f"Running Real-ESRGAN on {len(remaining_frames)} remaining frames: {' '.join(upscale_cmd)}")
+
+                # Run upscaling in background and monitor progress
+                process = subprocess.Popen(
+                    upscale_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+
+                # Write lock file with PID to prevent duplicate processes
+                lock_file.write_text(f"{process.pid}\n{work_dir}")
+                logger.info(f"Started Real-ESRGAN process PID {process.pid}, lock file created")
+
+                # Monitor upscaling progress - use total already done + new upscaled for accurate ETA
+                start_time = time.time()
+                initial_upscaled = already_done
+                if progress_callback:
+                    while process.poll() is None:
+                        upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+                        new_this_run = upscaled_count - initial_upscaled
+                        if new_this_run > 0 and total_frames > 0:
+                            # Calculate ETA based on new frames processed this run
+                            elapsed = time.time() - start_time
+                            time_per_frame = elapsed / new_this_run
+                            remaining_count = total_frames - upscaled_count
+                            remaining_time = time_per_frame * remaining_count
+
+                            if remaining_time < 60:
+                                eta = f"{int(remaining_time)}s"
+                            elif remaining_time < 3600:
+                                eta = f"{int(remaining_time/60)}m {int(remaining_time%60)}s"
+                            else:
+                                eta = f"{int(remaining_time/3600)}h {int((remaining_time%3600)/60)}m"
+
+                            upscale_progress = 0.22 + (0.58 * upscaled_count / total_frames)
+                            progress_callback(
+                                f"Upscaling: {upscaled_count}/{total_frames} (ETA: {eta})",
+                                min(0.80, upscale_progress)
+                            )
+                        time.sleep(1.0)
+
+                stdout, stderr = process.communicate()
+
+                # Clean up lock file after process completes
+                if lock_file.exists():
+                    lock_file.unlink()
+
+                if process.returncode != 0:
+                    logger.error(f"Real-ESRGAN failed: {stderr}")
+                    return False
+
+                # Clean up pending hard links directory
+                if pending_dir.exists():
+                    shutil.rmtree(pending_dir)
 
         upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
         logger.info(f"Upscaled {upscaled_count} frames total")
+
+        # Validate all frames were upscaled before proceeding to assembly
+        if upscaled_count < total_frames:
+            logger.error(f"Not all frames upscaled: {upscaled_count}/{total_frames}")
+            if progress_callback:
+                progress_callback(f"⚠️ Only {upscaled_count}/{total_frames} frames upscaled. Restart to continue.", 0.25)
+            return False
 
         # Step 3: Get original video info (fps)
         probe_cmd = [
