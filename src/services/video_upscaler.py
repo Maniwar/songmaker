@@ -957,16 +957,16 @@ class VideoUpscaler:
                                 time.sleep(2)  # Brief delay for GPU recovery
                                 goto_reassembly = False  # Continue to batch processing
                             else:
-                                # Process finished normally, check validation
+                                # Process finished normally, check if all done
                                 upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
                                 logger.info(f"Attached process finished: {upscaled_count} frames total")
                                 if upscaled_count < total_frames:
-                                    logger.error(f"Not all frames upscaled: {upscaled_count}/{total_frames}")
-                                    if progress_callback:
-                                        progress_callback(f"⚠️ Only {upscaled_count}/{total_frames} frames upscaled. Restart to continue.", 0.25)
-                                    return False
-                                # Skip to reassembly
-                                goto_reassembly = True
+                                    # Not all done - continue to batch processing (DON'T return!)
+                                    logger.info(f"Attached process done but {total_frames - upscaled_count} frames remaining, continuing...")
+                                    goto_reassembly = False  # Continue to batch processing
+                                else:
+                                    # All frames done - skip to reassembly
+                                    goto_reassembly = True
                         else:
                             # PID exists but not realesrgan - stale lock
                             lock_file.unlink()
@@ -1075,7 +1075,9 @@ class VideoUpscaler:
                     batch_start = len(list(upscaled_dir.glob("*.jpg")))
                     last_progress_count = batch_start
                     last_progress_time = time.time()
-                    STALL_TIMEOUT = 5  # Kill process if no progress for 5 seconds
+                    STALL_TIMEOUT_FIRST = 10  # First frame needs model load time
+                    STALL_TIMEOUT = 5  # Subsequent frames: 5 seconds
+                    first_frame_done = False
                     process_stalled = False
 
                     if progress_callback:
@@ -1088,9 +1090,11 @@ class VideoUpscaler:
                             if upscaled_count > last_progress_count:
                                 last_progress_count = upscaled_count
                                 last_progress_time = time.time()
+                                first_frame_done = True
                             else:
                                 stall_duration = time.time() - last_progress_time
-                                if stall_duration > STALL_TIMEOUT:
+                                current_timeout = STALL_TIMEOUT_FIRST if not first_frame_done else STALL_TIMEOUT
+                                if stall_duration > current_timeout:
                                     logger.warning(f"Process stalled for {stall_duration:.0f}s, killing and restarting...")
                                     if progress_callback:
                                         progress_callback(
