@@ -1540,6 +1540,49 @@ class VideoUpscaler:
             if progress_callback:
                 progress_callback(f"⚠️ Only {upscaled_count}/{total_frames} frames upscaled", 0.1)
 
+        # Check for corrupted (0-byte) frames and re-upscale them
+        corrupted_frames = [f for f in upscaled_dir.glob("*.jpg") if f.stat().st_size == 0]
+        if corrupted_frames:
+            logger.warning(f"Found {len(corrupted_frames)} corrupted (0-byte) frames, re-upscaling...")
+            if progress_callback:
+                progress_callback(f"🔧 Fixing {len(corrupted_frames)} corrupted frame(s)...", 0.12)
+
+            realesrgan_bin = get_realesrgan_path()
+            if realesrgan_bin:
+                for corrupted in corrupted_frames:
+                    frame_name = corrupted.stem  # e.g., "frame_006767"
+                    source_png = frames_dir / f"{frame_name}.png"
+
+                    if source_png.exists():
+                        # Remove corrupted file
+                        corrupted.unlink()
+                        logger.info(f"Re-upscaling {frame_name}...")
+
+                        # Re-upscale this frame
+                        upscale_cmd = [
+                            realesrgan_bin,
+                            "-i", str(source_png),
+                            "-o", str(upscaled_dir / f"{frame_name}.jpg"),
+                            "-n", "realesrgan-x4plus",
+                            "-f", "jpg",
+                        ]
+                        result = subprocess.run(upscale_cmd, capture_output=True, text=True, timeout=120)
+                        if result.returncode == 0:
+                            new_size = (upscaled_dir / f"{frame_name}.jpg").stat().st_size
+                            logger.info(f"Fixed {frame_name}: {new_size} bytes")
+                        else:
+                            logger.error(f"Failed to re-upscale {frame_name}: {result.stderr}")
+                    else:
+                        logger.error(f"Source PNG not found for {frame_name}")
+
+                if progress_callback:
+                    progress_callback(f"✅ Fixed {len(corrupted_frames)} corrupted frame(s)", 0.15)
+            else:
+                logger.error("Cannot fix corrupted frames: realesrgan binary not found")
+                if progress_callback:
+                    progress_callback("❌ Cannot fix corrupted frames - realesrgan not found", 0.1)
+                return False
+
         if progress_callback:
             progress_callback(f"🎬 Assembling {upscaled_count} upscaled frames...", 0.1)
 
