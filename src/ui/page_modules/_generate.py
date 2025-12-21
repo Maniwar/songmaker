@@ -1371,7 +1371,7 @@ def render_upscale_only_page(state) -> None:
 
             return  # Don't render the rest of the page
 
-    st.header("Upscale Video to 4K")
+    st.header("AI Video Upscaler (Real-ESRGAN 4x)")
 
     # Exit button
     col1, col2 = st.columns([6, 1])
@@ -1383,7 +1383,11 @@ def render_upscale_only_page(state) -> None:
             st.rerun()
 
     st.markdown("""
-    Upload any video to upscale it to 4K resolution using local AI-powered upscaling.
+    Enhance your video using AI-powered 4x upscaling with Real-ESRGAN.
+
+    **How it works:**
+    1. Frames are extracted and upscaled **4x** (e.g., 1080p → 4320p/8K)
+    2. Final video is encoded at your chosen **output resolution**
 
     **Supported formats:** MP4, MOV, WebM, MKV, AVI
     """)
@@ -1434,10 +1438,11 @@ def render_upscale_only_page(state) -> None:
 
         with col1:
             target_resolution = st.selectbox(
-                "Target Resolution",
-                options=["4K (3840x2160)", "2K (2560x1440)", "1080p (1920x1080)"],
+                "Output Resolution",
+                options=["4K (3840x2160)", "Native (keep 4x upscaled)", "2K (2560x1440)", "1080p (1920x1080)"],
                 index=0,
                 key="upscale_only_resolution",
+                help="Final video resolution. Frames are upscaled 4x first (e.g., 1080p→8K), then scaled to this size. 'Native' keeps full 4x resolution."
             )
 
         with col2:
@@ -1610,10 +1615,11 @@ def render_upscale_only_page(state) -> None:
         # Map resolution selection to value
         resolution_map = {
             "4K (3840x2160)": "4K",
+            "Native (keep 4x upscaled)": "native",
             "2K (2560x1440)": "2K",
             "1080p (1920x1080)": "1080p",
         }
-        target_res = resolution_map[target_resolution]
+        target_res = resolution_map.get(target_resolution, "4K")
 
         st.markdown("---")
 
@@ -1655,7 +1661,54 @@ def render_upscale_only_page(state) -> None:
                     total_frames = len(list(completed_dir.glob("frames/*.png")))
                     upscaled_frames = len(list(completed_dir.glob("upscaled/*.jpg")))
                     if total_frames > 0 and upscaled_frames >= total_frames:
-                        # Found a completed session - show prominent banner
+                        # Check if assembly is already in progress
+                        from src.services.video_upscaler import VideoUpscaler
+                        upscaler = VideoUpscaler()
+                        assembly_status = upscaler.check_assembly_status(completed_dir)
+
+                        if assembly_status["status"] == "running":
+                            # Assembly in progress - show progress
+                            st.info(f"🎬 **Assembly in Progress** (PID {assembly_status['pid']})")
+                            progress = assembly_status["progress"]
+                            current = assembly_status["current_frame"]
+                            total = assembly_status["total_frames"]
+                            st.progress(progress, text=f"Encoding: {current:,}/{total:,} frames ({int(progress*100)}%)")
+                            st.caption("FFmpeg is running in background. Safe to leave - will complete automatically.")
+                            if st.button("🔄 Refresh Progress", key="refresh_assembly"):
+                                st.rerun()
+                            st.markdown("---")
+                            break
+
+                        elif assembly_status["status"] == "complete":
+                            # Assembly complete - show result with preview/download
+                            output_path = assembly_status["output_path"]
+                            file_size_mb = output_path.stat().st_size / 1024 / 1024
+                            file_size_gb = file_size_mb / 1024
+
+                            st.success(f"✅ **Video Complete!**")
+                            if file_size_gb >= 1:
+                                st.info(f"**{output_path.name}** | {file_size_gb:.2f} GB | {assembly_status['total_frames']:,} frames")
+                            else:
+                                st.info(f"**{output_path.name}** | {file_size_mb:.1f} MB | {assembly_status['total_frames']:,} frames")
+
+                            # Preview (if not too large)
+                            if file_size_mb < 500:
+                                st.video(str(output_path))
+                            else:
+                                st.warning("⚠️ File too large for browser preview. Use Finder to play.")
+
+                            # Path and open button
+                            col1, col2 = st.columns([3, 1])
+                            with col1:
+                                st.code(str(output_path), language=None)
+                            with col2:
+                                if st.button("📂 Open in Finder", key="open_output_folder"):
+                                    subprocess.run(["open", "-R", str(output_path)])
+
+                            st.markdown("---")
+                            break
+
+                        # Found a completed upscaling session - show assembly options
                         st.success(f"✅ **Upscaling Complete!** {upscaled_frames:,} frames ready for assembly")
                         st.info(f"Session: `{completed_dir.name}`")
 

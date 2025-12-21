@@ -282,11 +282,17 @@ class VideoUpscaler:
             logger.warning("Real-ESRGAN not available, falling back to FFmpeg")
             method = "ffmpeg"
 
-        target_width, target_height = RESOLUTIONS[target_resolution]
+        # Handle "native" resolution (keep 4x upscaled size)
+        if target_resolution == "native":
+            target_width, target_height = None, None  # Will be set during assembly
+            res_label = "native (4x upscaled)"
+        else:
+            target_width, target_height = RESOLUTIONS.get(target_resolution, (3840, 2160))
+            res_label = target_resolution
 
         logger.info(f"Final method after validation: {method}")
         if progress_callback:
-            progress_callback(f"Upscaling to {target_resolution} using {method}...", 0.1)
+            progress_callback(f"Upscaling to {res_label} using {method}...", 0.1)
 
         try:
             if method == "coreml_realesrgan":
@@ -1448,8 +1454,11 @@ class VideoUpscaler:
             reassemble_cmd.extend(["-i", str(input_path)])
 
         # Now add output options (filters, codecs, etc.)
+        # Only add scale filter if target dimensions are specified (not native)
+        if target_width and target_height:
+            reassemble_cmd.extend(["-vf", f"scale={target_width}:{target_height}:flags=lanczos"])
+
         reassemble_cmd.extend([
-            "-vf", f"scale={target_width}:{target_height}:flags=lanczos",
             "-c:v", "libx264",
             "-preset", "slow",
             "-crf", "18",
@@ -1682,9 +1691,33 @@ class VideoUpscaler:
         ffmpeg_log = work_dir / "ffmpeg_assembly.log"
         lock_file = work_dir / "assembly.lock"
 
-        # Kill any existing FFmpeg assembly processes for this work dir before starting new one
+        # Check if assembly is ALREADY in progress - if so, just monitor it (don't restart!)
+        if lock_file.exists():
+            try:
+                lock_content = lock_file.read_text().strip()
+                pid = int(lock_content.split('\n')[0])
+                # Check if process is still running
+                result = subprocess.run(["ps", "-p", str(pid)], capture_output=True)
+                if result.returncode == 0:
+                    # Process still running - DON'T kill it, just monitor
+                    if progress_callback:
+                        progress_callback(f"🔄 Assembly already in progress (PID {pid}), monitoring...", 0.35)
+                    logger.info(f"Found existing assembly process: PID {pid}, monitoring instead of restarting")
+
+                    # Jump to monitoring loop (don't start new process)
+                    return self._monitor_assembly(
+                        pid, ffmpeg_log, lock_file, output_path, upscaled_count, progress_callback
+                    )
+                else:
+                    # Stale lock - clean up
+                    logger.info(f"Stale lock file (PID {pid} not running), cleaning up")
+                    lock_file.unlink()
+            except Exception as e:
+                logger.warning(f"Error checking lock file: {e}")
+                lock_file.unlink()
+
+        # No active assembly - kill any orphaned FFmpeg processes for this work dir
         try:
-            # Find and kill any FFmpeg processes using this work directory
             result = subprocess.run(
                 ["pgrep", "-f", f"ffmpeg.*{work_dir.name}"],
                 capture_output=True, text=True, timeout=2
@@ -1692,20 +1725,16 @@ class VideoUpscaler:
             if result.stdout.strip():
                 pids = result.stdout.strip().split('\n')
                 if progress_callback:
-                    progress_callback(f"🧹 Killing {len(pids)} existing FFmpeg process(es)...", 0.25)
-                logger.warning(f"Killing {len(pids)} existing FFmpeg processes before starting new assembly")
+                    progress_callback(f"🧹 Cleaning up {len(pids)} orphaned FFmpeg process(es)...", 0.25)
+                logger.warning(f"Killing {len(pids)} orphaned FFmpeg processes")
                 for pid in pids:
                     try:
                         subprocess.run(["kill", "-9", pid.strip()], timeout=2)
                     except Exception:
                         pass
-                time.sleep(1)  # Wait for cleanup
+                time.sleep(1)
         except Exception as e:
             logger.debug(f"Process cleanup check failed: {e}")
-
-        # Clean up stale lock file
-        if lock_file.exists():
-            lock_file.unlink()
 
         # Check if output already complete
         if output_path.exists():
@@ -1740,12 +1769,21 @@ class VideoUpscaler:
                 output_path.unlink()
                 time.sleep(0.5)
 
+        # Use a TEMP file during encoding to prevent half-finished videos being shown
+        # Only rename to final path when complete
+        temp_output = output_path.with_suffix(".encoding.mp4")
+        if temp_output.exists():
+            temp_output.unlink()  # Remove any previous temp file
+
+        # Replace output path in command with temp path
+        reassemble_cmd[-1] = str(temp_output)
+
         # Start FFmpeg in detached session so it survives Streamlit restarts
         with open(ffmpeg_log, 'w') as log_file:
             # Add -progress pipe:1 to get structured progress output
             cmd_with_progress = reassemble_cmd.copy()
             # Insert -progress before output path
-            output_idx = cmd_with_progress.index(str(output_path))
+            output_idx = len(cmd_with_progress) - 1  # Last element is the output
             cmd_with_progress.insert(output_idx, "pipe:1")
             cmd_with_progress.insert(output_idx, "-progress")
 
@@ -1756,8 +1794,8 @@ class VideoUpscaler:
                 start_new_session=True,  # SURVIVES STREAMLIT RESTARTS
             )
 
-        # Write lock file
-        lock_file.write_text(f"{process.pid}\n{output_path}")
+        # Write lock file with temp path info so we know to rename when done
+        lock_file.write_text(f"{process.pid}\n{temp_output}\n{output_path}")
         logger.info(f"Started detached FFmpeg assembly: PID {process.pid}")
 
         if progress_callback:
@@ -1822,20 +1860,25 @@ class VideoUpscaler:
         # Give it a moment to finalize
         time.sleep(2)
 
-        # Clean up lock file
-        if lock_file.exists():
-            lock_file.unlink()
+        # Check if process is still running
+        result = subprocess.run(["ps", "-p", str(process.pid)], capture_output=True)
+        process_running = result.returncode == 0
 
-        if output_path.exists():
-            file_size_mb = output_path.stat().st_size / 1024 / 1024
+        if process_running:
+            # Still encoding - don't rename yet, just report progress
+            if progress_callback:
+                progress_callback(f"🔄 Assembly still running (PID {process.pid}) - safe to leave page", 0.5)
+            return True  # Process is running, will complete in background
 
-            # Verify frame count
+        # Process finished - check if temp file is complete, then rename
+        if temp_output.exists():
+            # Verify frame count in temp file
             probe_cmd = [
                 "ffprobe", "-v", "error",
                 "-select_streams", "v:0",
                 "-show_entries", "stream=nb_frames",
                 "-of", "default=noprint_wrappers=1:nokey=1",
-                str(output_path),
+                str(temp_output),
             ]
             result = subprocess.run(probe_cmd, capture_output=True, text=True)
             actual_frames = 0
@@ -1845,28 +1888,138 @@ class VideoUpscaler:
                 pass
 
             if actual_frames >= upscaled_count * 0.99:
+                # Complete! Rename temp to final
+                import shutil
+                shutil.move(str(temp_output), str(output_path))
+                file_size_mb = output_path.stat().st_size / 1024 / 1024
+
+                # Clean up lock file
+                if lock_file.exists():
+                    lock_file.unlink()
+
                 if progress_callback:
                     progress_callback(f"✅ Video assembled: {output_path.name} ({file_size_mb:.1f} MB, {actual_frames:,} frames)", 1.0)
                 logger.info(f"Successfully assembled video: {output_path}")
                 return True
             else:
-                logger.warning(f"Assembly may be incomplete: {actual_frames}/{upscaled_count} frames")
+                # Temp file incomplete - encoding failed
+                logger.error(f"Encoding incomplete: {actual_frames}/{upscaled_count} frames in temp file")
                 if progress_callback:
-                    progress_callback(f"⚠️ Assembly in progress: {actual_frames:,}/{upscaled_count:,} frames", 0.8)
-                return True  # Still return True - process may still be running
-
-        else:
-            # Check if process is still running
-            result = subprocess.run(["ps", "-p", str(process.pid)], capture_output=True)
-            if result.returncode == 0:
-                if progress_callback:
-                    progress_callback(f"🔄 Assembly still running (PID {process.pid})...", 0.5)
-                return True  # Process is running
-            else:
-                logger.error("Assembly failed - no output file created")
-                if progress_callback:
-                    progress_callback("❌ Assembly failed - check logs", 0.5)
+                    progress_callback(f"❌ Encoding failed: only {actual_frames:,}/{upscaled_count:,} frames", 0.5)
+                # Clean up
+                if lock_file.exists():
+                    lock_file.unlink()
                 return False
+        else:
+            # No temp file - encoding failed to start or was interrupted
+            logger.error("Assembly failed - no output file created")
+            if progress_callback:
+                progress_callback("❌ Assembly failed - check logs", 0.5)
+            if lock_file.exists():
+                lock_file.unlink()
+            return False
+
+    def check_assembly_status(self, work_dir: Path) -> dict:
+        """
+        Check if there's an assembly in progress for this work directory.
+
+        Returns:
+            dict with keys:
+                - status: "idle" | "running" | "complete" | "failed"
+                - pid: process ID if running
+                - progress: 0-1 float
+                - current_frame: int
+                - total_frames: int
+                - output_path: Path if complete
+                - temp_path: Path if running
+        """
+        work_dir = Path(work_dir)
+        lock_file = work_dir / "assembly.lock"
+        ffmpeg_log = work_dir / "ffmpeg_assembly.log"
+        upscaled_dir = work_dir / "upscaled"
+        frames_dir = work_dir / "frames"
+
+        total_frames = len(list(upscaled_dir.glob("*.jpg"))) if upscaled_dir.exists() else 0
+
+        result = {
+            "status": "idle",
+            "pid": None,
+            "progress": 0,
+            "current_frame": 0,
+            "total_frames": total_frames,
+            "output_path": None,
+            "temp_path": None,
+        }
+
+        if not lock_file.exists():
+            return result
+
+        try:
+            lock_content = lock_file.read_text().strip().split('\n')
+            pid = int(lock_content[0])
+            temp_path = Path(lock_content[1]) if len(lock_content) > 1 else None
+            final_path = Path(lock_content[2]) if len(lock_content) > 2 else None
+
+            # Check if process is still running
+            ps_result = subprocess.run(["ps", "-p", str(pid)], capture_output=True)
+            if ps_result.returncode == 0:
+                # Process is running
+                result["status"] = "running"
+                result["pid"] = pid
+                result["temp_path"] = temp_path
+
+                # Parse progress from log file
+                if ffmpeg_log.exists():
+                    import re
+                    log_content = ffmpeg_log.read_text()
+                    frame_matches = re.findall(r'frame=(\d+)', log_content)
+                    if frame_matches:
+                        current_frame = int(frame_matches[-1])
+                        result["current_frame"] = current_frame
+                        if total_frames > 0:
+                            result["progress"] = current_frame / total_frames
+            else:
+                # Process finished - check if complete
+                if temp_path and temp_path.exists():
+                    # Check frame count
+                    probe_cmd = [
+                        "ffprobe", "-v", "error",
+                        "-select_streams", "v:0",
+                        "-show_entries", "stream=nb_frames",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        str(temp_path),
+                    ]
+                    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+                    try:
+                        actual_frames = int(probe_result.stdout.strip())
+                        if actual_frames >= total_frames * 0.99:
+                            # Complete - rename and return
+                            import shutil
+                            if final_path:
+                                shutil.move(str(temp_path), str(final_path))
+                                result["status"] = "complete"
+                                result["output_path"] = final_path
+                                result["progress"] = 1.0
+                                result["current_frame"] = actual_frames
+                                lock_file.unlink()
+                        else:
+                            result["status"] = "failed"
+                            result["current_frame"] = actual_frames
+                    except ValueError:
+                        result["status"] = "failed"
+                elif final_path and final_path.exists():
+                    result["status"] = "complete"
+                    result["output_path"] = final_path
+                    result["progress"] = 1.0
+                    lock_file.unlink()
+                else:
+                    result["status"] = "failed"
+                    lock_file.unlink()
+
+        except Exception as e:
+            logger.warning(f"Error checking assembly status: {e}")
+
+        return result
 
     def get_video_resolution(self, video_path: Path) -> tuple[int, int]:
         """Get the current resolution of a video."""
