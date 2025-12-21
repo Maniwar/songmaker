@@ -1569,13 +1569,39 @@ def render_upscale_only_page(state) -> None:
                             if cwd.exists():
                                 upscaled = len(list(cwd.glob("upscaled/*.jpg")))
                                 total = len(list(cwd.glob("frames/*.png")))
+                                # Count active workers
+                                try:
+                                    result = subprocess.run(
+                                        ["pgrep", "-f", "realesrgan-ncnn-vulkan"],
+                                        capture_output=True, text=True, timeout=2
+                                    )
+                                    worker_count = len(result.stdout.strip().split('\n')) if result.stdout.strip() else 0
+                                except Exception:
+                                    worker_count = 0
+
                                 if total > 0:
                                     pct = int(100 * upscaled / total)
-                                    st.progress(upscaled / total, text=f"⏳ Upscaling: {upscaled}/{total} ({pct}%)")
-                                    # Auto-refresh button
-                                    if st.button("🔄 Refresh Progress", key="refresh_upscale_progress"):
+                                    remaining = total - upscaled
+                                    # Estimate ETA based on ~2 frames/sec with workers
+                                    if worker_count > 0:
+                                        eta_sec = remaining / (worker_count * 0.25)  # ~0.25 fps per worker
+                                        if eta_sec < 60:
+                                            eta = f"{int(eta_sec)}s"
+                                        elif eta_sec < 3600:
+                                            eta = f"{int(eta_sec/60)}m {int(eta_sec%60)}s"
+                                        else:
+                                            eta = f"{int(eta_sec/3600)}h {int((eta_sec%3600)/60)}m"
+                                        status_text = f"🚀 {worker_count} workers | {upscaled}/{total} ({pct}%) | ETA: {eta}"
+                                    else:
+                                        status_text = f"⏸️ Paused | {upscaled}/{total} ({pct}%)"
+                                    st.progress(upscaled / total, text=status_text)
+                                    # Refresh button
+                                    if st.button("🔄 Refresh", key="refresh_upscale_progress"):
                                         st.rerun()
-                        st.info("💡 Upscaling continues in background. You can browse frames while waiting.")
+                        if worker_count > 0:
+                            st.info("💡 Upscaling in progress. Browse frames while waiting.")
+                        else:
+                            st.warning("⏸️ Workers stopped. Click Upscale to continue.")
 
                     dir_options = {str(d): f"{d.name} ({len(list(d.glob('upscaled/*.jpg')))} frames)" for d in existing_dirs[:10]}
                     selected_dir = st.selectbox(
@@ -1591,18 +1617,13 @@ def render_upscale_only_page(state) -> None:
                         upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
                         if upscaled_frames:
                             max_frame = len(upscaled_frames)
-                            # Preserve slider position in session state
-                            slider_key = "browse_frame_slider_top"
-                            if slider_key not in st.session_state:
-                                st.session_state[slider_key] = min(max_frame, 1)
-                            # Clamp to valid range if frames changed
-                            if st.session_state[slider_key] > max_frame:
-                                st.session_state[slider_key] = max_frame
                             frame_num = st.slider(
                                 "Select frame",
                                 min_value=1,
                                 max_value=max_frame,
-                                key=slider_key
+                                value=max(1, min(max_frame, st.session_state.get("_browse_frame", max_frame))),
+                                key="browse_frame_slider_top",
+                                on_change=lambda: st.session_state.update({"_browse_frame": st.session_state.browse_frame_slider_top})
                             )
                             frame_path = work_dir / "upscaled" / f"frame_{frame_num:06d}.jpg"
                             orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
@@ -1657,51 +1678,14 @@ def render_upscale_only_page(state) -> None:
             progress_bar = st.progress(0, text="Starting upscaling...")
             status_text = st.empty()
 
-            # Live preview section
-            st.markdown("### Live Preview (Before / After)")
-            preview_cols = st.columns(2)
-            with preview_cols[0]:
-                st.caption("Original (1080p)")
-                original_preview = st.empty()
-            with preview_cols[1]:
-                st.caption("Upscaled (4K)")
-                upscaled_preview = st.empty()
-            frame_info = st.empty()
-            frame_info.caption("Starting...")  # Clear any stale data
-
-            # Track for live updates
-            live_state = {"work_dir": None, "last_update": 0}
-
             def progress_callback(message: str, progress: float):
-                import time
                 progress_bar.progress(progress, text=message)
                 status_text.text(message)
 
-                # Extract and store work directory
+                # Store work directory for browse section
                 if "Work:" in message:
                     work_dir_path = message.split("Work:")[-1].strip()
-                    live_state["work_dir"] = work_dir_path
                     st.session_state["upscale_work_dir"] = work_dir_path
-
-                # Update live preview every 2 seconds
-                if live_state["work_dir"] and progress >= 0.22:
-                    current_time = time.time()
-                    if current_time - live_state["last_update"] > 2:
-                        live_state["last_update"] = current_time
-                        try:
-                            work_dir = Path(live_state["work_dir"])
-                            upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
-                            if len(upscaled_frames) >= 3:
-                                preview_frame = upscaled_frames[-3]
-                                frame_num = int(preview_frame.stem.split("_")[-1])
-                                orig_frame = work_dir / "frames" / f"frame_{frame_num:06d}.png"
-
-                                if orig_frame.exists():
-                                    original_preview.image(str(orig_frame), width="stretch")
-                                upscaled_preview.image(str(preview_frame), width="stretch")
-                                frame_info.caption(f"Frame {frame_num} | {len(upscaled_frames)} upscaled")
-                        except Exception:
-                            pass
 
             try:
                 upscaler = VideoUpscaler()
