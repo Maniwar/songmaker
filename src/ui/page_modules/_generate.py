@@ -1756,13 +1756,14 @@ def render_upscale_only_page(state) -> None:
                         with col_qual:
                             quality = st.selectbox(
                                 "Quality",
-                                options=["high", "medium", "low"],
+                                options=["maximum", "high", "medium", "low"],
                                 format_func=lambda x: {
+                                    "maximum": "Maximum (YouTube 8K)",
                                     "high": "High (larger file)",
                                     "medium": "Medium (balanced)",
                                     "low": "Low (smaller file)",
                                 }.get(x, x),
-                                index=1,
+                                index=2,  # Default to medium
                                 key="assembly_quality",
                             )
 
