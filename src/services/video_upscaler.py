@@ -1075,7 +1075,7 @@ class VideoUpscaler:
                     batch_start = len(list(upscaled_dir.glob("*.jpg")))
                     last_progress_count = batch_start
                     last_progress_time = time.time()
-                    STALL_TIMEOUT = 3  # Kill process if no progress for 3 seconds
+                    STALL_TIMEOUT = 5  # Kill process if no progress for 5 seconds
                     process_stalled = False
 
                     if progress_callback:
