@@ -1667,6 +1667,7 @@ def render_upscale_only_page(state) -> None:
                 st.caption("Upscaled (4K)")
                 upscaled_preview = st.empty()
             frame_info = st.empty()
+            frame_info.caption("Starting...")  # Clear any stale data
 
             # Track for live updates
             live_state = {"work_dir": None, "last_update": 0}
