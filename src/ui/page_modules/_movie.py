@@ -283,15 +283,66 @@ def render_characters_page() -> None:
                     help="e.g., 'female, 30s, British accent, warm'",
                 )
 
-                # Reference image upload
-                uploaded_ref = st.file_uploader(
-                    "Reference Image (optional)",
-                    type=["png", "jpg", "jpeg"],
-                    key=f"char_ref_{i}",
-                )
+                # Character Portrait Section
+                st.markdown("**Character Portrait**")
 
-                if uploaded_ref:
-                    st.image(uploaded_ref, width=150)
+                # Check if portrait already exists
+                portrait_path = char.reference_image_path
+                if portrait_path and Path(portrait_path).exists():
+                    st.image(str(portrait_path), width=150)
+                    st.caption("AI-generated portrait")
+                    if st.button("🔄 Regenerate", key=f"regen_portrait_{i}"):
+                        # Regenerate portrait
+                        from src.services.movie_image_generator import MovieImageGenerator
+                        generator = MovieImageGenerator(style=state.script.visual_style or "cinematic digital art")
+                        output_dir = config.output_dir / "movie" / "characters"
+                        with st.spinner(f"Generating portrait for {char.name}..."):
+                            result = generator.generate_character_reference(
+                                character=char,
+                                output_dir=output_dir,
+                                style=state.script.visual_style,
+                            )
+                            if result:
+                                char.reference_image_path = result
+                                st.success("Portrait regenerated!")
+                                st.rerun()
+                            else:
+                                st.error("Failed to generate portrait")
+                else:
+                    # Generate portrait button
+                    if st.button("🎨 Generate Portrait", key=f"gen_portrait_{i}", type="secondary"):
+                        from src.services.movie_image_generator import MovieImageGenerator
+                        generator = MovieImageGenerator(style=state.script.visual_style or "cinematic digital art")
+                        output_dir = config.output_dir / "movie" / "characters"
+                        with st.spinner(f"Generating portrait for {char.name}..."):
+                            result = generator.generate_character_reference(
+                                character=char,
+                                output_dir=output_dir,
+                                style=state.script.visual_style,
+                            )
+                            if result:
+                                char.reference_image_path = result
+                                st.success("Portrait generated!")
+                                st.rerun()
+                            else:
+                                st.error("Failed to generate portrait")
+
+                    # Also allow upload
+                    uploaded_ref = st.file_uploader(
+                        "Or upload reference",
+                        type=["png", "jpg", "jpeg"],
+                        key=f"char_ref_{i}",
+                    )
+                    if uploaded_ref:
+                        # Save uploaded reference
+                        output_dir = config.output_dir / "movie" / "characters"
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        ref_path = output_dir / f"character_{char.id}_uploaded.png"
+                        with open(ref_path, "wb") as f:
+                            f.write(uploaded_ref.getvalue())
+                        char.reference_image_path = ref_path
+                        st.image(uploaded_ref, width=150)
+                        st.caption("Uploaded reference")
 
             # Update character in script
             if new_name != char.name or new_description != char.description:

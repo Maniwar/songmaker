@@ -1603,7 +1603,36 @@ def render_upscale_only_page(state) -> None:
                         if worker_count > 0:
                             st.info("💡 Upscaling in progress. Browse frames while waiting.")
                         else:
-                            st.warning("⏸️ Workers stopped. Click Upscale to continue.")
+                            # Show continue button when workers stopped but frames remain
+                            current_work_dir = st.session_state.get("upscale_work_dir")
+                            if current_work_dir:
+                                cwd = Path(current_work_dir)
+                                if cwd.exists():
+                                    total_frames = len(list(cwd.glob("frames/*.png")))
+                                    done_frames = len(list(cwd.glob("upscaled/*.jpg")))
+                                    if done_frames < total_frames:
+                                        col_warn, col_btn = st.columns([3, 1])
+                                        with col_warn:
+                                            st.warning(f"⏸️ Workers stopped. {done_frames}/{total_frames} done.")
+                                        with col_btn:
+                                            if st.button("▶️ Continue", key="continue_upscale_btn", type="primary"):
+                                                # Find original input file from work dir hash
+                                                work_hash = cwd.name.replace("realesrgan_", "")
+                                                upload_dir = config.output_dir / "uploads"
+                                                input_file = None
+                                                for f in upload_dir.glob(f"upscale_input_*{work_hash}*.mp4"):
+                                                    input_file = f
+                                                    break
+                                                if input_file:
+                                                    st.session_state.upscaling_in_progress = True
+                                                    st.session_state["_continue_upscale_input"] = str(input_file)
+                                                    st.rerun()
+                                                else:
+                                                    st.error("Could not find original input file")
+                                    else:
+                                        st.success(f"✅ All {total_frames} frames upscaled!")
+                            else:
+                                st.warning("⏸️ Workers stopped. Select a session to continue.")
 
                     dir_options = {str(d): f"{d.name} ({len(list(d.glob('upscaled/*.jpg')))} frames)" for d in existing_dirs[:10]}
                     selected_dir = st.selectbox(
@@ -1616,14 +1645,110 @@ def render_upscale_only_page(state) -> None:
                         work_dir = Path(selected_dir)
                         st.code(str(work_dir), language=None)
                         st.session_state["upscale_work_dir"] = str(work_dir)
-                        upscaled_frames = sorted(work_dir.glob("upscaled/*.jpg"))
-                        if upscaled_frames:
-                            max_frame = len(upscaled_frames)
+
+                        # Get TOTAL frames and upscaled count
+                        total_frames = len(list(work_dir.glob("frames/*.png")))
+                        upscaled_count = len(list(work_dir.glob("upscaled/*.jpg")))
+                        remaining = total_frames - upscaled_count
+
+                        if total_frames > 0:
+                            # Show clear progress
+                            pct = int(100 * upscaled_count / total_frames)
+                            st.progress(upscaled_count / total_frames,
+                                       text=f"📊 {upscaled_count:,} / {total_frames:,} frames upscaled ({pct}%) - {remaining:,} remaining")
+
+                            # Visual Gantt with clickable colored bars
+                            upscaled_nums = {int(f.stem.replace("frame_", "")) for f in work_dir.glob("upscaled/*.jpg")}
+                            num_chunks = 20  # Balance between granularity and usability
+                            chunk_size = max(1, total_frames // num_chunks)
+
+                            # Build chunk data
+                            chunk_data = []
+                            for i in range(num_chunks):
+                                start = i * chunk_size + 1
+                                end = min((i + 1) * chunk_size, total_frames)
+                                chunk_done = sum(1 for f in range(start, end + 1) if f in upscaled_nums)
+                                chunk_total = end - start + 1
+                                pct_done = chunk_done / chunk_total if chunk_total > 0 else 0
+                                mid_frame = (start + end) // 2
+                                chunk_data.append((start, end, pct_done, mid_frame))
+
+                            # Build CSS styles for all colored bar segments
+                            css_rules = []
+                            for i, (start, end, pct_done, mid_frame) in enumerate(chunk_data):
+                                if pct_done >= 0.95:
+                                    color = "#22c55e"  # Green - done
+                                elif pct_done > 0.6:
+                                    color = "#84cc16"  # Lime - mostly done
+                                elif pct_done > 0.3:
+                                    color = "#eab308"  # Yellow - partial
+                                elif pct_done > 0:
+                                    color = "#f97316"  # Orange - started
+                                else:
+                                    color = "#64748b"  # Gray - pending
+                                css_rules.append(f".gantt-btn-{i} {{ background-color: {color} !important; color: white !important; border: none !important; }}")
+
+                            # Inject CSS with unique gantt container targeting
+                            st.markdown(f"""
+                            <style>
+                            .gantt-container button {{
+                                padding: 8px 0 !important;
+                                min-height: 36px !important;
+                                font-size: 14px !important;
+                                border-radius: 4px !important;
+                                font-weight: bold !important;
+                                transition: transform 0.1s, box-shadow 0.1s !important;
+                            }}
+                            .gantt-container button:hover {{
+                                transform: scale(1.05) !important;
+                                box-shadow: 0 2px 8px rgba(0,0,0,0.3) !important;
+                            }}
+                            {' '.join(css_rules)}
+                            </style>
+                            <div class="gantt-container">
+                            """, unsafe_allow_html=True)
+
+                            # Render colored bar buttons in columns
+                            cols = st.columns(num_chunks)
+                            for i, (start, end, pct_done, mid_frame) in enumerate(chunk_data):
+                                with cols[i]:
+                                    if st.button(
+                                        " ",  # Minimal label, color carries the info
+                                        key=f"gantt_bar_{i}",
+                                        help=f"Frames {start:,}-{end:,}\n{int(pct_done*100)}% done\nClick to jump to frame {mid_frame:,}",
+                                        use_container_width=True,
+                                    ):
+                                        # Update both keys so slider syncs
+                                        st.session_state["_browse_frame"] = mid_frame
+                                        st.session_state["browse_frame_slider_top"] = mid_frame
+                                        st.rerun()
+
+                            # Close container and add per-button colors
+                            button_css = "\n".join([
+                                f'div[data-testid="stHorizontalBlock"]:has(button[data-testid="stBaseButton-secondary"]) > div:nth-child({i+1}) button {{ background-color: {("#22c55e" if pct >= 0.95 else "#84cc16" if pct > 0.6 else "#eab308" if pct > 0.3 else "#f97316" if pct > 0 else "#64748b")} !important; color: white !important; border: none !important; }}'
+                                for i, (s, e, pct, m) in enumerate(chunk_data)
+                            ])
+                            st.markdown(f"</div><style>{button_css}</style>", unsafe_allow_html=True)
+
+                            # Legend with colored boxes
+                            st.markdown(
+                                f'<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;color:#888;margin-top:4px;padding:0 4px;">'
+                                f'<span>Frame 1</span>'
+                                f'<span style="display:flex;gap:8px;align-items:center;">'
+                                f'<span style="display:inline-flex;align-items:center;gap:2px;"><span style="background:#22c55e;width:12px;height:12px;border-radius:2px;"></span> Done</span>'
+                                f'<span style="display:inline-flex;align-items:center;gap:2px;"><span style="background:#eab308;width:12px;height:12px;border-radius:2px;"></span> Partial</span>'
+                                f'<span style="display:inline-flex;align-items:center;gap:2px;"><span style="background:#64748b;width:12px;height:12px;border-radius:2px;"></span> Pending</span>'
+                                f'</span>'
+                                f'<span>Frame {total_frames:,}</span></div>',
+                                unsafe_allow_html=True
+                            )
+
+                            # Slider goes to TOTAL frames, not just upscaled
                             frame_num = st.slider(
-                                "Select frame",
+                                "Browse frame",
                                 min_value=1,
-                                max_value=max_frame,
-                                value=max(1, min(max_frame, st.session_state.get("_browse_frame", max_frame))),
+                                max_value=total_frames,
+                                value=max(1, min(total_frames, st.session_state.get("_browse_frame", 1))),
                                 key="browse_frame_slider_top",
                                 on_change=lambda: st.session_state.update({"_browse_frame": st.session_state.browse_frame_slider_top})
                             )
@@ -1634,13 +1759,60 @@ def render_upscale_only_page(state) -> None:
                                 st.caption("Original")
                                 if orig_frame.exists():
                                     st.image(str(orig_frame), use_container_width=True)
+                                else:
+                                    st.info("Original frame not found")
                             with cols[1]:
                                 st.caption("Upscaled")
                                 if frame_path.exists():
                                     st.image(str(frame_path), use_container_width=True)
-                            st.caption(f"Frame {frame_num} of {max_frame}")
+                                else:
+                                    st.warning(f"⏳ Frame {frame_num} not yet upscaled")
+                            st.caption(f"Frame {frame_num} of {total_frames:,} total")
 
-        if start_clicked:
+        # Handle continue button from browse section
+        continue_input = st.session_state.pop("_continue_upscale_input", None)
+        if continue_input:
+            from datetime import datetime
+            input_path = Path(continue_input)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_name = f"upscaled_{target_res}_{timestamp}_{input_path.stem}.mp4"
+            output_path = config.output_dir / output_name
+
+            progress_bar = st.progress(0, text="Continuing upscaling...")
+            status_text = st.empty()
+
+            def progress_callback(message: str, progress: float):
+                progress_bar.progress(progress, text=message)
+                status_text.text(message)
+                if "Work:" in message:
+                    work_dir_path = message.split("Work:")[-1].strip()
+                    st.session_state["upscale_work_dir"] = work_dir_path
+
+            try:
+                upscaler = VideoUpscaler()
+                success = upscaler.upscale(
+                    input_path=input_path,
+                    output_path=output_path,
+                    target_resolution=target_res,
+                    method="realesrgan",
+                    preserve_audio=True,
+                    progress_callback=progress_callback,
+                    blocking=False,
+                )
+                if success and output_path.exists():
+                    progress_bar.progress(1.0, text="Upscaling complete!")
+                    st.success("Video upscaled successfully!")
+                    st.session_state.upscaling_in_progress = False
+                elif success:
+                    st.info("⏳ Workers started. Progress will update automatically.")
+                else:
+                    st.error("Failed to continue upscaling")
+                    st.session_state.upscaling_in_progress = False
+            except Exception as e:
+                st.error(f"Error: {e}")
+                st.session_state.upscaling_in_progress = False
+
+        elif start_clicked:
             st.session_state.upscaling_in_progress = True
             # Save uploaded file (with deduplication)
             config.ensure_directories()
@@ -1676,7 +1848,7 @@ def render_upscale_only_page(state) -> None:
             output_name = f"upscaled_{target_res}_{timestamp}_{Path(uploaded_video.name).stem}.mp4"
             output_path = config.output_dir / output_name
 
-            # Run upscaling
+            # Run upscaling (non-blocking mode - returns immediately when workers running)
             progress_bar = st.progress(0, text="Starting upscaling...")
             status_text = st.empty()
 
@@ -1691,6 +1863,14 @@ def render_upscale_only_page(state) -> None:
 
             try:
                 upscaler = VideoUpscaler()
+                # Store output path for checking completion on refresh
+                st.session_state["upscale_output_path"] = str(output_path)
+                st.session_state["upscale_input_path"] = str(input_path)
+                st.session_state["upscale_target_res"] = target_res
+
+                # Use non-blocking mode for realesrgan method
+                # This returns immediately if workers are running, allowing UI to refresh
+                use_blocking = selected_method != "realesrgan"
                 success = upscaler.upscale(
                     input_path=Path(input_path),
                     output_path=Path(output_path),
@@ -1701,8 +1881,10 @@ def render_upscale_only_page(state) -> None:
                     model=selected_model,  # Pass AI model for Real-ESRGAN/Nomos2
                     batch_size=batch_size,  # MPS batch/tile processing parallelism
                     tile_size=tile_size,  # MPS tile size (larger = faster for 1080p+)
+                    blocking=use_blocking,  # Non-blocking for realesrgan
                 )
 
+                # Check if complete or still in progress
                 if success and output_path.exists():
                     progress_bar.progress(1.0, text="Upscaling complete!")
                     st.success(f"Video upscaled successfully!")
@@ -1792,6 +1974,13 @@ def render_upscale_only_page(state) -> None:
                                         if frame_path.exists():
                                             st.image(str(frame_path), use_container_width=True)
                                     st.caption(f"Frame {frame_num} of {max_frame}")
+                elif success and not output_path.exists():
+                    # NON-BLOCKING MODE: Workers are running in background
+                    # Keep upscaling_in_progress=True so auto-refresh continues polling
+                    st.info("⏳ Upscaling in progress... Workers are running in background.")
+                    st.caption("Page will auto-refresh every 5 seconds. You can close this page and return later.")
+                    # Keep upscaling state for polling
+                    st.session_state.upscaling_in_progress = True
                 else:
                     st.error("Upscaling failed. Check the logs for details.")
                     st.session_state.upscaling_in_progress = False

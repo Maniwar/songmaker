@@ -194,6 +194,7 @@ class VideoUpscaler:
         model: Optional[str] = None,
         batch_size: Optional[int] = None,
         tile_size: Optional[int] = None,
+        blocking: bool = True,
     ) -> bool:
         """
         Upscale a video to the target resolution.
@@ -215,6 +216,8 @@ class VideoUpscaler:
                        based on available GPU memory.
             tile_size: Size of tiles for MPS upscaling. If None, auto-calculated based on
                        available GPU memory.
+            blocking: If False, returns immediately when workers are running (for realesrgan),
+                     allowing UI to poll for progress. Returns True to indicate "in progress".
 
         Returns:
             True if successful, False otherwise
@@ -309,7 +312,7 @@ class VideoUpscaler:
             elif method == "realesrgan":
                 success = self._upscale_realesrgan(
                     input_path, output_path, target_width, target_height,
-                    preserve_audio, progress_callback
+                    preserve_audio, progress_callback, blocking=blocking
                 )
             else:
                 success = self._upscale_ffmpeg(
@@ -317,7 +320,9 @@ class VideoUpscaler:
                     preserve_audio, progress_callback
                 )
 
-            if success and progress_callback:
+            # Only show "complete" if output file actually exists
+            # In non-blocking mode, success=True but output may not exist yet
+            if success and progress_callback and output_path.exists():
                 progress_callback("Upscaling complete!", 1.0)
 
             return success
@@ -670,84 +675,167 @@ class VideoUpscaler:
     def _kill_stalled_realesrgan_processes(
         self,
         progress_callback: Optional[Callable[[str, float], None]] = None,
-    ) -> None:
+    ) -> int:
         """Detect and kill any stalled realesrgan processes.
 
-        This health check runs at the start of upscaling to clean up any
-        frozen processes from previous runs. The ncnn-vulkan binary frequently
-        freezes on Apple Silicon.
+        Uses pgrep to find ALL running realesrgan processes (handles multiple workers).
+        Returns the number of healthy workers still running.
         """
-        import os
         import time
 
         work_dir_base = Path.home() / ".cache" / "songmaker" / "upscale_work"
 
-        # Find all lock files
-        lock_files = list(work_dir_base.glob("*/upscale.lock"))
+        # Find all running realesrgan processes via pgrep
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "realesrgan-ncnn-vulkan"],
+                capture_output=True, text=True, timeout=2
+            )
+            running_pids = [p.strip() for p in result.stdout.strip().split('\n') if p.strip()]
+        except Exception:
+            running_pids = []
 
-        for lock_file in lock_files:
-            try:
-                lock_data = lock_file.read_text().strip().split("\n")
-                pid = int(lock_data[0])
-                work_dir = Path(lock_data[1]) if len(lock_data) > 1 else lock_file.parent
-                upscaled_dir = work_dir / "upscaled"
-
-                # Check if process is running
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    # Process dead, clean up lock file
-                    logger.info(f"Cleaning up stale lock file for dead PID {pid}")
-                    lock_file.unlink()
-                    continue
-
-                # Process is running - check if it's making progress
-                initial_count = len(list(upscaled_dir.glob("*.jpg"))) if upscaled_dir.exists() else 0
-
-                if progress_callback:
-                    progress_callback(f"Checking existing process (PID {pid})...", 0.05)
-
-                # Wait 3 seconds and check again
-                time.sleep(3)
-
-                # Re-check if process is still running
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    # Process finished during check
-                    logger.info(f"Process {pid} finished during health check")
-                    if lock_file.exists():
-                        lock_file.unlink()
-                    continue
-
-                current_count = len(list(upscaled_dir.glob("*.jpg"))) if upscaled_dir.exists() else 0
-
-                if current_count > initial_count:
-                    # Process is making progress, leave it alone
-                    logger.info(f"Process {pid} is healthy: {current_count - initial_count} new frames in 3s")
-                    if progress_callback:
-                        progress_callback(f"Existing process healthy, attaching...", 0.08)
-                else:
-                    # Process is stalled - kill it
-                    logger.warning(f"Process {pid} stalled (0 frames in 3s), killing...")
-                    if progress_callback:
-                        progress_callback(f"Killing stalled process (PID {pid})...", 0.05)
-                    try:
-                        os.kill(pid, 9)  # SIGKILL
-                        time.sleep(1)  # Wait for cleanup
-                    except OSError:
-                        pass
-                    if lock_file.exists():
-                        lock_file.unlink()
-                    logger.info(f"Killed stalled process {pid}")
-
-            except (ValueError, IndexError, OSError) as e:
-                # Invalid lock file, clean up
-                logger.warning(f"Invalid lock file {lock_file}: {e}")
+        if not running_pids:
+            # No processes running, clean up any stale lock files
+            for lock_file in work_dir_base.glob("*/upscale.lock"):
+                logger.info(f"Cleaning up stale lock file (no running processes)")
                 try:
                     lock_file.unlink()
                 except OSError:
                     pass
+            return 0
+
+        # Processes are running - check if they're making progress
+        # Find the active work directory
+        active_work_dir = None
+        for lock_file in work_dir_base.glob("*/upscale.lock"):
+            active_work_dir = lock_file.parent
+            break
+
+        if not active_work_dir:
+            # Workers running but no lock file - find by most recent upscaled dir
+            for work_dir in sorted(work_dir_base.glob("realesrgan_*"), key=lambda p: p.stat().st_mtime, reverse=True):
+                if (work_dir / "upscaled").exists():
+                    active_work_dir = work_dir
+                    break
+
+        if not active_work_dir:
+            return len(running_pids)  # Can't check progress without work dir
+
+        upscaled_dir = active_work_dir / "upscaled"
+        initial_count = len(list(upscaled_dir.glob("*.jpg"))) if upscaled_dir.exists() else 0
+
+        if progress_callback:
+            progress_callback(f"Checking {len(running_pids)} workers...", 0.05)
+
+        # Wait 5 seconds and check again
+        time.sleep(5)
+
+        # Re-check running processes
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "realesrgan-ncnn-vulkan"],
+                capture_output=True, text=True, timeout=2
+            )
+            current_pids = [p.strip() for p in result.stdout.strip().split('\n') if p.strip()]
+        except Exception:
+            current_pids = []
+
+        current_count = len(list(upscaled_dir.glob("*.jpg"))) if upscaled_dir.exists() else 0
+
+        if current_count > initial_count:
+            # Workers are making progress
+            logger.info(f"{len(current_pids)} workers healthy: {current_count - initial_count} new frames in 5s")
+            return len(current_pids)
+        elif current_pids:
+            # Workers running but no progress - stalled
+            logger.warning(f"{len(current_pids)} workers stalled (0 frames in 5s), killing all...")
+            if progress_callback:
+                progress_callback(f"Killing {len(current_pids)} stalled workers...", 0.05)
+            try:
+                subprocess.run(["pkill", "-9", "-f", "realesrgan-ncnn-vulkan"],
+                              capture_output=True, timeout=5)
+                time.sleep(1)
+            except Exception:
+                pass
+            # Clean up lock files
+            for lock_file in work_dir_base.glob("*/upscale.lock"):
+                try:
+                    lock_file.unlink()
+                except OSError:
+                    pass
+            return 0
+
+        return 0  # No workers running
+
+    def _get_running_worker_count(self) -> int:
+        """Get count of running realesrgan workers."""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "realesrgan-ncnn-vulkan"],
+                capture_output=True, text=True, timeout=2
+            )
+            pids = [p for p in result.stdout.strip().split('\n') if p.strip()]
+            return len(pids)
+        except Exception:
+            return 0
+
+    def get_upscaling_status(self) -> dict:
+        """Get current upscaling status for UI polling.
+
+        Returns dict with:
+        - status: "idle", "running", "complete", or "error"
+        - workers: number of active workers
+        - upscaled: number of upscaled frames
+        - total: total number of frames
+        - work_dir: path to work directory
+        - progress: float 0-1
+        """
+        work_dir_base = Path.home() / ".cache" / "songmaker" / "upscale_work"
+
+        # Find active work directory
+        active_work_dir = None
+        for lock_file in work_dir_base.glob("*/upscale.lock"):
+            active_work_dir = lock_file.parent
+            break
+
+        if not active_work_dir:
+            # No lock file, find most recent work dir
+            for work_dir in sorted(work_dir_base.glob("realesrgan_*"), key=lambda p: p.stat().st_mtime, reverse=True):
+                if (work_dir / "upscaled").exists():
+                    active_work_dir = work_dir
+                    break
+
+        if not active_work_dir:
+            return {"status": "idle", "workers": 0, "upscaled": 0, "total": 0, "work_dir": None, "progress": 0}
+
+        frames_dir = active_work_dir / "frames"
+        upscaled_dir = active_work_dir / "upscaled"
+
+        total = len(list(frames_dir.glob("*.png"))) if frames_dir.exists() else 0
+        upscaled = len(list(upscaled_dir.glob("*.jpg"))) if upscaled_dir.exists() else 0
+        workers = self._get_running_worker_count()
+
+        if total == 0:
+            return {"status": "idle", "workers": workers, "upscaled": upscaled, "total": total, "work_dir": str(active_work_dir), "progress": 0}
+
+        progress = upscaled / total
+
+        if upscaled >= total:
+            status = "complete"
+        elif workers > 0:
+            status = "running"
+        else:
+            status = "paused"  # Frames remaining but no workers
+
+        return {
+            "status": status,
+            "workers": workers,
+            "upscaled": upscaled,
+            "total": total,
+            "work_dir": str(active_work_dir),
+            "progress": progress,
+        }
 
     def _upscale_ffmpeg(
         self,
@@ -820,6 +908,7 @@ class VideoUpscaler:
         target_height: int,
         preserve_audio: bool,
         progress_callback: Optional[Callable[[str, float], None]] = None,
+        blocking: bool = True,
     ) -> bool:
         """Upscale using Real-ESRGAN AI model (ncnn-vulkan).
 
@@ -827,6 +916,11 @@ class VideoUpscaler:
         to do a two-step process: AI upscale then resize to exact target.
 
         Uses persistent work directory for resume capability.
+
+        Args:
+            blocking: If False, returns immediately when workers are running,
+                     allowing UI to poll for progress. Returns True to indicate
+                     "in progress" (call again to check status).
         """
         import hashlib
         import os
@@ -973,11 +1067,24 @@ class VideoUpscaler:
                 running_pids = []
 
             if running_pids:
-                logger.info(f"Upscaling already in progress ({len(running_pids)} workers), attaching...")
+                logger.info(f"Upscaling already in progress ({len(running_pids)} workers)")
+                upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+
+                # NON-BLOCKING MODE: Return immediately, let UI poll for updates
+                if not blocking:
+                    upscale_progress = 0.22 + (0.58 * upscaled_count / total_frames)
+                    if progress_callback:
+                        progress_callback(
+                            f"🚀 {len(running_pids)} workers | {upscaled_count}/{total_frames} | Work: {work_dir}",
+                            min(0.80, upscale_progress)
+                        )
+                    logger.info(f"Non-blocking mode: returning (workers running, {upscaled_count}/{total_frames} done)")
+                    return True  # Return True = in progress, call again to check
+
+                # BLOCKING MODE: Monitor workers with watchdog
                 if progress_callback:
                     progress_callback(f"⏳ {len(running_pids)} workers running, monitoring...", 0.22)
 
-                # Monitor ALL running workers with watchdog
                 start_time = time.time()
                 initial_upscaled = already_done
                 last_progress_count = initial_upscaled
@@ -1083,7 +1190,8 @@ class VideoUpscaler:
                 # PARALLEL PROCESSING: Run multiple realesrgan workers simultaneously
                 # This significantly speeds up processing by utilizing more GPU/CPU resources
                 NUM_WORKERS = 8  # Run 8 parallel processes
-                FRAMES_PER_WORKER = 50  # Each worker processes 50 frames at a time
+                # Each worker gets ALL its share of remaining frames (not small batches)
+                # This allows the process to complete unattended
 
                 # Find models directory once
                 home = Path.home()
@@ -1112,13 +1220,14 @@ class VideoUpscaler:
 
                     round_num += 1
 
-                    # Determine how many workers to use this round
-                    num_workers_this_round = min(NUM_WORKERS, len(remaining_frames) // 10 + 1)
-                    num_workers_this_round = max(1, min(num_workers_this_round, NUM_WORKERS))
+                    # Determine how many workers to use
+                    num_workers_this_round = min(NUM_WORKERS, len(remaining_frames))
+                    num_workers_this_round = max(1, num_workers_this_round)
 
-                    # Divide frames among workers
-                    frames_this_round = remaining_frames[:num_workers_this_round * FRAMES_PER_WORKER]
-                    remaining_frames = remaining_frames[num_workers_this_round * FRAMES_PER_WORKER:]
+                    # Give ALL remaining frames to workers (divide evenly)
+                    # This allows unattended completion - no need for multiple rounds
+                    frames_this_round = remaining_frames
+                    remaining_frames = []  # All frames assigned
 
                     # Split frames evenly among workers
                     worker_frames = []
@@ -1154,7 +1263,7 @@ class VideoUpscaler:
                         for frame in frames:
                             os.link(str(frame.absolute()), str(pending_dir / frame.name))
 
-                        # Start worker process
+                        # Start worker process (detached so it survives Streamlit restarts)
                         upscale_cmd = [
                             realesrgan_bin,
                             "-i", str(pending_dir),
@@ -1166,20 +1275,34 @@ class VideoUpscaler:
                         if models_dir.exists():
                             upscale_cmd.extend(["-m", str(models_dir)])
 
+                        # Use start_new_session=True so workers survive parent termination
+                        # Redirect output to /dev/null since we can't read from detached processes
                         process = subprocess.Popen(
                             upscale_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,  # Survives Streamlit restarts
                         )
                         processes.append((worker_id, process, len(frames)))
-                        logger.info(f"Started worker {worker_id} (PID {process.pid}) with {len(frames)} frames")
+                        logger.info(f"Started detached worker {worker_id} (PID {process.pid}) with {len(frames)} frames")
 
                     # Write lock file with first worker PID
                     if processes:
                         lock_file.write_text(f"{processes[0][1].pid}\n{work_dir}")
 
-                    # Monitor all workers with watchdog
+                    # NON-BLOCKING MODE: Return immediately after starting workers
+                    if not blocking:
+                        current_done = len(list(upscaled_dir.glob("*.jpg")))
+                        upscale_progress = 0.22 + (0.58 * current_done / total_frames)
+                        if progress_callback:
+                            progress_callback(
+                                f"🚀 Started {len(processes)} workers | {current_done}/{total_frames} | Work: {work_dir}",
+                                min(0.80, upscale_progress)
+                            )
+                        logger.info(f"Non-blocking mode: started {len(processes)} workers, returning immediately")
+                        return True  # Return True = in progress, call again to check
+
+                    # BLOCKING MODE: Monitor all workers with watchdog
                     last_progress_count = len(list(upscaled_dir.glob("*.jpg")))
                     last_progress_time = time.time()
                     STALL_TIMEOUT_FIRST = 15  # First frame needs model load time (per worker)

@@ -137,6 +137,7 @@ class MovieImageGenerator:
         output_dir: Path,
         use_sequential_mode: bool = False,
         hero_image: Optional[Path] = None,
+        use_character_references: bool = True,
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> list[Path]:
         """Generate images for all scenes in a script.
@@ -146,6 +147,7 @@ class MovieImageGenerator:
             output_dir: Directory to save images
             use_sequential_mode: Use previous image as reference for consistency
             hero_image: Optional hero image for style reference
+            use_character_references: Use character portraits as references
             progress_callback: Optional progress callback
 
         Returns:
@@ -165,11 +167,25 @@ class MovieImageGenerator:
                     progress
                 )
 
+            # Determine reference image for this scene
+            scene_reference = reference_image
+
+            # Use character portrait as reference if available
+            if use_character_references and scene.direction.visible_characters:
+                for char_id in scene.direction.visible_characters:
+                    character = script.get_character(char_id)
+                    if character and character.reference_image_path:
+                        char_ref_path = Path(character.reference_image_path)
+                        if char_ref_path.exists():
+                            scene_reference = char_ref_path
+                            logger.info(f"Using {character.name}'s portrait as reference for scene {i+1}")
+                            break  # Use first character with portrait
+
             image_path = self.generate_scene_image(
                 scene=scene,
                 script=script,
                 output_dir=output_dir,
-                reference_image=reference_image,
+                reference_image=scene_reference,
                 progress_callback=None,  # Don't nest callbacks
             )
 
