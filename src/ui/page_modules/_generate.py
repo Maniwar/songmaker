@@ -1278,6 +1278,11 @@ def render_upscale_only_page(state) -> None:
             threads = st.session_state.get("assembly_threads", 0)
             buffer_size = st.session_state.get("assembly_buffer", 128)
 
+            # Clear flags IMMEDIATELY to prevent re-triggering on page refresh
+            # The check_assembly_status() logic will handle showing progress
+            st.session_state["ready_for_assembly"] = False
+            st.session_state["assembly_work_dir"] = None
+
             # Run assembly
             upscaler = VideoUpscaler()
             success = upscaler.assemble_video(
@@ -1291,10 +1296,6 @@ def render_upscale_only_page(state) -> None:
                 threads=threads,
                 buffer_size=buffer_size,
             )
-
-            # Clear the assembly flags (don't clear widget keys - they're managed by Streamlit)
-            st.session_state["ready_for_assembly"] = False
-            st.session_state["assembly_work_dir"] = None
 
             if success and output_path.exists():
                 file_size_mb = output_path.stat().st_size / 1024 / 1024
@@ -1361,6 +1362,12 @@ def render_upscale_only_page(state) -> None:
                         )
 
                 if st.button("🔄 Upscale Another Video", type="secondary"):
+                    st.rerun()
+            elif success:
+                # Assembly started but not complete yet (running in background)
+                st.info("🔄 Assembly running in background. Safe to leave - will complete automatically.")
+                st.caption("Refresh this page later to check progress, or use the 'Refresh Progress' button below.")
+                if st.button("🔄 Refresh Progress", key="refresh_after_start"):
                     st.rerun()
             else:
                 st.error("❌ Video assembly failed. Check logs for details.")

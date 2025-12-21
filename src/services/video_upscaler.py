@@ -1644,6 +1644,14 @@ class VideoUpscaler:
         if target_width and target_height:
             reassemble_cmd.extend(["-vf", f"scale={target_width}:{target_height}:flags=lanczos"])
 
+        # Check if hardware encoder can handle the resolution
+        # H.264 VideoToolbox doesn't support 8K - fall back to software
+        if encoder == "h264_videotoolbox" and (target_width is None or target_width > 4096):
+            logger.warning("H.264 hardware encoder doesn't support 8K, falling back to libx264")
+            if progress_callback:
+                progress_callback("⚠️ H.264 hardware doesn't support 8K - using software encoder", 0.32)
+            encoder = "libx264"
+
         # Apply encoder-specific settings
         if encoder in ["hevc_videotoolbox", "h264_videotoolbox"]:
             # Hardware encoding (VideoToolbox)
@@ -1699,15 +1707,12 @@ class VideoUpscaler:
                 # Check if process is still running
                 result = subprocess.run(["ps", "-p", str(pid)], capture_output=True)
                 if result.returncode == 0:
-                    # Process still running - DON'T kill it, just monitor
+                    # Process still running - DON'T kill it, just return True
+                    # UI will use check_assembly_status() to show progress
                     if progress_callback:
-                        progress_callback(f"🔄 Assembly already in progress (PID {pid}), monitoring...", 0.35)
-                    logger.info(f"Found existing assembly process: PID {pid}, monitoring instead of restarting")
-
-                    # Jump to monitoring loop (don't start new process)
-                    return self._monitor_assembly(
-                        pid, ffmpeg_log, lock_file, output_path, upscaled_count, progress_callback
-                    )
+                        progress_callback(f"🔄 Assembly already in progress (PID {pid}) - do not restart", 0.35)
+                    logger.info(f"Found existing assembly process: PID {pid}, NOT restarting")
+                    return True  # Assembly is running, don't interfere
                 else:
                     # Stale lock - clean up
                     logger.info(f"Stale lock file (PID {pid} not running), cleaning up")
