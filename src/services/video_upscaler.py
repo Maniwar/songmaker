@@ -667,6 +667,88 @@ class VideoUpscaler:
         result = subprocess.run(cmd, capture_output=True, text=True)
         return result.returncode == 0
 
+    def _kill_stalled_realesrgan_processes(
+        self,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> None:
+        """Detect and kill any stalled realesrgan processes.
+
+        This health check runs at the start of upscaling to clean up any
+        frozen processes from previous runs. The ncnn-vulkan binary frequently
+        freezes on Apple Silicon.
+        """
+        import os
+        import time
+
+        work_dir_base = Path.home() / ".cache" / "songmaker" / "upscale_work"
+
+        # Find all lock files
+        lock_files = list(work_dir_base.glob("*/upscale.lock"))
+
+        for lock_file in lock_files:
+            try:
+                lock_data = lock_file.read_text().strip().split("\n")
+                pid = int(lock_data[0])
+                work_dir = Path(lock_data[1]) if len(lock_data) > 1 else lock_file.parent
+                upscaled_dir = work_dir / "upscaled"
+
+                # Check if process is running
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    # Process dead, clean up lock file
+                    logger.info(f"Cleaning up stale lock file for dead PID {pid}")
+                    lock_file.unlink()
+                    continue
+
+                # Process is running - check if it's making progress
+                initial_count = len(list(upscaled_dir.glob("*.jpg"))) if upscaled_dir.exists() else 0
+
+                if progress_callback:
+                    progress_callback(f"Checking existing process (PID {pid})...", 0.05)
+
+                # Wait 3 seconds and check again
+                time.sleep(3)
+
+                # Re-check if process is still running
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    # Process finished during check
+                    logger.info(f"Process {pid} finished during health check")
+                    if lock_file.exists():
+                        lock_file.unlink()
+                    continue
+
+                current_count = len(list(upscaled_dir.glob("*.jpg"))) if upscaled_dir.exists() else 0
+
+                if current_count > initial_count:
+                    # Process is making progress, leave it alone
+                    logger.info(f"Process {pid} is healthy: {current_count - initial_count} new frames in 3s")
+                    if progress_callback:
+                        progress_callback(f"Existing process healthy, attaching...", 0.08)
+                else:
+                    # Process is stalled - kill it
+                    logger.warning(f"Process {pid} stalled (0 frames in 3s), killing...")
+                    if progress_callback:
+                        progress_callback(f"Killing stalled process (PID {pid})...", 0.05)
+                    try:
+                        os.kill(pid, 9)  # SIGKILL
+                        time.sleep(1)  # Wait for cleanup
+                    except OSError:
+                        pass
+                    if lock_file.exists():
+                        lock_file.unlink()
+                    logger.info(f"Killed stalled process {pid}")
+
+            except (ValueError, IndexError, OSError) as e:
+                # Invalid lock file, clean up
+                logger.warning(f"Invalid lock file {lock_file}: {e}")
+                try:
+                    lock_file.unlink()
+                except OSError:
+                    pass
+
     def _upscale_ffmpeg(
         self,
         input_path: Path,
