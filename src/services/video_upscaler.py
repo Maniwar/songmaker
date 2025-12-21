@@ -889,16 +889,44 @@ class VideoUpscaler:
                             logger.info(f"Upscaling already in progress (PID {existing_pid}), attaching to existing process")
                             if progress_callback:
                                 progress_callback(f"⏳ Upscaling already running (PID {existing_pid}), monitoring...", 0.22)
-                            # Monitor the existing process instead of starting a new one
+                            # Monitor the existing process with watchdog
                             start_time = time.time()
                             initial_upscaled = already_done
+                            last_progress_count = initial_upscaled
+                            last_progress_time = time.time()
+                            STALL_TIMEOUT = 5  # Kill if no progress for 5 seconds
+                            process_stalled = False
+
                             while True:
                                 # Check if process still running
                                 try:
                                     os.kill(existing_pid, 0)
                                 except OSError:
                                     break  # Process finished
+
                                 upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+
+                                # Watchdog: check for stall
+                                if upscaled_count > last_progress_count:
+                                    last_progress_count = upscaled_count
+                                    last_progress_time = time.time()
+                                else:
+                                    stall_duration = time.time() - last_progress_time
+                                    if stall_duration > STALL_TIMEOUT:
+                                        logger.warning(f"Attached process stalled for {stall_duration:.0f}s, killing...")
+                                        if progress_callback:
+                                            progress_callback(
+                                                f"⚠️ Process stalled, killing and restarting... ({upscaled_count}/{total_frames} done)",
+                                                0.22 + (0.58 * upscaled_count / total_frames)
+                                            )
+                                        # Kill the stalled process
+                                        try:
+                                            os.kill(existing_pid, 9)  # SIGKILL
+                                        except OSError:
+                                            pass
+                                        process_stalled = True
+                                        break
+
                                 new_this_run = upscaled_count - initial_upscaled
                                 if new_this_run > 0 and total_frames > 0:
                                     elapsed = time.time() - start_time
@@ -918,20 +946,27 @@ class VideoUpscaler:
                                             min(0.80, upscale_progress)
                                         )
                                 time.sleep(1.0)
-                            # Process finished, clean up lock file
+
+                            # Clean up lock file
                             if lock_file.exists():
                                 lock_file.unlink()
-                            # Skip to validation - frames should be done
-                            upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
-                            logger.info(f"Attached process finished: {upscaled_count} frames total")
-                            # Jump to validation section
-                            if upscaled_count < total_frames:
-                                logger.error(f"Not all frames upscaled: {upscaled_count}/{total_frames}")
-                                if progress_callback:
-                                    progress_callback(f"⚠️ Only {upscaled_count}/{total_frames} frames upscaled. Restart to continue.", 0.25)
-                                return False
-                            # Skip to reassembly
-                            goto_reassembly = True
+
+                            # If process stalled, DON'T return - fall through to batch processing
+                            if process_stalled:
+                                logger.info("Stalled process killed, continuing with batch processing...")
+                                time.sleep(2)  # Brief delay for GPU recovery
+                                goto_reassembly = False  # Continue to batch processing
+                            else:
+                                # Process finished normally, check validation
+                                upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+                                logger.info(f"Attached process finished: {upscaled_count} frames total")
+                                if upscaled_count < total_frames:
+                                    logger.error(f"Not all frames upscaled: {upscaled_count}/{total_frames}")
+                                    if progress_callback:
+                                        progress_callback(f"⚠️ Only {upscaled_count}/{total_frames} frames upscaled. Restart to continue.", 0.25)
+                                    return False
+                                # Skip to reassembly
+                                goto_reassembly = True
                         else:
                             # PID exists but not realesrgan - stale lock
                             lock_file.unlink()
@@ -950,95 +985,177 @@ class VideoUpscaler:
             if goto_reassembly:
                 pass  # Skip to reassembly section below
             else:
-                # Create temp directory with hard links to only the remaining frames
+                # Recalculate remaining frames (in case we killed a stalled attached process)
+                all_frames = sorted(frames_dir.glob("*.png"))
+                upscaled_files = {f.stem for f in upscaled_dir.glob("*.jpg")}
+                remaining_frames = [f for f in all_frames if f.stem not in upscaled_files]
+                already_done = len(all_frames) - len(remaining_frames)
+
+                if progress_callback and remaining_frames:
+                    progress_callback(f"📷 {len(remaining_frames)} frames remaining to upscale...", 0.23)
+
+                # Process frames in batches to avoid GPU hangs
+                # Using smaller batches due to ncnn-vulkan stability issues on Apple Silicon
+                BATCH_SIZE = 50  # Small batches for stability
+                SMALL_BATCH_SIZE = 25  # Even smaller after stalls
                 pending_dir = work_dir / "pending"
-                if pending_dir.exists():
-                    shutil.rmtree(pending_dir)
-                pending_dir.mkdir(parents=True, exist_ok=True)
 
-                for frame in remaining_frames:
-                    # Use hard links - realesrgan doesn't follow symlinks
-                    os.link(str(frame.absolute()), str(pending_dir / frame.name))
-
-                if progress_callback:
-                    progress_callback(f"📷 Processing {len(remaining_frames)} remaining frames...", 0.22)
-
-                # Find models directory
+                # Find models directory once
                 home = Path.home()
                 models_dir = home / ".local" / "share" / "realesrgan-ncnn-vulkan" / "models"
                 if not models_dir.exists():
-                    # Check next to binary
                     bin_path = Path(realesrgan_bin).parent
                     models_dir = bin_path / "models"
 
-                upscale_cmd = [
-                    realesrgan_bin,
-                    "-i", str(pending_dir),  # Only process remaining frames
-                    "-o", str(upscaled_dir),
-                    "-n", model_name,
-                    "-f", "jpg",  # JPEG is ~10x smaller/faster than PNG (3-5MB vs 43MB per frame)
-                    "-j", "4:4:4",  # Parallel: 4 threads for load, 4 for process, 4 for save
-                ]
-
-                # Add models path if it exists
-                if models_dir.exists():
-                    upscale_cmd.extend(["-m", str(models_dir)])
-
-                logger.info(f"Running Real-ESRGAN on {len(remaining_frames)} remaining frames: {' '.join(upscale_cmd)}")
-
-                # Run upscaling in background and monitor progress
-                process = subprocess.Popen(
-                    upscale_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-
-                # Write lock file with PID to prevent duplicate processes
-                lock_file.write_text(f"{process.pid}\n{work_dir}")
-                logger.info(f"Started Real-ESRGAN process PID {process.pid}, lock file created")
-
-                # Monitor upscaling progress - use total already done + new upscaled for accurate ETA
+                # Process in batches
                 start_time = time.time()
-                initial_upscaled = already_done
-                if progress_callback:
-                    while process.poll() is None:
-                        upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
-                        new_this_run = upscaled_count - initial_upscaled
-                        if new_this_run > 0 and total_frames > 0:
-                            # Calculate ETA based on new frames processed this run
-                            elapsed = time.time() - start_time
-                            time_per_frame = elapsed / new_this_run
-                            remaining_count = total_frames - upscaled_count
-                            remaining_time = time_per_frame * remaining_count
+                total_to_process = len(remaining_frames)
+                batch_num = 0
+                consecutive_stalls = 0
+                max_consecutive_stalls = 10  # Give up after 10 consecutive stalls
 
-                            if remaining_time < 60:
-                                eta = f"{int(remaining_time)}s"
-                            elif remaining_time < 3600:
-                                eta = f"{int(remaining_time/60)}m {int(remaining_time%60)}s"
-                            else:
-                                eta = f"{int(remaining_time/3600)}h {int((remaining_time%3600)/60)}m"
-
-                            upscale_progress = 0.22 + (0.58 * upscaled_count / total_frames)
+                while remaining_frames:
+                    # Check for too many consecutive stalls
+                    if consecutive_stalls >= max_consecutive_stalls:
+                        logger.error(f"Too many consecutive stalls ({consecutive_stalls}), aborting")
+                        if progress_callback:
+                            current_done = len(list(upscaled_dir.glob("*.jpg")))
                             progress_callback(
-                                f"Upscaling: {upscaled_count}/{total_frames} (ETA: {eta})",
-                                min(0.80, upscale_progress)
+                                f"❌ Process keeps stalling. {current_done}/{total_frames} done. Try smaller batches or different model.",
+                                0.22 + (0.58 * current_done / total_frames)
                             )
-                        time.sleep(1.0)
+                        break
 
-                stdout, stderr = process.communicate()
+                    batch_num += 1
+                    # Use smaller batch after stalls for better stability
+                    current_batch_size = SMALL_BATCH_SIZE if consecutive_stalls > 0 else BATCH_SIZE
+                    batch = remaining_frames[:current_batch_size]
+                    remaining_frames = remaining_frames[current_batch_size:]
 
-                # Clean up lock file after process completes
-                if lock_file.exists():
-                    lock_file.unlink()
+                    # Create pending directory with hard links for this batch
+                    if pending_dir.exists():
+                        shutil.rmtree(pending_dir)
+                    pending_dir.mkdir(parents=True, exist_ok=True)
 
-                if process.returncode != 0:
-                    logger.error(f"Real-ESRGAN failed: {stderr}")
-                    return False
+                    for frame in batch:
+                        os.link(str(frame.absolute()), str(pending_dir / frame.name))
 
-                # Clean up pending hard links directory
-                if pending_dir.exists():
-                    shutil.rmtree(pending_dir)
+                    current_done = len(list(upscaled_dir.glob("*.jpg")))
+                    if progress_callback:
+                        progress_callback(
+                            f"📷 Batch {batch_num}: Processing {len(batch)} frames ({current_done}/{total_frames} total done)...",
+                            0.22 + (0.58 * current_done / total_frames)
+                        )
+
+                    upscale_cmd = [
+                        realesrgan_bin,
+                        "-i", str(pending_dir),
+                        "-o", str(upscaled_dir),
+                        "-n", model_name,
+                        "-f", "jpg",
+                        "-j", "1:2:2",  # Conservative parallelism
+                    ]
+                    if models_dir.exists():
+                        upscale_cmd.extend(["-m", str(models_dir)])
+
+                    logger.info(f"Batch {batch_num}: Processing {len(batch)} frames")
+
+                    # Run this batch
+                    process = subprocess.Popen(
+                        upscale_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True
+                    )
+
+                    # Write lock file
+                    lock_file.write_text(f"{process.pid}\n{work_dir}")
+
+                    # Monitor this batch with watchdog for stall detection
+                    batch_start = len(list(upscaled_dir.glob("*.jpg")))
+                    last_progress_count = batch_start
+                    last_progress_time = time.time()
+                    STALL_TIMEOUT = 3  # Kill process if no progress for 3 seconds
+                    process_stalled = False
+
+                    if progress_callback:
+                        while process.poll() is None:
+                            upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+                            batch_done = upscaled_count - batch_start
+                            total_done_now = upscaled_count
+
+                            # Watchdog: check for stall
+                            if upscaled_count > last_progress_count:
+                                last_progress_count = upscaled_count
+                                last_progress_time = time.time()
+                            else:
+                                stall_duration = time.time() - last_progress_time
+                                if stall_duration > STALL_TIMEOUT:
+                                    logger.warning(f"Process stalled for {stall_duration:.0f}s, killing and restarting...")
+                                    if progress_callback:
+                                        progress_callback(
+                                            f"⚠️ Process stalled, auto-restarting... ({total_done_now}/{total_frames} done)",
+                                            0.22 + (0.58 * total_done_now / total_frames)
+                                        )
+                                    process.kill()
+                                    process_stalled = True
+                                    break
+
+                            if total_done_now > already_done and total_frames > 0:
+                                elapsed = time.time() - start_time
+                                frames_this_session = total_done_now - already_done
+                                time_per_frame = elapsed / frames_this_session
+                                remaining_count = total_frames - total_done_now
+                                remaining_time = time_per_frame * remaining_count
+
+                                if remaining_time < 60:
+                                    eta = f"{int(remaining_time)}s"
+                                elif remaining_time < 3600:
+                                    eta = f"{int(remaining_time/60)}m {int(remaining_time%60)}s"
+                                else:
+                                    eta = f"{int(remaining_time/3600)}h {int((remaining_time%3600)/60)}m"
+
+                                upscale_progress = 0.22 + (0.58 * total_done_now / total_frames)
+                                progress_callback(
+                                    f"Batch {batch_num}: {batch_done}/{len(batch)} | Total: {total_done_now}/{total_frames} (ETA: {eta})",
+                                    min(0.80, upscale_progress)
+                                )
+                            time.sleep(1.0)
+
+                    stdout, stderr = process.communicate(timeout=5) if not process_stalled else ("", "Process killed due to stall")
+
+                    # Clean up lock file
+                    if lock_file.exists():
+                        lock_file.unlink()
+
+                    if process.returncode != 0 or process_stalled:
+                        if process_stalled:
+                            consecutive_stalls += 1
+                            logger.warning(f"Batch {batch_num} stalled (stall #{consecutive_stalls}) - will retry remaining frames")
+                        else:
+                            logger.error(f"Batch {batch_num} failed: {stderr}")
+                            consecutive_stalls += 1  # Also count failures
+
+                        # Re-check which frames still need processing and add to remaining
+                        upscaled_files = {f.stem for f in upscaled_dir.glob("*.jpg")}
+                        frames_from_this_batch = [f for f in batch if f.stem not in upscaled_files]
+                        if frames_from_this_batch:
+                            # Add un-processed frames back to beginning of queue
+                            remaining_frames = frames_from_this_batch + remaining_frames
+                            logger.info(f"Re-queued {len(frames_from_this_batch)} frames for retry")
+
+                        # Brief delay before restart to let GPU recover
+                        time.sleep(2)
+                    else:
+                        # Successful batch - reset stall counter
+                        consecutive_stalls = 0
+
+                    # Clean up pending directory after each batch
+                    if pending_dir.exists():
+                        shutil.rmtree(pending_dir)
+
+                    current_done = len(list(upscaled_dir.glob("*.jpg")))
+                    logger.info(f"Batch {batch_num} complete: {current_done}/{total_frames} frames done")
 
         upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
         logger.info(f"Upscaled {upscaled_count} frames total")
