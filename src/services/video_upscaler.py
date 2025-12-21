@@ -957,115 +957,114 @@ class VideoUpscaler:
                 progress_callback(f"✅ All {total_frames} frames already upscaled!", 0.80)
             logger.info(f"All {total_frames} frames already upscaled, skipping to reassembly")
         else:
-            # Check for existing process via lock file to prevent duplicates
+            # Check for existing realesrgan processes (not just lock file PID)
+            # This properly handles multiple parallel workers
             import os
             lock_file = work_dir / "upscale.lock"
-            if lock_file.exists():
-                try:
-                    lock_data = lock_file.read_text().strip().split("\n")
-                    existing_pid = int(lock_data[0])
-                    # Check if process is still running
+
+            # Check if ANY realesrgan process is running (handles multiple workers)
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", "realesrgan-ncnn-vulkan"],
+                    capture_output=True, text=True, timeout=2
+                )
+                running_pids = [int(p) for p in result.stdout.strip().split('\n') if p.strip()]
+            except Exception:
+                running_pids = []
+
+            if running_pids:
+                logger.info(f"Upscaling already in progress ({len(running_pids)} workers), attaching...")
+                if progress_callback:
+                    progress_callback(f"⏳ {len(running_pids)} workers running, monitoring...", 0.22)
+
+                # Monitor ALL running workers with watchdog
+                start_time = time.time()
+                initial_upscaled = already_done
+                last_progress_count = initial_upscaled
+                last_progress_time = time.time()
+                STALL_TIMEOUT = 8  # 8 seconds for parallel workers
+                process_stalled = False
+
+                while True:
+                    # Check if ANY realesrgan process is still running
                     try:
-                        os.kill(existing_pid, 0)  # Signal 0 = check if process exists
-                        # Process exists - check if it's actually realesrgan
                         result = subprocess.run(
-                            ["ps", "-p", str(existing_pid), "-o", "comm="],
-                            capture_output=True, text=True
+                            ["pgrep", "-f", "realesrgan-ncnn-vulkan"],
+                            capture_output=True, text=True, timeout=2
                         )
-                        if "realesrgan" in result.stdout.lower():
-                            logger.info(f"Upscaling already in progress (PID {existing_pid}), attaching to existing process")
+                        current_pids = [p for p in result.stdout.strip().split('\n') if p.strip()]
+                    except Exception:
+                        current_pids = []
+
+                    if not current_pids:
+                        break  # All workers finished
+
+                    upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+
+                    # Watchdog: check for stall
+                    if upscaled_count > last_progress_count:
+                        last_progress_count = upscaled_count
+                        last_progress_time = time.time()
+                    else:
+                        stall_duration = time.time() - last_progress_time
+                        if stall_duration > STALL_TIMEOUT:
+                            logger.warning(f"Workers stalled for {stall_duration:.0f}s, killing all...")
                             if progress_callback:
-                                progress_callback(f"⏳ Upscaling already running (PID {existing_pid}), monitoring...", 0.22)
-                            # Monitor the existing process with watchdog
-                            start_time = time.time()
-                            initial_upscaled = already_done
-                            last_progress_count = initial_upscaled
-                            last_progress_time = time.time()
-                            STALL_TIMEOUT = 5  # Kill if no progress for 5 seconds
-                            process_stalled = False
+                                progress_callback(
+                                    f"⚠️ Workers stalled, restarting... ({upscaled_count}/{total_frames} done)",
+                                    0.22 + (0.58 * upscaled_count / total_frames)
+                                )
+                            # Kill all stalled workers
+                            subprocess.run(["pkill", "-9", "-f", "realesrgan-ncnn-vulkan"],
+                                          capture_output=True, timeout=5)
+                            process_stalled = True
+                            break
 
-                            while True:
-                                # Check if process still running
-                                try:
-                                    os.kill(existing_pid, 0)
-                                except OSError:
-                                    break  # Process finished
-
-                                upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
-
-                                # Watchdog: check for stall
-                                if upscaled_count > last_progress_count:
-                                    last_progress_count = upscaled_count
-                                    last_progress_time = time.time()
-                                else:
-                                    stall_duration = time.time() - last_progress_time
-                                    if stall_duration > STALL_TIMEOUT:
-                                        logger.warning(f"Attached process stalled for {stall_duration:.0f}s, killing...")
-                                        if progress_callback:
-                                            progress_callback(
-                                                f"⚠️ Process stalled, killing and restarting... ({upscaled_count}/{total_frames} done)",
-                                                0.22 + (0.58 * upscaled_count / total_frames)
-                                            )
-                                        # Kill the stalled process
-                                        try:
-                                            os.kill(existing_pid, 9)  # SIGKILL
-                                        except OSError:
-                                            pass
-                                        process_stalled = True
-                                        break
-
-                                new_this_run = upscaled_count - initial_upscaled
-                                if new_this_run > 0 and total_frames > 0:
-                                    elapsed = time.time() - start_time
-                                    time_per_frame = elapsed / new_this_run
-                                    remaining_count = total_frames - upscaled_count
-                                    remaining_time = time_per_frame * remaining_count
-                                    if remaining_time < 60:
-                                        eta = f"{int(remaining_time)}s"
-                                    elif remaining_time < 3600:
-                                        eta = f"{int(remaining_time/60)}m {int(remaining_time%60)}s"
-                                    else:
-                                        eta = f"{int(remaining_time/3600)}h {int((remaining_time%3600)/60)}m"
-                                    upscale_progress = 0.22 + (0.58 * upscaled_count / total_frames)
-                                    if progress_callback:
-                                        progress_callback(
-                                            f"Upscaling: {upscaled_count}/{total_frames} (ETA: {eta})",
-                                            min(0.80, upscale_progress)
-                                        )
-                                time.sleep(1.0)
-
-                            # Clean up lock file
-                            if lock_file.exists():
-                                lock_file.unlink()
-
-                            # If process stalled, DON'T return - fall through to batch processing
-                            if process_stalled:
-                                logger.info("Stalled process killed, continuing with batch processing...")
-                                time.sleep(2)  # Brief delay for GPU recovery
-                                goto_reassembly = False  # Continue to batch processing
-                            else:
-                                # Process finished normally, check if all done
-                                upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
-                                logger.info(f"Attached process finished: {upscaled_count} frames total")
-                                if upscaled_count < total_frames:
-                                    # Not all done - continue to batch processing (DON'T return!)
-                                    logger.info(f"Attached process done but {total_frames - upscaled_count} frames remaining, continuing...")
-                                    goto_reassembly = False  # Continue to batch processing
-                                else:
-                                    # All frames done - skip to reassembly
-                                    goto_reassembly = True
+                    new_this_run = upscaled_count - initial_upscaled
+                    if new_this_run > 0 and total_frames > 0:
+                        elapsed = time.time() - start_time
+                        time_per_frame = elapsed / new_this_run
+                        remaining_count = total_frames - upscaled_count
+                        remaining_time = time_per_frame * remaining_count
+                        if remaining_time < 60:
+                            eta = f"{int(remaining_time)}s"
+                        elif remaining_time < 3600:
+                            eta = f"{int(remaining_time/60)}m {int(remaining_time%60)}s"
                         else:
-                            # PID exists but not realesrgan - stale lock
-                            lock_file.unlink()
-                            goto_reassembly = False
-                    except OSError:
-                        # Process doesn't exist - stale lock file
-                        lock_file.unlink()
-                        goto_reassembly = False
-                except (ValueError, IndexError):
-                    # Invalid lock file
+                            eta = f"{int(remaining_time/3600)}h {int((remaining_time%3600)/60)}m"
+                        upscale_progress = 0.22 + (0.58 * upscaled_count / total_frames)
+                        if progress_callback:
+                            progress_callback(
+                                f"🚀 {len(current_pids)} workers | {upscaled_count}/{total_frames} (ETA: {eta})",
+                                min(0.80, upscale_progress)
+                            )
+                    time.sleep(1.0)
+
+                # Clean up lock file
+                if lock_file.exists():
                     lock_file.unlink()
-                    goto_reassembly = False
+
+                # After workers finish, check if we need to continue
+                if process_stalled:
+                    logger.info("Stalled workers killed, continuing with batch processing...")
+                    time.sleep(2)  # Brief delay for GPU recovery
+                    goto_reassembly = False  # Continue to batch processing
+                else:
+                    # Workers finished normally, check if all done
+                    upscaled_count = len(list(upscaled_dir.glob("*.jpg")))
+                    logger.info(f"Workers finished: {upscaled_count} frames total")
+                    if upscaled_count < total_frames:
+                        # Not all done - continue to batch processing
+                        logger.info(f"Workers done but {total_frames - upscaled_count} frames remaining, continuing...")
+                        goto_reassembly = False  # Continue to batch processing
+                    else:
+                        # All frames done - skip to reassembly
+                        goto_reassembly = True
+            elif lock_file.exists():
+                # Lock file exists but no process - stale lock
+                logger.info("Cleaning up stale lock file (no running workers)")
+                lock_file.unlink()
+                goto_reassembly = False
             else:
                 goto_reassembly = False
 
