@@ -1624,9 +1624,11 @@ class VideoUpscaler:
             reassemble_cmd.extend(["-threads", str(threads)])
 
         # Add thread_queue_size for better I/O buffering
+        # Use -start_number 1 since frames start at frame_000001.jpg
         reassemble_cmd.extend([
             "-thread_queue_size", str(buffer_size),
             "-framerate", fps,
+            "-start_number", "1",
             "-i", str(upscaled_dir / "frame_%06d.jpg"),
         ])
 
