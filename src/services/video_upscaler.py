@@ -1786,21 +1786,25 @@ class VideoUpscaler:
         if preserve_audio and original_input and original_input.exists():
             reassemble_cmd.extend(["-i", str(original_input)])
 
-        # Quality mapping for different encoders
-        # YouTube 8K recommends 80-160 Mbps for SDR @ 30fps
-        quality_map = {
-            # VideoToolbox: lower q:v = higher quality/bitrate
-            "hevc_videotoolbox": {"maximum": 20, "high": 40, "medium": 55, "low": 70},
-            "h264_videotoolbox": {"maximum": 20, "high": 40, "medium": 55, "low": 70},
-            "libx264": {"maximum": 15, "high": 18, "medium": 23, "low": 28},  # CRF
-            "libvpx-vp9": {"maximum": 10, "high": 15, "medium": 25, "low": 35},  # CQ
+        # Quality/bitrate mapping for different encoders
+        # YouTube 8K SDR @ 30fps recommends 80-160 Mbps
+        # YouTube 8K SDR @ 60fps recommends 120-240 Mbps
+        # Source: https://support.google.com/youtube/answer/1722171
+
+        # VideoToolbox: Use -b:v with -constant_bit_rate true (no -q:v!)
+        # IMPORTANT: VideoToolbox outputs ~53% of requested bitrate
+        # Tested ratios: 150M→79M, 200M→106M, 250M→133M, 300M→171M
+        # To hit YouTube 8K targets (80-160 Mbps), request higher values
+        bitrate_map = {
+            # HEVC: max=300M→160Mbps, high=225M→120Mbps, med=115M→60Mbps, low=60M→30Mbps
+            "hevc_videotoolbox": {"maximum": "300M", "high": "225M", "medium": "115M", "low": "60M"},
+            "h264_videotoolbox": {"maximum": "350M", "high": "260M", "medium": "130M", "low": "70M"},
+            "libvpx-vp9": {"maximum": "120M", "high": "80M", "medium": "50M", "low": "25M"},
         }
-        # Target bitrates for YouTube 8K (used with "maximum" quality)
-        bitrate_8k = {
-            "hevc_videotoolbox": "150M",  # 150 Mbps
-            "h264_videotoolbox": "200M",
-            "libx264": "200M",
-            "libvpx-vp9": "120M",  # VP9 more efficient
+        # CRF values for software encoders (lower = better quality)
+        crf_map = {
+            "libx264": {"maximum": 15, "high": 18, "medium": 23, "low": 28},
+            "libvpx-vp9": {"maximum": 15, "high": 20, "medium": 30, "low": 40},
         }
 
         # Add video filter for scaling (skip if native)
@@ -1818,36 +1822,36 @@ class VideoUpscaler:
         # Apply encoder-specific settings
         if encoder in ["hevc_videotoolbox", "h264_videotoolbox"]:
             # Hardware encoding (VideoToolbox)
-            q_value = quality_map.get(encoder, {}).get(quality, 55)
+            # IMPORTANT: Do NOT use -q:v - it overrides bitrate and produces garbage
+            # Use -b:v with -constant_bit_rate for predictable output
+            target_br = bitrate_map.get(encoder, {}).get(quality, "50M")
             reassemble_cmd.extend([
                 "-c:v", encoder,
-                "-q:v", str(q_value),
+                "-b:v", target_br,
+                "-constant_bit_rate", "true",  # macOS 13+ - enforces target bitrate
             ])
-            # For maximum quality, also set minimum bitrate
-            if quality == "maximum":
-                target_br = bitrate_8k.get(encoder, "150M")
-                reassemble_cmd.extend(["-b:v", target_br])
             if encoder == "hevc_videotoolbox":
-                reassemble_cmd.extend(["-tag:v", "hvc1"])  # Compatibility tag for HEVC
-            encoder_label = "Hardware"
+                reassemble_cmd.extend(["-tag:v", "hvc1"])
+            encoder_label = f"Hardware ({target_br})"
+            logger.info(f"VideoToolbox encoding at {target_br} (CBR mode)")
+
         elif encoder == "libvpx-vp9":
             # VP9 encoding (YouTube 8K native format)
-            cq = quality_map.get("libvpx-vp9", {}).get(quality, 25)
+            target_br = bitrate_map.get(encoder, {}).get(quality, "40M")
+            cq = crf_map.get("libvpx-vp9", {}).get(quality, 30)
             reassemble_cmd.extend([
                 "-c:v", "libvpx-vp9",
+                "-b:v", target_br,
                 "-crf", str(cq),
                 "-pix_fmt", "yuv420p",
                 "-row-mt", "1",  # Enable row-based multithreading
             ])
-            # For maximum quality, set target bitrate instead of pure CRF
-            if quality == "maximum":
-                reassemble_cmd.extend(["-b:v", bitrate_8k.get(encoder, "120M")])
-            else:
-                reassemble_cmd.extend(["-b:v", "0"])  # Pure CRF mode
-            encoder_label = "VP9"
+            logger.info(f"VP9 encoding at {target_br}, crf={cq}")
+            encoder_label = f"VP9 ({target_br})"
+
         else:
             # Software encoding (libx264)
-            crf = quality_map.get("libx264", {}).get(quality, 23)
+            crf = crf_map.get("libx264", {}).get(quality, 23)
             preset = "slow" if quality == "maximum" else ("medium" if quality == "high" else ("fast" if quality == "medium" else "veryfast"))
             reassemble_cmd.extend([
                 "-c:v", "libx264",
@@ -1855,7 +1859,8 @@ class VideoUpscaler:
                 "-crf", str(crf),
                 "-pix_fmt", "yuv420p",
             ])
-            encoder_label = "Software"
+            logger.info(f"libx264 encoding with crf={crf}, preset={preset}")
+            encoder_label = f"Software (crf {crf})"
 
         if preserve_audio and original_input and original_input.exists():
             # NOTE: Don't use -shortest as it can truncate video if audio duration differs

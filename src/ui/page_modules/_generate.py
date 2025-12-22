@@ -1683,8 +1683,31 @@ def render_upscale_only_page(state) -> None:
                             total = assembly_status["total_frames"]
                             st.progress(progress, text=f"Encoding: {current:,}/{total:,} frames ({int(progress*100)}%)")
                             st.caption("FFmpeg is running in background. Safe to leave - will complete automatically.")
-                            if st.button("🔄 Refresh Progress", key="refresh_assembly"):
-                                st.rerun()
+
+                            col_refresh, col_cancel = st.columns([1, 1])
+                            with col_refresh:
+                                if st.button("🔄 Refresh Progress", key="refresh_assembly"):
+                                    st.rerun()
+                            with col_cancel:
+                                if st.button("❌ Cancel & Change Settings", key="cancel_assembly", type="secondary"):
+                                    # Kill the FFmpeg process
+                                    pid = assembly_status['pid']
+                                    try:
+                                        import os
+                                        import signal
+                                        os.kill(pid, signal.SIGTERM)
+                                        # Also clean up temp file
+                                        temp_file = assembly_status.get("output_path")
+                                        if temp_file:
+                                            temp_encoding = Path(str(temp_file).replace(".mp4", ".encoding.mp4"))
+                                            if temp_encoding.exists():
+                                                temp_encoding.unlink()
+                                        st.success("Assembly cancelled. You can now change settings and restart.")
+                                        time.sleep(1)
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Failed to cancel: {e}")
+
                             st.markdown("---")
                             break
 
