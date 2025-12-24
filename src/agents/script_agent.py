@@ -259,7 +259,7 @@ IMPORTANT:
         messages.append({"role": "user", "content": extraction_prompt})
 
         response = client.messages.create(
-            model=self.config.claude_model,
+            model=default_config.claude_model,  # Use global config for model
             max_tokens=8192,  # Scripts can be very long
             system="You are a JSON extraction assistant. Return only valid JSON, no markdown formatting, no explanation text.",
             messages=messages,
@@ -401,7 +401,7 @@ Respond with only a JSON array:
 ]"""
 
         response = client.messages.create(
-            model=self.config.claude_model,
+            model=default_config.claude_model,  # Use global config for model
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -443,7 +443,7 @@ Write:
 Keep it concise but vivid."""
 
         response = client.messages.create(
-            model=self.config.claude_model,
+            model=default_config.claude_model,  # Use global config for model
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -469,7 +469,7 @@ Respond with only a JSON array of strings:
 ["style1", "style2", "style3", "style4", "style5"]"""
 
         response = client.messages.create(
-            model=self.config.claude_model,
+            model=default_config.claude_model,  # Use global config for model
             max_tokens=256,
             messages=[{"role": "user", "content": prompt}],
         )
