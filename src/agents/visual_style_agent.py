@@ -322,7 +322,7 @@ User's message: {user_message}"""
         for attempt in range(max_retries):
             try:
                 response = client.messages.create(
-                    model=self.config.claude_model,
+                    model=default_config.claude_model,  # Use global config for dynamic model selection
                     max_tokens=8192,  # Increased to handle 20+ scene descriptions
                     system=self._get_system_prompt(),
                     messages=self.conversation_history,
@@ -486,7 +486,7 @@ RULES:
         logger.info(f"Extracting visual plan for {self._num_scenes} scenes (single batch)...")
 
         response = client.messages.create(
-            model=self.config.claude_model,
+            model=default_config.claude_model,  # Use global config for dynamic model selection
             max_tokens=16384,
             system="You are a JSON extraction assistant. Return only valid JSON, no markdown. visual_prompt should ONLY describe scene-specific action/composition (1-2 sentences) - DO NOT include character descriptions, visual world, or cinematography style as those are added separately.",
             messages=messages,
@@ -660,7 +660,7 @@ RULES:
         for attempt in range(max_retries):
             try:
                 response = client.messages.create(
-                    model=self.config.claude_model,
+                    model=default_config.claude_model,  # Use global config for dynamic model selection
                     max_tokens=8192,
                     system=system,
                     messages=messages,
