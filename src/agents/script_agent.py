@@ -18,7 +18,10 @@ from src.models.schemas import (
     Character,
     DialogueLine,
     Emotion,
+    MovieConfig,
+    MovieFormat,
     MovieScene,
+    MovieTone,
     SceneDirection,
     Script,
     VoiceSettings,
@@ -103,6 +106,137 @@ class ScriptAgent:
         self._config = config  # Store optional override
         self._client = None
         self.conversation_history: list[dict] = []
+        self._project_config: Optional[MovieConfig] = None
+
+    def set_project_config(self, project_config: MovieConfig) -> None:
+        """Set the project configuration to guide script development.
+
+        This information will be used to tailor the script to the user's
+        specified format, duration, tone, and character count.
+
+        Args:
+            project_config: The MovieConfig from the setup step
+        """
+        self._project_config = project_config
+
+    def _get_config_context(self) -> str:
+        """Generate context string from project config for the system prompt."""
+        if not self._project_config:
+            return ""
+
+        cfg = self._project_config
+
+        # Format mapping
+        format_desc = {
+            MovieFormat.PODCAST: "a podcast-style discussion or interview",
+            MovieFormat.EDUCATIONAL: "an educational tutorial or lesson",
+            MovieFormat.SHORT_FILM: "an animated short film or story",
+            MovieFormat.EXPLAINER: "an explainer video or product breakdown",
+            MovieFormat.INTERVIEW: "an interview or Q&A format video",
+        }
+
+        # Tone mapping
+        tone_desc = {
+            MovieTone.CASUAL: "casual and conversational",
+            MovieTone.PROFESSIONAL: "professional and business-like",
+            MovieTone.EDUCATIONAL: "clear and instructive",
+            MovieTone.HUMOROUS: "funny and lighthearted",
+            MovieTone.DRAMATIC: "intense and emotional",
+        }
+
+        # Duration in readable format
+        minutes = cfg.target_duration // 60
+        seconds = cfg.target_duration % 60
+        if seconds:
+            duration_str = f"{minutes} minutes and {seconds} seconds"
+        else:
+            duration_str = f"{minutes} minutes"
+
+        # Character description
+        if cfg.num_characters == 1:
+            char_desc = "a solo narrator"
+        elif cfg.num_characters == 2:
+            char_desc = "two characters in dialogue"
+        else:
+            char_desc = f"{cfg.num_characters} characters (ensemble)"
+
+        # Handle custom format (with backward compatibility)
+        custom_format = getattr(cfg, 'custom_format', None)
+        if custom_format:
+            format_text = custom_format
+        else:
+            format_text = format_desc.get(cfg.format, str(cfg.format))
+
+        # Handle character names (with backward compatibility)
+        character_names = getattr(cfg, 'character_names', [])
+        if character_names:
+            char_names = ", ".join(character_names)
+            char_desc = f"{cfg.num_characters} characters named: {char_names}"
+        else:
+            char_desc = char_desc  # Use the solo/duo/ensemble description
+
+        # Get recommended scenes and overlap settings (with backward compatibility)
+        recommended_scenes = getattr(cfg, 'recommended_scenes', 5)
+        allow_overlap = getattr(cfg, 'allow_overlap', True)
+
+        # Handle custom tone (with backward compatibility)
+        custom_tone = getattr(cfg, 'custom_tone', None)
+        if custom_tone:
+            tone_text = custom_tone
+        else:
+            tone_text = tone_desc.get(cfg.tone, str(cfg.tone))
+
+        # Technical settings (with backward compatibility)
+        generation_method = getattr(cfg, 'generation_method', 'tts_images')
+        voice_provider = getattr(cfg, 'voice_provider', 'edge')
+        veo_model = getattr(cfg, 'veo_model', 'veo-3.1-generate-preview')
+        veo_duration = getattr(cfg, 'veo_duration', 8)
+        veo_resolution = getattr(cfg, 'veo_resolution', '720p')
+
+        # Build technical context based on generation method
+        if generation_method == "veo3":
+            tech_context = f"""
+TECHNICAL SETTINGS (Video Generation):
+- Method: Veo 3.1 AI Video (generates video with spoken dialogue directly)
+- Model: {veo_model}
+- Clip Duration: {veo_duration} seconds per scene
+- Resolution: {veo_resolution}
+
+IMPORTANT FOR VEO: Each scene's dialogue will be spoken by Veo's AI voices. Write dialogue that:
+- Sounds natural when spoken aloud
+- Fits within ~{veo_duration} seconds per scene (roughly {veo_duration * 15} words max per scene)
+- Includes clear emotion/delivery cues for the AI voices
+- Has distinct character voices that can be differentiated"""
+        else:
+            voice_labels = {
+                "edge": "Edge TTS (Free)",
+                "openai": "OpenAI TTS",
+                "elevenlabs": "ElevenLabs (Premium)",
+            }
+            tech_context = f"""
+TECHNICAL SETTINGS (TTS + Images):
+- Method: Text-to-Speech with generated images
+- Voice Provider: {voice_labels.get(voice_provider, voice_provider)}
+
+IMPORTANT FOR TTS: Dialogue will be converted to speech. Write dialogue that:
+- Sounds natural when read aloud by TTS
+- Has appropriate pacing and punctuation for speech synthesis
+- Avoids complex words that TTS might mispronounce"""
+
+        context = f"""
+PROJECT REQUIREMENTS (from user's setup):
+- Format: {format_text}
+- Target Duration: {duration_str}
+- Recommended Scenes: {recommended_scenes} scenes (aim for this number to achieve the target duration)
+- Characters: {char_desc}
+- Tone: {tone_text}
+- Visual Style: {cfg.visual_style}
+- Overlapping Dialogue: {"allowed (characters can interrupt each other)" if allow_overlap else "not allowed (sequential dialogue only)"}
+{tech_context}
+
+IMPORTANT: Tailor your script to match these requirements. Aim for approximately {recommended_scenes} scenes to achieve the target duration of {duration_str}. Each scene should have enough dialogue to fill its portion of the total runtime.
+"""
+        return context
 
     @property
     def config(self) -> Config:
@@ -133,10 +267,16 @@ class ScriptAgent:
         model_to_use = default_config.claude_model
         logger.info(f"ScriptAgent using model: {model_to_use}")
 
+        # Build system prompt with optional config context
+        system_prompt = SYSTEM_PROMPT
+        config_context = self._get_config_context()
+        if config_context:
+            system_prompt = system_prompt + "\n" + config_context
+
         response = client.messages.create(
             model=model_to_use,
             max_tokens=default_config.claude_max_tokens,  # Use model's max output tokens
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             messages=self.conversation_history,
         )
 

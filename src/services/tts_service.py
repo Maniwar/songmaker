@@ -396,6 +396,72 @@ class TTSService:
         audio = AudioSegment.from_file(str(audio_path))
         return len(audio) / 1000.0
 
+    def extract_word_timing(self, audio_path: Path, expected_text: str = None) -> list:
+        """Extract word-level timing from an audio file using WhisperX.
+
+        Args:
+            audio_path: Path to audio file
+            expected_text: Optional expected text (for alignment accuracy)
+
+        Returns:
+            List of Word objects with timing information
+        """
+        from src.models.schemas import Word
+
+        try:
+            from src.services.audio_processor import AudioProcessor
+            processor = AudioProcessor()
+
+            # Transcribe with word-level alignment
+            transcript = processor.transcribe(audio_path, language="en")
+
+            if transcript and transcript.all_words:
+                return transcript.all_words
+            else:
+                logger.warning("No words extracted from %s", audio_path)
+                return []
+
+        except Exception as e:
+            logger.warning("Failed to extract word timing from %s: %s", audio_path, e)
+            return []
+
+    def generate_dialogue_with_timing(
+        self,
+        dialogue: DialogueLine,
+        character: Character,
+        output_dir: Path,
+        extract_words: bool = True,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> tuple[Path, list]:
+        """Generate audio for dialogue and extract word-level timing.
+
+        Args:
+            dialogue: The dialogue line to generate
+            character: The character speaking
+            output_dir: Directory to save audio
+            extract_words: Whether to extract word timing
+            progress_callback: Optional progress callback
+
+        Returns:
+            Tuple of (audio_path, list of Word objects)
+        """
+        # Generate the audio
+        audio_path = self.generate_dialogue_audio(
+            dialogue=dialogue,
+            character=character,
+            output_dir=output_dir,
+            progress_callback=progress_callback,
+        )
+
+        # Extract word timing if requested
+        words = []
+        if extract_words:
+            if progress_callback:
+                progress_callback(f"Extracting word timing for {character.name}...", 0.5)
+            words = self.extract_word_timing(audio_path, dialogue.text)
+
+        return audio_path, words
+
     def concatenate_audio(
         self,
         audio_paths: list[Path],
@@ -431,6 +497,187 @@ class TTSService:
         logger.info("Concatenated %d audio files to %s", len(audio_paths), output_path)
 
         return output_path
+
+    def mix_dialogue_with_timing(
+        self,
+        dialogue_items: list[dict],
+        output_path: Path,
+    ) -> Path:
+        """Mix multiple dialogue audio files with precise timing for overlaps.
+
+        Each dialogue_item should contain:
+            - audio_path: Path to the audio file
+            - start_time: When this audio should start (in seconds)
+
+        This allows for overlapping dialogue (characters talking over each other).
+
+        Args:
+            dialogue_items: List of dicts with audio_path and start_time
+            output_path: Output path for mixed audio
+
+        Returns:
+            Path to mixed audio file
+        """
+        if not dialogue_items:
+            raise ValueError("No dialogue items provided")
+
+        # Sort by start time
+        sorted_items = sorted(dialogue_items, key=lambda x: x["start_time"])
+
+        # Find total duration needed
+        max_end_time = 0.0
+        for item in sorted_items:
+            audio = AudioSegment.from_file(str(item["audio_path"]))
+            duration = len(audio) / 1000.0
+            end_time = item["start_time"] + duration
+            max_end_time = max(max_end_time, end_time)
+
+        # Create a base track of silence
+        total_duration_ms = int(max_end_time * 1000) + 100  # Add 100ms padding
+        mixed = AudioSegment.silent(duration=total_duration_ms)
+
+        # Overlay each audio at its start time
+        for item in sorted_items:
+            audio = AudioSegment.from_file(str(item["audio_path"]))
+            start_ms = int(item["start_time"] * 1000)
+            mixed = mixed.overlay(audio, position=start_ms)
+
+        # Export
+        mixed.export(str(output_path), format="mp3")
+        logger.info(
+            "Mixed %d dialogue tracks with overlaps to %s (%.1f seconds)",
+            len(dialogue_items),
+            output_path,
+            max_end_time,
+        )
+
+        return output_path
+
+    def calculate_overlap_timing(
+        self,
+        dialogues: list[DialogueLine],
+        default_pause_ms: float = 300,
+    ) -> list[float]:
+        """Calculate start times for dialogues considering overlaps.
+
+        Uses start_offset and interrupt_at_word to determine timing.
+        Negative start_offset means overlap with previous dialogue.
+
+        Args:
+            dialogues: List of DialogueLine objects with timing info
+            default_pause_ms: Default pause between lines in milliseconds
+
+        Returns:
+            List of start times in seconds for each dialogue
+        """
+        start_times = []
+        current_time = 0.0
+
+        for i, dialogue in enumerate(dialogues):
+            if i == 0:
+                # First dialogue starts at 0
+                start_times.append(0.0)
+            else:
+                prev_dialogue = dialogues[i - 1]
+                prev_duration = prev_dialogue.duration or 0.0
+                prev_end = start_times[i - 1] + prev_duration
+
+                # Check for interrupt_at_word (precise word-level interruption)
+                if dialogue.interrupt_at_word is not None and prev_dialogue.has_word_timing:
+                    word_idx = dialogue.interrupt_at_word
+                    words = prev_dialogue.words
+
+                    # Handle negative indices
+                    if word_idx < 0:
+                        word_idx = len(words) + word_idx
+
+                    # Clamp to valid range
+                    word_idx = max(0, min(word_idx, len(words) - 1))
+
+                    if words and 0 <= word_idx < len(words):
+                        # Start when that word starts in the previous dialogue
+                        word_start = words[word_idx].start
+                        start_time = start_times[i - 1] + word_start
+                        start_times.append(start_time)
+                        continue
+
+                # Use start_offset (negative = overlap, positive = extra pause)
+                offset_seconds = dialogue.start_offset
+                natural_start = prev_end + (default_pause_ms / 1000)
+                start_time = max(0, natural_start + offset_seconds)
+                start_times.append(start_time)
+
+        return start_times
+
+    def apply_timing_to_scenes(
+        self,
+        scenes: list,
+        default_pause_ms: float = 300,
+        scene_pause_ms: float = 1000,
+    ) -> float:
+        """Apply timing to all dialogue and scenes, handling overlaps.
+
+        This method:
+        1. Calculates dialogue start times considering overlaps
+        2. Sets start_time and end_time on each dialogue
+        3. Sets start_time and end_time on each scene based on its dialogue
+
+        Args:
+            scenes: List of MovieScene objects with dialogue
+            default_pause_ms: Default pause between dialogue lines in milliseconds
+            scene_pause_ms: Pause between scenes in milliseconds
+
+        Returns:
+            Total duration in seconds
+        """
+        from src.models.schemas import MovieScene
+
+        running_time = 0.0
+
+        for scene_idx, scene in enumerate(scenes):
+            if not scene.dialogue:
+                # Empty scene - give it a default duration
+                scene.start_time = running_time
+                scene.end_time = running_time + 3.0  # 3 second default
+                running_time = scene.end_time + (scene_pause_ms / 1000)
+                continue
+
+            # Mark scene start
+            scene.start_time = running_time
+
+            # Calculate start times for all dialogue in this scene
+            # considering overlaps
+            start_times = self.calculate_overlap_timing(
+                scene.dialogue,
+                default_pause_ms=default_pause_ms,
+            )
+
+            # Offset start times by scene start
+            for i, dialogue in enumerate(scene.dialogue):
+                if dialogue.duration is None:
+                    # Need duration - try to get it from audio
+                    if dialogue.audio_path:
+                        dialogue_duration = self.get_audio_duration(
+                            Path(dialogue.audio_path)
+                        )
+                    else:
+                        # Estimate based on text length (~150 WPM)
+                        word_count = len(dialogue.text.split())
+                        dialogue_duration = word_count / 2.5  # ~2.5 words per second
+                else:
+                    dialogue_duration = dialogue.duration
+
+                dialogue.start_time = running_time + start_times[i]
+                dialogue.end_time = dialogue.start_time + dialogue_duration
+
+            # Scene ends when last dialogue ends (accounting for overlaps)
+            max_end = max(d.end_time for d in scene.dialogue if d.end_time)
+            scene.end_time = max_end
+
+            # Add scene pause before next scene
+            running_time = scene.end_time + (scene_pause_ms / 1000)
+
+        return running_time
 
 
 def check_elevenlabs_available() -> bool:

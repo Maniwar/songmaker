@@ -220,6 +220,10 @@ class MovieImageGenerator:
         character: Character,
         output_dir: Path,
         style: Optional[str] = None,
+        image_size: str = "2K",
+        aspect_ratio: str = "1:1",
+        model: Optional[str] = None,
+        source_image: Optional["Image.Image"] = None,
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> Optional[Path]:
         """Generate a reference image for a character.
@@ -228,40 +232,157 @@ class MovieImageGenerator:
             character: The character to generate
             output_dir: Directory to save the image
             style: Optional style override
+            image_size: Image size ("2K" or "4K")
+            aspect_ratio: Aspect ratio (e.g., "1:1", "3:4", "16:9")
+            model: Optional model override (e.g., "gemini-2.0-flash-exp")
+            source_image: Optional source photo to transform into character
             progress_callback: Optional progress callback
 
         Returns:
             Path to generated reference image
         """
-        output_dir.mkdir(parents=True, exist_ok=True)
+        from io import BytesIO
+        from PIL import Image as PILImage
 
-        prompt = (
-            f"Portrait of {character.description}. "
-            f"Character portrait, neutral expression, centered composition. "
-            f"Style: {style or self.style}. "
-            f"Highly detailed, professional quality."
-        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"character_{character.id}_reference.png"
+        effective_style = style or self.style
 
         if progress_callback:
             progress_callback(f"Generating reference for {character.name}...", 0.0)
 
-        output_path = output_dir / f"character_{character.id}_reference.png"
-
-        try:
-            result = self.image_generator.generate(
-                prompt=prompt,
+        if source_image:
+            # Use dedicated photo transformation
+            return self._transform_photo_to_character(
+                source_image=source_image,
+                character=character,
+                style=effective_style,
                 output_path=output_path,
+                image_size=image_size,
+                aspect_ratio=aspect_ratio,
+                model=model,
+            )
+        else:
+            # Generate from scratch
+            prompt = (
+                f"{effective_style} style portrait. "
+                f"A {effective_style} character portrait of {character.description}. "
+                f"Centered composition, neutral expression, professional lighting. "
+                f"Highly detailed, {effective_style}."
             )
 
-            if result and result.exists():
-                logger.info(f"Generated character reference: {result}")
-                return result
+            try:
+                result_image = self.image_generator.generate_scene_image(
+                    prompt=prompt,
+                    style_prefix=effective_style,
+                    aspect_ratio=aspect_ratio,
+                    image_size=image_size,
+                    output_path=output_path,
+                    model=model,
+                )
+
+                if result_image and output_path.exists():
+                    logger.info(f"Generated character reference: {output_path}")
+                    return output_path
+                else:
+                    logger.error(f"Failed to generate reference for {character.name}")
+                    return None
+
+            except Exception as e:
+                logger.error(f"Error generating character reference: {e}")
+                return None
+
+    def _transform_photo_to_character(
+        self,
+        source_image,
+        character: Character,
+        style: str,
+        output_path: Path,
+        image_size: str = "2K",
+        aspect_ratio: str = "1:1",
+        model: Optional[str] = None,
+    ) -> Optional[Path]:
+        """Transform a source photo into a character portrait using Gemini.
+
+        Uses gemini-2.5-flash-image or gemini-3-pro-image-preview for image editing.
+        Imagen models don't support image input.
+        """
+        from io import BytesIO
+        from PIL import Image as PILImage
+
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError:
+            logger.error("google-genai not installed")
+            return None
+
+        from src.config import config
+        client = genai.Client(api_key=config.google_api_key)
+
+        # Use Gemini models for image editing - Imagen doesn't support image input
+        # gemini-2.5-flash-image is optimized for image editing
+        # gemini-3-pro-image-preview is best for complex edits up to 4K
+        if model and "imagen" in model.lower():
+            logger.warning("Imagen doesn't support image editing, using gemini-2.5-flash-image")
+            model_name = "gemini-2.5-flash-image"
+        elif model and "gemini" in model.lower():
+            model_name = model
+        else:
+            # Default to gemini-2.5-flash-image for fast image editing
+            model_name = "gemini-2.5-flash-image"
+
+        # Build transformation prompt following Google's best practices
+        transform_prompt = f"""Transform this photograph into a {style} style character portrait.
+
+KEEP the person's face shape, eye shape, and basic facial features recognizable.
+APPLY this character description: {character.description}
+CHANGE the art style to: {style}
+Make it a professional quality portrait with good composition and lighting."""
+
+        logger.info(f"Transforming photo with {model_name}, size={image_size}")
+
+        try:
+            # Use the simpler format: contents=[prompt, image]
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[transform_prompt, source_image],
+                config=types.GenerateContentConfig(
+                    response_modalities=['IMAGE', 'TEXT'],
+                    image_config=types.ImageConfig(
+                        aspect_ratio=aspect_ratio,
+                        image_size=image_size,
+                    ),
+                ),
+            )
+
+            # Extract image from response
+            result_image = None
+            error_text = None
+
+            for part in response.parts:
+                if part.inline_data and part.inline_data.data:
+                    result_image = PILImage.open(BytesIO(part.inline_data.data))
+                    break
+                elif hasattr(part, 'as_image') and callable(part.as_image):
+                    result_image = part.as_image()
+                    break
+                elif part.text:
+                    error_text = part.text
+
+            if result_image:
+                result_image.save(output_path, format="PNG")
+                logger.info(f"Transformed photo saved: {output_path}")
+                return output_path
             else:
-                logger.error(f"Failed to generate reference for {character.name}")
+                if error_text:
+                    logger.error(f"Model returned text instead of image: {error_text[:200]}")
+                else:
+                    logger.error("No image returned from transformation")
                 return None
 
         except Exception as e:
-            logger.error(f"Error generating character reference: {e}")
+            logger.error(f"API error during transformation: {e}")
             return None
 
 

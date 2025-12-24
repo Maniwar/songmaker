@@ -47,8 +47,11 @@ def main():
     st.title("🎵 Songmaker")
     st.markdown("*Transform your song ideas into music videos with synchronized lyrics*")
 
-    # Sidebar for project management
-    render_project_sidebar()
+    # Check mode before rendering sidebar (Movie Mode has its own sidebar)
+    movie_mode = st.session_state.get('movie_mode', False)
+    if not movie_mode:
+        # Sidebar for project management (Song Mode only)
+        render_project_sidebar()
 
     # Validate configuration
     errors = config.validate()
@@ -65,7 +68,8 @@ def main():
     # Check for special modes (bypass normal workflow)
     # Check both session state flag and AppState for compatibility
     upscale_mode = st.session_state.get('upscale_only_mode', False) or getattr(state, 'upscale_only_mode', False)
-    movie_mode = st.session_state.get('movie_mode', False) or getattr(state, 'movie_mode', False)
+    # movie_mode already checked above for sidebar, also check AppState
+    movie_mode = movie_mode or getattr(state, 'movie_mode', False)
 
     if movie_mode:
         # Movie Mode - animated podcasts, educational videos, short films

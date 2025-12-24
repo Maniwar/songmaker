@@ -620,6 +620,512 @@ def list_audio_files() -> list[Path]:
     return sorted(audio_files, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+# ============================================================================
+# Movie Mode State Management
+# ============================================================================
+
+
+def get_movie_projects_dir() -> Path:
+    """Get the movie projects directory, creating it if needed."""
+    MOVIE_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    return MOVIE_PROJECTS_DIR
+
+
+def list_saved_movie_projects() -> list[Path]:
+    """List all saved movie project files."""
+    projects_dir = get_movie_projects_dir()
+    return sorted(
+        projects_dir.glob("*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+
+
+def save_movie_state(project_name: Optional[str] = None) -> Path:
+    """
+    Save the current movie mode state to a JSON file.
+
+    Args:
+        project_name: Optional name for the project.
+
+    Returns:
+        Path to the saved file.
+    """
+    if "movie_state" not in st.session_state:
+        raise ValueError("No movie state to save")
+
+    state: MovieModeState = st.session_state.movie_state
+    projects_dir = get_movie_projects_dir()
+
+    # Generate filename (priority: passed name > state name > script title > timestamp)
+    if project_name:
+        filename = project_name
+    elif getattr(state, 'project_name', None):
+        filename = state.project_name
+    elif state.script and state.script.title:
+        # Use script title
+        words = state.script.title.split()[:4]
+        filename = "_".join(words)
+    else:
+        filename = f"movie_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    # Clean filename
+    filename = "".join(c if c.isalnum() or c in "_-" else "_" for c in filename)
+    filepath = projects_dir / f"{filename}.json"
+
+    # Serialize state using Pydantic's model_dump
+    state_dict = state.model_dump(mode="json")
+
+    # Add metadata
+    save_data = {
+        "version": "1.0",
+        "type": "movie",
+        "saved_at": datetime.now().isoformat(),
+        "state": state_dict,
+    }
+
+    with open(filepath, "w") as f:
+        json.dump(save_data, f, indent=2, default=str)
+
+    return filepath
+
+
+def load_movie_state(filepath: Path) -> bool:
+    """
+    Load movie mode state from a saved JSON file.
+
+    Args:
+        filepath: Path to the saved project file.
+
+    Returns:
+        True if loaded successfully, False otherwise.
+    """
+    try:
+        with open(filepath) as f:
+            save_data = json.load(f)
+
+        state_dict = save_data.get("state", save_data)
+
+        # Create new MovieModeState from loaded data
+        loaded_state = MovieModeState.model_validate(state_dict)
+
+        st.session_state.movie_state = loaded_state
+        st.session_state.movie_mode = True
+        return True
+    except Exception as e:
+        st.error(f"Failed to load movie project: {e}")
+        return False
+
+
+def get_movie_project_info(filepath: Path) -> dict:
+    """Get summary info about a saved movie project."""
+    try:
+        with open(filepath) as f:
+            save_data = json.load(f)
+
+        state_dict = save_data.get("state", save_data)
+        saved_at = save_data.get("saved_at", "Unknown")
+
+        # Extract key info
+        script = state_dict.get("script")
+        title = script.get("title", "Untitled") if script else "No script"
+        step = state_dict.get("current_step", "script")
+
+        # Count scenes and characters
+        scene_count = len(script.get("scenes", [])) if script else 0
+        char_count = len(script.get("characters", [])) if script else 0
+
+        return {
+            "name": filepath.stem,
+            "title": title[:40] + "..." if len(title) > 40 else title,
+            "step": step,
+            "scene_count": scene_count,
+            "char_count": char_count,
+            "saved_at": saved_at,
+        }
+    except Exception:
+        return {
+            "name": filepath.stem,
+            "title": "Unable to read",
+            "step": "unknown",
+            "scene_count": 0,
+            "char_count": 0,
+            "saved_at": "Unknown",
+        }
+
+
+def delete_movie_project(filepath: Path) -> bool:
+    """Delete a saved movie project file."""
+    try:
+        filepath.unlink()
+        return True
+    except Exception:
+        return False
+
+
+def recover_movie_from_audio(orphan_audio_files: list[Path], saved_projects: list[Path]) -> None:
+    """
+    Recover a movie project by transcribing orphaned audio files with WhisperX.
+
+    This creates a new movie project with:
+    - Characters extracted from filenames
+    - Dialogue transcribed from audio
+    - All audio files linked
+
+    Args:
+        orphan_audio_files: List of orphan audio file paths
+        saved_projects: List of saved project paths (to filter out referenced files)
+    """
+    from src.services.audio_processor import AudioProcessor
+    from src.models.schemas import (
+        Character,
+        DialogueLine,
+        Emotion,
+        MovieModeState,
+        MovieScene,
+        MovieWorkflowStep,
+        Script,
+        SceneDirection,
+        VoiceSettings,
+    )
+    from pydub import AudioSegment
+
+    # Filter to only truly orphaned files
+    orphans = []
+    for af in orphan_audio_files:
+        is_referenced = False
+        for project_path in saved_projects:
+            try:
+                with open(project_path) as f:
+                    data = json.load(f)
+                state_dict = data.get("state", data)
+                script = state_dict.get("script", {})
+                for scene in script.get("scenes", []):
+                    for dialogue in scene.get("dialogue", []):
+                        if dialogue.get("audio_path") and Path(dialogue["audio_path"]).name == af.name:
+                            is_referenced = True
+                            break
+                    if is_referenced:
+                        break
+                if is_referenced:
+                    break
+            except Exception:
+                pass
+        if not is_referenced:
+            orphans.append(af)
+
+    if not orphans:
+        st.warning("No orphan audio files to recover")
+        return
+
+    # Sort by modification time to preserve order
+    orphans.sort(key=lambda p: p.stat().st_mtime)
+
+    st.info(f"Recovering {len(orphans)} audio files...")
+    progress = st.progress(0, text="Initializing WhisperX...")
+
+    # Initialize transcriber
+    try:
+        processor = AudioProcessor()
+    except Exception as e:
+        st.error(f"Failed to initialize WhisperX: {e}")
+        return
+
+    # Extract unique characters from filenames
+    # Filename format: dialogue_{character}_{hash}.mp3
+    characters_dict = {}
+    dialogue_data = []
+
+    for i, audio_path in enumerate(orphans):
+        progress.progress((i + 0.5) / len(orphans), text=f"Transcribing {audio_path.name}...")
+
+        # Extract character name from filename
+        # dialogue_host_081dcdad.mp3 -> host
+        # dialogue_james_rivera_27668292.mp3 -> james_rivera
+        filename = audio_path.stem  # dialogue_host_081dcdad
+        parts = filename.split("_")
+        if len(parts) >= 3 and parts[0] == "dialogue":
+            # Everything between "dialogue_" and the last part (hash) is the character name
+            char_name_parts = parts[1:-1]  # Remove 'dialogue' and hash
+            char_id = "_".join(char_name_parts)
+            char_name = " ".join(part.title() for part in char_name_parts)
+        else:
+            char_id = "unknown"
+            char_name = "Unknown Speaker"
+
+        # Add to characters dict if new
+        if char_id not in characters_dict:
+            characters_dict[char_id] = Character(
+                id=char_id,
+                name=char_name,
+                description=f"Character recovered from audio",
+                personality="",
+                voice=VoiceSettings(provider="edge", voice_id="en-US-GuyNeural"),
+            )
+
+        # Transcribe the audio
+        try:
+            transcript = processor.transcribe(audio_path, language="en")
+            text = transcript.text.strip() if transcript.text else ""
+        except Exception as e:
+            st.warning(f"Failed to transcribe {audio_path.name}: {e}")
+            text = "[Transcription failed]"
+
+        # Get audio duration
+        try:
+            audio = AudioSegment.from_file(str(audio_path))
+            duration = len(audio) / 1000.0  # milliseconds to seconds
+        except Exception:
+            duration = 3.0  # Default fallback
+
+        dialogue_data.append({
+            "char_id": char_id,
+            "text": text,
+            "audio_path": str(audio_path),
+            "duration": duration,
+        })
+
+        progress.progress((i + 1) / len(orphans), text=f"Transcribed {i + 1}/{len(orphans)}")
+
+    progress.progress(1.0, text="Building recovered script...")
+
+    # Build scenes - group dialogue into scenes (roughly 5 lines per scene)
+    scenes = []
+    lines_per_scene = 5
+    running_time = 0.0
+
+    for scene_idx in range(0, len(dialogue_data), lines_per_scene):
+        scene_dialogues = dialogue_data[scene_idx:scene_idx + lines_per_scene]
+
+        dialogue_lines = []
+        scene_start = running_time
+
+        for d in scene_dialogues:
+            line = DialogueLine(
+                character_id=d["char_id"],
+                text=d["text"],
+                emotion=Emotion.NEUTRAL,
+                audio_path=d["audio_path"],
+                start_time=running_time,
+                end_time=running_time + d["duration"],
+            )
+            dialogue_lines.append(line)
+            running_time = line.end_time + 0.3  # 300ms pause between lines
+
+        scene = MovieScene(
+            index=scene_idx // lines_per_scene + 1,
+            direction=SceneDirection(
+                setting="Recovered scene",
+                camera="Medium shot",
+                mood="neutral",
+                visible_characters=[d["char_id"] for d in scene_dialogues],
+            ),
+            dialogue=dialogue_lines,
+            start_time=scene_start,
+            end_time=running_time,
+        )
+        scenes.append(scene)
+        running_time += 1.0  # 1s pause between scenes
+
+    # Build the script
+    script = Script(
+        title="Recovered Movie",
+        description="Script recovered from orphaned audio files using WhisperX transcription",
+        visual_style="cinematic",
+        characters=list(characters_dict.values()),
+        scenes=scenes,
+    )
+
+    # Create movie state
+    movie_state = MovieModeState(
+        current_step=MovieWorkflowStep.VOICES,  # Start at voices since we have audio
+        script=script,
+        script_messages=[{
+            "role": "assistant",
+            "content": f"**Recovered Script**\n\nRecovered {len(dialogue_data)} dialogue lines from {len(characters_dict)} characters across {len(scenes)} scenes.\n\nCharacters: {', '.join(c.name for c in script.characters)}",
+        }],
+    )
+
+    # Save to session state
+    st.session_state.movie_state = movie_state
+    st.session_state.movie_mode = True
+
+    # Auto-save the recovered project
+    try:
+        save_path = save_movie_state("Recovered_Movie")
+        st.success(f"Recovered movie saved to {save_path.name}")
+    except Exception as e:
+        st.warning(f"Auto-save failed: {e}")
+
+    st.success(f"Recovered {len(dialogue_data)} dialogue lines from {len(characters_dict)} characters!")
+    st.rerun()
+
+
+def render_movie_project_sidebar() -> None:
+    """Render the movie mode project management sidebar."""
+    with st.sidebar:
+        st.header("Movie Project")
+
+        # Save current project
+        with st.expander("Save Project", expanded=False):
+            project_name = st.text_input(
+                "Project name (optional)",
+                placeholder="Auto-generated from title",
+                key="save_movie_project_name",
+            )
+            if st.button("Save", key="save_movie_btn", use_container_width=True):
+                try:
+                    filepath = save_movie_state(
+                        project_name if project_name else None
+                    )
+                    st.success(f"Saved to {filepath.name}")
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
+
+        # Load existing project
+        saved_projects = list_saved_movie_projects()
+        if saved_projects:
+            with st.expander("Load Project", expanded=False):
+                for project_path in saved_projects[:10]:  # Show last 10
+                    info = get_movie_project_info(project_path)
+                    col1, col2 = st.columns([4, 1])
+                    with col1:
+                        label = f"{info['title']}\n{info['step']}"
+                        if info['scene_count'] > 0:
+                            label += f" ({info['scene_count']} scenes)"
+                        if st.button(
+                            label,
+                            key=f"load_movie_{project_path.stem}",
+                            use_container_width=True,
+                        ):
+                            if load_movie_state(project_path):
+                                st.success("Loaded!")
+                                st.rerun()
+                    with col2:
+                        if st.button("X", key=f"del_movie_{project_path.stem}"):
+                            if delete_movie_project(project_path):
+                                st.rerun()
+
+        # Recover from orphaned files
+        from src.config import config
+        movie_audio_dir = config.output_dir / "movie" / "audio"
+        if movie_audio_dir.exists():
+            orphan_audio_files = list(movie_audio_dir.glob("dialogue_*.mp3"))
+            if orphan_audio_files:
+                with st.expander("Recover Project", expanded=False):
+                    st.caption(f"Found {len(orphan_audio_files)} audio files in output/movie/audio/")
+
+                    # Check if any saved project references these files
+                    orphan_count = len(orphan_audio_files)
+                    referenced_count = 0
+
+                    # Get saved projects list (may not be defined above if empty)
+                    all_saved_projects = list_saved_movie_projects()
+
+                    # Check saved projects for references to these files
+                    for project_path in all_saved_projects:
+                        try:
+                            with open(project_path) as f:
+                                data = json.load(f)
+                            state_dict = data.get("state", data)
+                            script = state_dict.get("script", {})
+                            for scene in script.get("scenes", []):
+                                for dialogue in scene.get("dialogue", []):
+                                    if dialogue.get("audio_path"):
+                                        audio_name = Path(dialogue["audio_path"]).name
+                                        for af in orphan_audio_files:
+                                            if af.name == audio_name:
+                                                referenced_count += 1
+                                                break
+                        except Exception:
+                            pass
+
+                    actual_orphans = orphan_count - referenced_count
+
+                    if actual_orphans > 0:
+                        st.warning(f"{actual_orphans} audio files not linked to any saved project")
+                        st.caption("These may be from a session that wasn't saved.")
+
+                        # Recover from audio using WhisperX
+                        if st.button("🔄 Recover Script from Audio", type="primary", use_container_width=True):
+                            recover_movie_from_audio(orphan_audio_files, all_saved_projects)
+
+                        if st.button("🗑️ Clean Up Orphaned Audio", use_container_width=True):
+                            # Remove audio files not referenced by any project
+                            cleaned = 0
+                            for af in orphan_audio_files:
+                                is_referenced = False
+                                for project_path in all_saved_projects:
+                                    try:
+                                        with open(project_path) as f:
+                                            data = json.load(f)
+                                        state_dict = data.get("state", data)
+                                        script = state_dict.get("script", {})
+                                        for scene in script.get("scenes", []):
+                                            for dialogue in scene.get("dialogue", []):
+                                                if dialogue.get("audio_path") and Path(dialogue["audio_path"]).name == af.name:
+                                                    is_referenced = True
+                                                    break
+                                            if is_referenced:
+                                                break
+                                        if is_referenced:
+                                            break
+                                    except Exception:
+                                        pass
+
+                                if not is_referenced:
+                                    try:
+                                        af.unlink()
+                                        cleaned += 1
+                                    except Exception:
+                                        pass
+
+                            st.success(f"Cleaned up {cleaned} orphaned audio files")
+                            st.rerun()
+                    else:
+                        st.success("All audio files are linked to saved projects")
+
+        # Settings
+        with st.expander("Settings", expanded=False):
+            # Claude model selection
+            claude_models = {
+                "claude-haiku-4-5-20251001": "Haiku 4.5 (Fast)",
+                "claude-sonnet-4-5-20250929": "Sonnet 4.5 (Balanced)",
+                "claude-opus-4-5-20251101": "Opus 4.5 (Best)",
+            }
+
+            # Get current model from config
+            from src.config import config
+            current_model = config.claude_model
+
+            # Find index of current model
+            model_ids = list(claude_models.keys())
+            try:
+                current_index = model_ids.index(current_model)
+            except ValueError:
+                current_index = 1  # Default to Sonnet
+
+            selected_model = st.selectbox(
+                "Claude Model",
+                options=model_ids,
+                format_func=lambda x: claude_models[x],
+                index=current_index,
+                key="movie_claude_model_select",
+            )
+
+            if selected_model != current_model:
+                config.claude_model = selected_model
+                st.rerun()
+
+            # Show current model indicator
+            model_short = {
+                "claude-haiku-4-5-20251001": "🐇 Haiku",
+                "claude-sonnet-4-5-20250929": "🎵 Sonnet",
+                "claude-opus-4-5-20251101": "🎼 Opus",
+            }.get(selected_model, selected_model)
+            st.caption(f"Using: **{model_short}**")
+
+
 def render_project_sidebar() -> None:
     """Render the project management sidebar section."""
     with st.sidebar:

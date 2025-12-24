@@ -84,10 +84,16 @@ class ImageConfig:
             "DEFAULT_ART_STYLE", "cinematic digital art, dramatic lighting, 8k quality"
         )
     )
-    # Nano Banana Pro (Gemini 3 Pro Image) - highest quality
-    # Alternatives: imagen-4.0-ultra-generate-001, gemini-2.5-flash-image-preview
+    # Image generation model options:
+    # Gemini models (support both text-to-image AND image editing):
+    # - gemini-2.5-flash-image: Fast, 1024px (Nano Banana) - recommended default
+    # - gemini-3-pro-image-preview: Professional, up to 4K (Nano Banana Pro) - best quality
+    # Imagen models (text-to-image only, no image editing):
+    # - imagen-4.0-generate-001: Standard quality
+    # - imagen-4.0-ultra-generate-001: Highest quality
+    # - imagen-4.0-fast-generate-001: Fast generation
     model: str = field(
-        default_factory=lambda: os.getenv("IMAGE_MODEL", "gemini-3-pro-image-preview")
+        default_factory=lambda: os.getenv("IMAGE_MODEL", "gemini-2.5-flash-image")
     )
     aspect_ratio: str = "16:9"
     image_size: str = field(

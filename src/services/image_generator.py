@@ -1,4 +1,4 @@
-"""Image generation service using Google Imagen."""
+"""Image generation service using Google Gemini/Imagen."""
 
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,9 +37,13 @@ class ImageGenerator:
         output_path: Optional[Path] = None,
         image_size: Optional[str] = None,
         show_character: bool = True,
+        model: Optional[str] = None,
     ) -> Optional[Image.Image]:
         """
-        Generate a scene image using Nano Banana Pro (Gemini 3 Pro Image).
+        Generate a scene image using Gemini or Imagen models.
+
+        Default model is gemini-2.5-flash-image (Nano Banana) which supports
+        both text-to-image and image editing/transformation.
 
         Args:
             prompt: The scene description
@@ -51,6 +55,9 @@ class ImageGenerator:
             output_path: Optional path to save the image
             image_size: Image size for Gemini models ("2K" or "4K")
             show_character: Whether the character appears in this scene (default True)
+            model: Optional model override. Gemini models (e.g., "gemini-2.5-flash-image",
+                "gemini-3-pro-image-preview") support image editing. Imagen models
+                (e.g., "imagen-4.0-generate-001") are text-to-image only.
 
         Returns:
             Generated PIL Image or None if generation failed
@@ -83,7 +90,8 @@ class ImageGenerator:
         full_prompt = ". ".join(full_prompt_parts)
 
         try:
-            model_name = self.config.image.model
+            # Use provided model or fall back to config default
+            model_name = model or self.config.image.model
             is_gemini_model = "gemini" in model_name.lower()
 
             if is_gemini_model:
