@@ -88,7 +88,7 @@ Respond in this exact JSON format:
 Only respond with the JSON, no other text."""
 
         response = client.messages.create(
-            model=self.config.claude_model,
+            model=default_config.claude_model,  # Use global config for dynamic model selection
             max_tokens=2048,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
@@ -146,7 +146,7 @@ Please refine the lyrics based on this feedback. Keep the same JSON format:
 Only respond with the JSON, no other text."""
 
         response = client.messages.create(
-            model=self.config.claude_model,
+            model=default_config.claude_model,  # Use global config for dynamic model selection
             max_tokens=2048,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],

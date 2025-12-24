@@ -558,7 +558,7 @@ Respond with ONLY the visual world description (1-2 sentences). Be specific abou
 
         try:
             response = client.messages.create(
-                model=self.config.claude_model,
+                model=default_config.claude_model,  # Use global config for dynamic model selection
                 max_tokens=200,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -665,7 +665,7 @@ Create exactly {num_scenes} scenes. Only respond with the JSON."""
         try:
             logger.info(f"Calling Claude API to generate {num_scenes} scene prompts...")
             response = client.messages.create(
-                model=self.config.claude_model,
+                model=default_config.claude_model,  # Use global config for dynamic model selection
                 max_tokens=4096,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
