@@ -97,9 +97,14 @@ class ScriptAgent:
     ]
 
     def __init__(self, config: Optional[Config] = None):
-        self.config = config or default_config
+        self._config = config  # Store optional override
         self._client = None
         self.conversation_history: list[dict] = []
+
+    @property
+    def config(self) -> Config:
+        """Get config, always reading current global config for model selection."""
+        return self._config or default_config
 
     def _get_client(self) -> anthropic.Anthropic:
         """Lazy load Anthropic client."""
@@ -121,9 +126,9 @@ class ScriptAgent:
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": user_message})
 
-        # Send to Claude
+        # Send to Claude - always use current model from config
         response = client.messages.create(
-            model=self.config.claude_model,
+            model=default_config.claude_model,  # Use global config for model
             max_tokens=4096,  # Scripts can be long
             system=SYSTEM_PROMPT,
             messages=self.conversation_history,

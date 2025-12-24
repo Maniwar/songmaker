@@ -20,7 +20,7 @@ from src.models.schemas import Character, DialogueLine, Emotion, VoiceSettings
 logger = logging.getLogger(__name__)
 
 
-# Default voices for each provider
+# Default voices for each provider (used for auto-assignment)
 DEFAULT_VOICES = {
     "elevenlabs": {
         "male": "ErXwobaYiN019PkySvjV",  # Antoni
@@ -38,6 +38,92 @@ DEFAULT_VOICES = {
         "narrator": "en-US-DavisNeural",
     },
 }
+
+# All available voices per provider (for voice picker)
+# Updated December 2025 with latest voices
+AVAILABLE_VOICES = {
+    "openai": {
+        # Original voices
+        "alloy": "Alloy (Neutral)",
+        "echo": "Echo (Male)",
+        "fable": "Fable (British Male)",
+        "onyx": "Onyx (Deep Male)",
+        "nova": "Nova (Female)",
+        "shimmer": "Shimmer (Female)",
+        # New expressive voices (Oct 2024+)
+        "ash": "Ash (Male, Expressive)",
+        "ballad": "Ballad (Male, Expressive)",
+        "coral": "Coral (Female, Expressive)",
+        "sage": "Sage (Female, Expressive)",
+        "verse": "Verse (Male, Expressive)",
+    },
+    "edge": {
+        # Male voices
+        "en-US-AndrewNeural": "Andrew (Male, Warm & Confident)",
+        "en-US-BrianNeural": "Brian (Male, Casual & Sincere)",
+        "en-US-ChristopherNeural": "Christopher (Male, Authoritative)",
+        "en-US-EricNeural": "Eric (Male, Rational)",
+        "en-US-GuyNeural": "Guy (Male, Passionate)",
+        "en-US-RogerNeural": "Roger (Male, Lively)",
+        "en-US-SteffanNeural": "Steffan (Male, Rational)",
+        # Female voices
+        "en-US-AnaNeural": "Ana (Female, Cute & Cartoon)",
+        "en-US-AriaNeural": "Aria (Female, Positive & Confident)",
+        "en-US-AvaNeural": "Ava (Female, Expressive & Caring)",
+        "en-US-EmmaNeural": "Emma (Female, Cheerful & Clear)",
+        "en-US-JennyNeural": "Jenny (Female, Friendly)",
+        "en-US-MichelleNeural": "Michelle (Female, Pleasant)",
+        # British voices
+        "en-GB-RyanNeural": "Ryan (Male, British)",
+        "en-GB-SoniaNeural": "Sonia (Female, British)",
+        # Australian voices
+        "en-AU-WilliamNeural": "William (Male, Australian)",
+        "en-AU-NatashaNeural": "Natasha (Female, Australian)",
+    },
+    "elevenlabs": {
+        "ErXwobaYiN019PkySvjV": "Antoni (Male)",
+        "VR6AewLTigWG4xSOukaG": "Arnold (Male, Deep)",
+        "pNInz6obpgDQGcFmaJgB": "Adam (Male)",
+        "EXAVITQu4vr4xnSDxMaL": "Bella (Female)",
+        "21m00Tcm4TlvDq8ikWAM": "Rachel (Female)",
+        "AZnzlk1XvdvUeBnXmlld": "Domi (Female)",
+    },
+}
+
+# Voice rotation for auto-assignment (to give different characters different voices)
+# Alternates male/female for variety
+VOICE_ROTATION = {
+    "openai": ["onyx", "nova", "ash", "coral", "echo", "sage", "ballad", "shimmer", "verse", "alloy", "fable"],
+    "edge": [
+        "en-US-AndrewNeural", "en-US-AriaNeural", "en-US-BrianNeural",
+        "en-US-AvaNeural", "en-US-GuyNeural", "en-US-EmmaNeural",
+        "en-US-ChristopherNeural", "en-US-JennyNeural",
+    ],
+    "elevenlabs": [
+        "ErXwobaYiN019PkySvjV", "EXAVITQu4vr4xnSDxMaL",
+        "VR6AewLTigWG4xSOukaG", "21m00Tcm4TlvDq8ikWAM",
+    ],
+}
+
+
+def get_available_voices_for_provider(provider: str) -> dict[str, str]:
+    """Get available voices for a provider.
+
+    Returns:
+        Dict mapping voice_id to display name
+    """
+    return AVAILABLE_VOICES.get(provider, {})
+
+
+def get_rotated_voice(provider: str, index: int) -> str:
+    """Get a voice from the rotation based on character index.
+
+    This ensures different characters get different voices automatically.
+    """
+    voices = VOICE_ROTATION.get(provider, [])
+    if not voices:
+        return DEFAULT_VOICES.get(provider, {}).get("narrator", "")
+    return voices[index % len(voices)]
 
 
 def infer_voice_id_from_name(voice_name: str, provider: str) -> str:

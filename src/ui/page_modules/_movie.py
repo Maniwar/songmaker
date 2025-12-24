@@ -672,28 +672,115 @@ def render_voices_page() -> None:
         )
         return
 
-    # Provider selection
+    # Provider selection - default to first available
+    # Check if we have a stored provider preference
+    if "tts_provider" not in st.session_state:
+        st.session_state.tts_provider = available[0]
+
+    # Make sure stored provider is still available
+    if st.session_state.tts_provider not in available:
+        st.session_state.tts_provider = available[0]
+
     provider = st.selectbox(
         "TTS Provider",
         options=available,
+        index=available.index(st.session_state.tts_provider),
         format_func=lambda x: {
             "elevenlabs": "ElevenLabs (Best Quality)",
             "openai": "OpenAI TTS",
             "edge": "Edge TTS (Free)",
         }.get(x, x),
+        key="tts_provider_select",
     )
+
+    # Update session state and character voices when provider changes
+    if provider != st.session_state.tts_provider:
+        st.session_state.tts_provider = provider
+        # Update all character voice providers to use the selected provider
+        for char in state.script.characters:
+            char.voice.provider = provider
+        st.rerun()
+
+    # Ensure all characters use the selected provider
+    for char in state.script.characters:
+        if char.voice.provider != provider:
+            char.voice.provider = provider
 
     # Show voice options per character
     st.markdown("### Character Voice Assignments")
 
-    for char in state.script.characters:
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            st.markdown(f"**{char.name}:** {char.voice.voice_name or 'Not set'}")
-        with col2:
-            # Voice preview button (placeholder)
-            if st.button(f"🔊 Preview", key=f"preview_{char.id}"):
-                st.info("Voice preview coming soon!")
+    from src.services.tts_service import get_available_voices_for_provider, get_rotated_voice
+
+    # Get available voices for selected provider
+    available_voices = get_available_voices_for_provider(provider)
+    voice_ids = list(available_voices.keys())
+    voice_labels = available_voices
+
+    for char_idx, char in enumerate(state.script.characters):
+        with st.expander(f"🎭 {char.name}", expanded=char_idx == 0):
+            col1, col2, col3 = st.columns([2, 2, 1])
+
+            with col1:
+                st.markdown(f"**Description:** {char.voice.voice_name or 'Not set'}")
+
+                # Voice picker dropdown
+                # Auto-assign a rotated voice if none set
+                current_voice_id = char.voice.voice_id
+                if not current_voice_id or current_voice_id not in voice_ids:
+                    # Auto-assign based on character index for variety
+                    current_voice_id = get_rotated_voice(provider, char_idx)
+                    char.voice.voice_id = current_voice_id
+
+                current_idx = voice_ids.index(current_voice_id) if current_voice_id in voice_ids else 0
+
+                new_voice = st.selectbox(
+                    "Voice",
+                    options=voice_ids,
+                    index=current_idx,
+                    format_func=lambda x: voice_labels.get(x, x),
+                    key=f"voice_select_{char.id}",
+                )
+
+                if new_voice != char.voice.voice_id:
+                    char.voice.voice_id = new_voice
+
+            with col2:
+                # Speed slider
+                new_speed = st.slider(
+                    "Speed",
+                    min_value=0.5,
+                    max_value=2.0,
+                    value=char.voice.speed,
+                    step=0.1,
+                    key=f"voice_speed_{char.id}",
+                )
+                if new_speed != char.voice.speed:
+                    char.voice.speed = new_speed
+
+            with col3:
+                # Voice preview button - generates a short sample
+                if st.button(f"🔊 Preview", key=f"preview_{char.id}"):
+                    from src.services.tts_service import TTSService
+                    import tempfile
+
+                    preview_text = f"Hello, I am {char.name}."
+                    if char.personality:
+                        preview_text = f"Hello, I am {char.name}. {char.personality.split('.')[0]}."
+
+                    with st.spinner(f"Generating preview..."):
+                        try:
+                            tts = TTSService(default_provider=provider)
+                            # Generate to temp file
+                            preview_path = Path(tempfile.mktemp(suffix=".mp3"))
+                            tts.generate_speech(
+                                text=preview_text,
+                                voice_settings=char.voice,
+                                output_path=preview_path,
+                            )
+                            # Play the audio
+                            st.audio(str(preview_path), format="audio/mp3")
+                        except Exception as e:
+                            st.error(f"Preview failed: {e}")
 
     # Dialogue count
     total_dialogue = state.script.total_dialogue_count
@@ -794,13 +881,59 @@ def render_visuals_page() -> None:
         st.warning("Please create a script first.")
         return
 
-    st.subheader("Generate Scene Images")
-    st.markdown(
-        f"""
-        Generate images for each scene in '{state.script.title}'.
-        Character descriptions will be included for visual consistency.
-        """
+    st.subheader("Generate Scene Visuals")
+
+    # Check if Veo 3.1 is available
+    from src.services.veo3_generator import check_veo3_available, get_veo3_pricing_estimate
+
+    veo3_available = check_veo3_available()
+
+    # Generation mode selection
+    st.markdown("### Generation Mode")
+
+    generation_modes = ["traditional"]
+    mode_labels = {"traditional": "Traditional (Images + TTS Audio)"}
+
+    if veo3_available:
+        generation_modes.insert(0, "veo3")
+        mode_labels["veo3"] = "Veo 3.1 (Video with Dialogue - Recommended)"
+
+    generation_mode = st.radio(
+        "Choose generation method:",
+        options=generation_modes,
+        format_func=lambda x: mode_labels.get(x, x),
+        horizontal=True,
+        help="Veo 3.1 generates video clips with dialogue audio directly from prompts. "
+             "Traditional mode generates images and uses TTS for voices separately.",
     )
+
+    if generation_mode == "veo3":
+        st.info(
+            """
+            **Veo 3.1 Mode** generates video clips with:
+            - Synchronized dialogue audio (characters speak their lines!)
+            - Sound effects and ambient audio
+            - Cinematic motion and camera movement
+
+            No need for separate TTS or lip sync - everything is generated together.
+            """
+        )
+
+        # Show cost estimate
+        num_scenes = len(state.script.scenes)
+        estimate = get_veo3_pricing_estimate(num_scenes, duration=8)
+        st.caption(
+            f"Estimated cost: **${estimate['estimated_total']:.2f}** "
+            f"({num_scenes} scenes × 8 seconds × $0.75/sec)"
+        )
+    else:
+        st.markdown(
+            f"""
+            Generate images for each scene in '{state.script.title}'.
+            Character descriptions will be included for visual consistency.
+            You'll need to generate TTS audio separately.
+            """
+        )
 
     # Visual style settings
     col1, col2 = st.columns(2)
@@ -809,7 +942,7 @@ def render_visuals_page() -> None:
             "Visual Style",
             value=state.script.visual_style,
             height=100,
-            help="Art style for all generated images",
+            help="Art style for all generated visuals",
         )
     with col2:
         world_desc = st.text_area(
@@ -823,6 +956,25 @@ def render_visuals_page() -> None:
     state.script.visual_style = visual_style
     state.script.world_description = world_desc if world_desc else None
 
+    # Veo 3.1 specific settings
+    if generation_mode == "veo3":
+        col1, col2 = st.columns(2)
+        with col1:
+            veo_duration = st.selectbox(
+                "Clip Duration",
+                options=[4, 6, 8],
+                index=2,
+                format_func=lambda x: f"{x} seconds",
+                help="Duration of each generated clip",
+            )
+        with col2:
+            veo_resolution = st.selectbox(
+                "Resolution",
+                options=["720p", "1080p"],
+                index=0,
+                help="1080p only available for 8-second clips",
+            )
+
     # Scene preview
     st.markdown("### Scenes to Generate")
     for scene in state.script.scenes:
@@ -832,40 +984,89 @@ def render_visuals_page() -> None:
             st.markdown(f"**Characters:** {', '.join(scene.direction.visible_characters)}")
             if scene.dialogue:
                 st.markdown(f"**Dialogue lines:** {len(scene.dialogue)}")
+                for d in scene.dialogue:
+                    char = state.script.get_character(d.character_id)
+                    char_name = char.name if char else d.character_id
+                    st.caption(f'  {char_name}: "{d.text}"')
 
     # Generate button
     st.markdown("---")
 
-    if st.button("🎨 Generate All Scene Images", type="primary", use_container_width=True):
-        from src.services.movie_image_generator import MovieImageGenerator
+    if generation_mode == "veo3":
+        if st.button("🎬 Generate All Scenes with Veo 3.1", type="primary", use_container_width=True):
+            from src.services.veo3_generator import Veo3Generator
 
-        generator = MovieImageGenerator(style=visual_style)
-        output_dir = config.output_dir / "movie" / "images"
-
-        progress_bar = st.progress(0, text="Generating images...")
-
-        def progress_callback(msg, progress):
-            progress_bar.progress(progress, text=msg)
-
-        try:
-            images = generator.generate_all_scenes(
-                script=state.script,
-                output_dir=output_dir,
-                use_sequential_mode=True,  # For consistency
-                progress_callback=progress_callback,
+            generator = Veo3Generator(
+                model="veo-3.1-generate-preview",
+                resolution=veo_resolution,
+                duration=veo_duration,
             )
+            output_dir = config.output_dir / "movie" / "videos"
 
-            progress_bar.progress(1.0, text="Image generation complete!")
-            st.success(f"Generated {len(images)} scene images!")
+            progress_bar = st.progress(0, text="Generating scenes with Veo 3.1...")
 
-            # Show generated images
-            cols = st.columns(3)
-            for i, img_path in enumerate(images):
-                with cols[i % 3]:
-                    st.image(str(img_path), caption=f"Scene {i + 1}")
+            def progress_callback(msg, progress):
+                progress_bar.progress(progress, text=msg)
 
-        except Exception as e:
-            st.error(f"Image generation failed: {e}")
+            try:
+                videos = generator.generate_all_scenes(
+                    script=state.script,
+                    output_dir=output_dir,
+                    style=visual_style,
+                    use_character_references=True,
+                    progress_callback=progress_callback,
+                )
+
+                progress_bar.progress(1.0, text="Generation complete!")
+                st.success(f"Generated {len(videos)} video clips with dialogue!")
+
+                # Show generated videos
+                for i, video_path in enumerate(videos):
+                    with st.expander(f"Scene {i + 1}", expanded=i == 0):
+                        st.video(str(video_path))
+
+                # Skip to render step since videos already have audio
+                st.info("Videos include dialogue audio. You can skip straight to rendering!")
+                if st.button("Continue to Render →", type="primary"):
+                    # Skip voices step since Veo 3.1 generates audio
+                    go_to_movie_step(MovieWorkflowStep.RENDER)
+                    st.rerun()
+
+            except Exception as e:
+                st.error(f"Veo 3.1 generation failed: {e}")
+
+    else:
+        # Traditional image generation
+        if st.button("🎨 Generate All Scene Images", type="primary", use_container_width=True):
+            from src.services.movie_image_generator import MovieImageGenerator
+
+            generator = MovieImageGenerator(style=visual_style)
+            output_dir = config.output_dir / "movie" / "images"
+
+            progress_bar = st.progress(0, text="Generating images...")
+
+            def progress_callback(msg, progress):
+                progress_bar.progress(progress, text=msg)
+
+            try:
+                images = generator.generate_all_scenes(
+                    script=state.script,
+                    output_dir=output_dir,
+                    use_sequential_mode=True,  # For consistency
+                    progress_callback=progress_callback,
+                )
+
+                progress_bar.progress(1.0, text="Image generation complete!")
+                st.success(f"Generated {len(images)} scene images!")
+
+                # Show generated images
+                cols = st.columns(3)
+                for i, img_path in enumerate(images):
+                    with cols[i % 3]:
+                        st.image(str(img_path), caption=f"Scene {i + 1}")
+
+            except Exception as e:
+                st.error(f"Image generation failed: {e}")
 
     # Navigation
     st.markdown("---")
