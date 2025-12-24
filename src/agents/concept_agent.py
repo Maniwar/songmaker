@@ -1,11 +1,14 @@
 """Concept Agent for iterative song concept development."""
 
+import logging
 from typing import Optional
 
 import anthropic
 
 from src.config import Config, config as default_config
 from src.models.schemas import SongConcept
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """You are a creative music producer and songwriter assistant specializing in creating songs for Suno AI. Your role is to help users develop compelling song concepts through iterative collaboration.
@@ -76,15 +79,26 @@ class ConceptAgent:
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": user_message})
 
-        # Send to Claude
+        # Send to Claude - use current model from config
+        model_to_use = default_config.claude_model
+        max_tokens = default_config.claude_max_tokens
+        logger.info(f"ConceptAgent using model: {model_to_use} (max_tokens: {max_tokens})")
+
         response = client.messages.create(
-            model=default_config.claude_model,  # Use global config for dynamic model selection
-            max_tokens=1024,
+            model=model_to_use,
+            max_tokens=max_tokens,
             system=SYSTEM_PROMPT,
             messages=self.conversation_history,
         )
 
+        # Log which model actually responded
+        actual_model = response.model
+        logger.info(f"Response from model: {actual_model}")
+
         assistant_message = response.content[0].text
+
+        # Store last used model for verification
+        self._last_model_used = actual_model
 
         # Add assistant response to history
         self.conversation_history.append(

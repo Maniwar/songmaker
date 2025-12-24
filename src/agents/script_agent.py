@@ -5,12 +5,15 @@ with consistent characters, dialogue, and scene descriptions.
 """
 
 import json
+import logging
 import re
 from typing import Optional
 
 import anthropic
 
 from src.config import Config, config as default_config
+
+logger = logging.getLogger(__name__)
 from src.models.schemas import (
     Character,
     DialogueLine,
@@ -127,12 +130,19 @@ class ScriptAgent:
         self.conversation_history.append({"role": "user", "content": user_message})
 
         # Send to Claude - always use current model from config
+        model_to_use = default_config.claude_model
+        logger.info(f"ScriptAgent using model: {model_to_use}")
+
         response = client.messages.create(
-            model=default_config.claude_model,  # Use global config for model
-            max_tokens=4096,  # Scripts can be long
+            model=model_to_use,
+            max_tokens=default_config.claude_max_tokens,  # Use model's max output tokens
             system=SYSTEM_PROMPT,
             messages=self.conversation_history,
         )
+
+        # Log which model actually responded
+        actual_model = response.model
+        logger.info(f"Response from model: {actual_model}")
 
         assistant_message = response.content[0].text
 
@@ -140,6 +150,9 @@ class ScriptAgent:
         self.conversation_history.append(
             {"role": "assistant", "content": assistant_message}
         )
+
+        # Store last used model for verification
+        self._last_model_used = actual_model
 
         return assistant_message
 
@@ -402,7 +415,7 @@ Respond with only a JSON array:
 
         response = client.messages.create(
             model=default_config.claude_model,  # Use global config for model
-            max_tokens=1024,
+            max_tokens=4096,  # Character lists can be detailed
             messages=[{"role": "user", "content": prompt}],
         )
 
@@ -444,7 +457,7 @@ Keep it concise but vivid."""
 
         response = client.messages.create(
             model=default_config.claude_model,  # Use global config for model
-            max_tokens=1024,
+            max_tokens=4096,  # Scenes with dialogue can be long
             messages=[{"role": "user", "content": prompt}],
         )
 

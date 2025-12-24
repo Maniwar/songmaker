@@ -4,11 +4,19 @@ import streamlit as st
 
 from src.agents.concept_agent import ConceptAgent
 from src.ui.components.state import get_state, update_state, advance_step, go_to_step
+from src.ui.components.chat_bubbles import (
+    inject_chat_styles,
+    render_chat_message,
+    render_typing_indicator,
+)
 
 
 def render_concept_page() -> None:
     """Render the concept workshop page."""
     state = get_state()
+
+    # Inject iPhone-style chat CSS
+    inject_chat_styles()
 
     st.header("Song Concept Workshop")
     st.markdown(
@@ -44,27 +52,43 @@ def render_concept_page() -> None:
             """
         )
 
-    # Display conversation history
+    # Display conversation history with iPhone-style bubbles
     for msg in state.concept_messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+        render_chat_message(
+            content=msg["content"],
+            role=msg["role"],
+            model=msg.get("model"),
+            show_model_indicator=True,
+        )
 
     # Chat input
     if user_input := st.chat_input("Describe your song idea..."):
         # Add user message to state
         state.concept_messages.append({"role": "user", "content": user_input})
 
-        with st.chat_message("user"):
-            st.markdown(user_input)
+        # Show user message immediately
+        render_chat_message(content=user_input, role="user")
+
+        # Show typing indicator while getting response
+        typing_placeholder = st.empty()
+        with typing_placeholder:
+            render_typing_indicator()
 
         # Get AI response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                response = agent.chat(user_input)
-            st.markdown(response)
+        response = agent.chat(user_input)
 
-        # Add assistant response to state
-        state.concept_messages.append({"role": "assistant", "content": response})
+        # Clear typing indicator
+        typing_placeholder.empty()
+
+        # Get the model that was used
+        model_used = getattr(agent, '_last_model_used', None)
+
+        # Add assistant response to state (including model info)
+        state.concept_messages.append({
+            "role": "assistant",
+            "content": response,
+            "model": model_used,
+        })
 
         st.rerun()
 

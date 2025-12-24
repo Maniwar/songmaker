@@ -12,6 +12,11 @@ from src.models.schemas import (
     Script,
     VoiceSettings,
 )
+from src.ui.components.chat_bubbles import (
+    inject_chat_styles,
+    render_chat_message,
+    render_typing_indicator,
+)
 
 
 def get_movie_state() -> MovieModeState:
@@ -118,6 +123,9 @@ def render_script_page() -> None:
     """Render the script development page."""
     state = get_movie_state()
 
+    # Inject iPhone-style chat CSS
+    inject_chat_styles()
+
     st.subheader("Script Workshop")
     st.markdown(
         """
@@ -153,27 +161,43 @@ def render_script_page() -> None:
             """
         )
 
-    # Display conversation history
+    # Display conversation history with iPhone-style bubbles
     for msg in state.script_messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+        render_chat_message(
+            content=msg["content"],
+            role=msg["role"],
+            model=msg.get("model"),
+            show_model_indicator=True,
+        )
 
     # Chat input
     if user_input := st.chat_input("Describe your video idea..."):
         # Add user message to state
         state.script_messages.append({"role": "user", "content": user_input})
 
-        with st.chat_message("user"):
-            st.markdown(user_input)
+        # Show user message immediately
+        render_chat_message(content=user_input, role="user")
+
+        # Show typing indicator while getting response
+        typing_placeholder = st.empty()
+        with typing_placeholder:
+            render_typing_indicator()
 
         # Get AI response
-        with st.chat_message("assistant"):
-            with st.spinner("Writing..."):
-                response = agent.chat(user_input)
-            st.markdown(response)
+        response = agent.chat(user_input)
 
-        # Add assistant response to state
-        state.script_messages.append({"role": "assistant", "content": response})
+        # Clear typing indicator
+        typing_placeholder.empty()
+
+        # Get the model that was used
+        model_used = getattr(agent, '_last_model_used', None)
+
+        # Add assistant response to state (including model info)
+        state.script_messages.append({
+            "role": "assistant",
+            "content": response,
+            "model": model_used,
+        })
 
         st.rerun()
 
@@ -643,7 +667,32 @@ def render_voices_page() -> None:
         st.warning("Please create a script first.")
         return
 
+    # Check if Veo 3.1 is available for alternative path
+    from src.services.veo3_generator import check_veo3_available
+    veo3_available = check_veo3_available()
+
     st.subheader("Generate Character Voices")
+
+    # Show path options
+    if veo3_available:
+        st.info(
+            """
+            **Two ways to add voices to your movie:**
+
+            1. **TTS Mode** (below): Generate voices now, then create images in the next step.
+               Best for: More control over individual voices, lower cost.
+
+            2. **Veo 3.1 Mode**: Skip this step and generate video clips with built-in dialogue.
+               Best for: Higher quality, characters actually speak on screen, but costs more.
+            """
+        )
+
+        if st.button("Skip to Veo 3.1 (Video with Dialogue)", type="secondary"):
+            go_to_movie_step(MovieWorkflowStep.VISUALS)
+            st.rerun()
+
+        st.markdown("---")
+
     st.markdown(
         """
         Generate AI voices for each character's dialogue. The voices will be
@@ -786,84 +835,116 @@ def render_voices_page() -> None:
     total_dialogue = state.script.total_dialogue_count
     st.markdown(f"**Total dialogue lines:** {total_dialogue}")
 
-    # Generate button
+    # Check if voices have already been generated
+    voices_generated = sum(
+        1 for scene in state.script.scenes
+        for d in scene.dialogue
+        if d.audio_path and Path(d.audio_path).exists()
+    )
+
     st.markdown("---")
 
-    if st.button("🎙️ Generate All Voices", type="primary", use_container_width=True):
-        from src.services.tts_service import TTSService
+    # Show status if voices already generated
+    if voices_generated > 0:
+        st.success(f"**{voices_generated}/{total_dialogue} voice clips generated**")
 
-        tts = TTSService(default_provider=provider)
-        output_dir = config.output_dir / "movie" / "audio"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Calculate total duration from existing audio
+        last_scene = state.script.scenes[-1] if state.script.scenes else None
+        if last_scene and last_scene.end_time:
+            total_duration = last_scene.end_time
+            minutes = int(total_duration // 60)
+            seconds = int(total_duration % 60)
+            st.info(f"Total duration: {minutes}m {seconds}s")
 
-        progress_bar = st.progress(0, text="Generating voices...")
-        total = total_dialogue
-        completed = 0
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Regenerate Voices", use_container_width=True):
+                st.session_state.regenerate_voices = True
+                st.rerun()
+        with col2:
+            if st.button("Continue to Visuals →", type="primary", use_container_width=True):
+                advance_movie_step()
+                st.rerun()
 
-        # Track cumulative time for dialogue timing
-        running_time = 0.0
-        pause_between_lines = 0.3  # 300ms pause between dialogue lines
-        pause_between_scenes = 1.0  # 1s pause between scenes
-        failed_count = 0
+    # Generate button (show if no voices or regenerating)
+    should_generate = voices_generated == 0 or st.session_state.get("regenerate_voices", False)
 
-        for scene_idx, scene in enumerate(state.script.scenes):
-            # Mark scene start time
-            scene.start_time = running_time
+    if should_generate:
+        if st.button("🎙️ Generate All Voices", type="primary", use_container_width=True):
+            # Clear regenerate flag
+            st.session_state.pop("regenerate_voices", None)
 
-            for dialogue in scene.dialogue:
-                char = state.script.get_character(dialogue.character_id)
-                if not char:
-                    st.warning(f"Character '{dialogue.character_id}' not found, skipping dialogue")
-                    failed_count += 1
-                    continue
+            from src.services.tts_service import TTSService
 
-                try:
-                    audio_path = tts.generate_dialogue_audio(
-                        dialogue=dialogue,
-                        character=char,
-                        output_dir=output_dir,
-                    )
+            tts = TTSService(default_provider=provider)
+            output_dir = config.output_dir / "movie" / "audio"
+            output_dir.mkdir(parents=True, exist_ok=True)
 
-                    # Get duration and set timing
-                    duration = tts.get_audio_duration(audio_path)
-                    dialogue.audio_path = audio_path
-                    dialogue.start_time = running_time
-                    dialogue.end_time = running_time + duration
-                    running_time = dialogue.end_time + pause_between_lines
+            progress_bar = st.progress(0, text="Generating voices...")
+            total = total_dialogue
+            completed = 0
 
-                    completed += 1
-                    progress_bar.progress(
-                        completed / total,
-                        text=f"Generated voice for {char.name} ({completed}/{total})"
-                    )
+            # Track cumulative time for dialogue timing
+            running_time = 0.0
+            pause_between_lines = 0.3  # 300ms pause between dialogue lines
+            pause_between_scenes = 1.0  # 1s pause between scenes
+            failed_count = 0
 
-                except Exception as e:
-                    st.error(f"Failed to generate voice for {char.name}: {e}")
-                    failed_count += 1
-                    # Clear timing for failed dialogue so it's excluded from video
-                    dialogue.audio_path = None
-                    dialogue.start_time = None
-                    dialogue.end_time = None
+            for scene_idx, scene in enumerate(state.script.scenes):
+                # Mark scene start time
+                scene.start_time = running_time
 
-            # Mark scene end time
-            scene.end_time = running_time
-            # Add pause between scenes (except for last scene)
-            if scene_idx < len(state.script.scenes) - 1:
-                running_time += pause_between_scenes
+                for dialogue in scene.dialogue:
+                    char = state.script.get_character(dialogue.character_id)
+                    if not char:
+                        st.warning(
+                            f"Character '{dialogue.character_id}' not found, skipping"
+                        )
+                        failed_count += 1
+                        continue
 
-        progress_bar.progress(1.0, text="Voice generation complete!")
-        total_duration = running_time
-        minutes = int(total_duration // 60)
-        seconds = int(total_duration % 60)
+                    try:
+                        audio_path = tts.generate_dialogue_audio(
+                            dialogue=dialogue,
+                            character=char,
+                            output_dir=output_dir,
+                        )
 
-        if failed_count > 0:
-            st.warning(f"Generated {completed} voice clips ({failed_count} failed). Total duration: {minutes}m {seconds}s")
-        else:
-            st.success(f"Generated {completed} voice clips! Total duration: {minutes}m {seconds}s")
+                        # Get duration and set timing
+                        duration = tts.get_audio_duration(audio_path)
+                        dialogue.audio_path = audio_path
+                        dialogue.start_time = running_time
+                        dialogue.end_time = running_time + duration
+                        running_time = dialogue.end_time + pause_between_lines
 
-        # Continue button
-        if st.button("Continue to Visuals →", type="primary"):
-            advance_movie_step()
+                        completed += 1
+                        progress_bar.progress(
+                            completed / total,
+                            text=f"Generated voice for {char.name} ({completed}/{total})"
+                        )
+
+                    except Exception as e:
+                        st.error(f"Failed to generate voice for {char.name}: {e}")
+                        failed_count += 1
+                        # Clear timing for failed dialogue
+                        dialogue.audio_path = None
+                        dialogue.start_time = None
+                        dialogue.end_time = None
+
+                # Mark scene end time
+                scene.end_time = running_time
+                # Add pause between scenes (except for last scene)
+                if scene_idx < len(state.script.scenes) - 1:
+                    running_time += pause_between_scenes
+
+            progress_bar.progress(1.0, text="Voice generation complete!")
+
+            if failed_count > 0:
+                st.warning(f"Generated {completed} clips ({failed_count} failed)")
+            else:
+                st.success(f"Generated {completed} voice clips!")
+
+            # Rerun to show the "Continue" button
             st.rerun()
 
     # Navigation

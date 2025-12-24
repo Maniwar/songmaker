@@ -156,6 +156,23 @@ class Config:
         default_factory=lambda: os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
     )
 
+    @property
+    def claude_max_tokens(self) -> int:
+        """Get max output tokens for the current Claude model.
+
+        Returns the maximum output tokens supported by the selected model:
+        - Haiku 4.5: 8,192 tokens
+        - Sonnet 4.5: 16,384 tokens
+        - Opus 4.5: 32,768 tokens
+        """
+        model = self.claude_model.lower()
+        if "haiku" in model:
+            return 8192
+        elif "opus" in model:
+            return 32768
+        else:  # Sonnet or unknown
+            return 16384
+
     # Sub-configurations
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
     video: VideoConfig = field(default_factory=VideoConfig)

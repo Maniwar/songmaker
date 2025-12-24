@@ -9,11 +9,12 @@ from typing import Optional
 
 import streamlit as st
 
-from src.models.schemas import AppState, WorkflowStep
+from src.models.schemas import AppState, WorkflowStep, MovieModeState
 
 
 # Default projects directory
 PROJECTS_DIR = Path("projects")
+MOVIE_PROJECTS_DIR = Path("projects/movies")
 
 # Scene metadata filename
 SCENE_METADATA_FILE = "scenes.json"
@@ -738,6 +739,14 @@ def render_project_sidebar() -> None:
                 from src.config import config
                 config.claude_model = selected_model
                 st.rerun()
+
+            # Show current model indicator
+            model_short = {
+                "claude-haiku-4-5-20251001": "🐇 Haiku",
+                "claude-sonnet-4-5-20250929": "🎵 Sonnet",
+                "claude-opus-4-5-20251101": "🎼 Opus",
+            }.get(selected_model, selected_model)
+            st.caption(f"Using: **{model_short}**")
 
         # New project and quick actions
         st.divider()
