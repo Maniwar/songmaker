@@ -690,6 +690,80 @@ def save_movie_state(project_name: Optional[str] = None) -> Path:
     return filepath
 
 
+def ensure_movie_directories(project_name: Optional[str] = None) -> Path:
+    """Create movie mode output directories for a specific project.
+
+    Args:
+        project_name: Name of the project. If None, uses the current movie state's
+                     project name or generates one from script title/timestamp.
+
+    Returns:
+        Path to the project directory
+    """
+    from src.config import config
+    import time
+
+    # Determine project name
+    if not project_name and "movie_state" in st.session_state:
+        state = st.session_state.movie_state
+        # Priority: existing project_dir > project_name > script title > timestamp
+        if state.project_dir:
+            project_dir = Path(state.project_dir)
+            if project_dir.exists():
+                return project_dir
+            # Extract project name from path
+            project_name = project_dir.name
+        elif state.project_name:
+            project_name = state.project_name
+        elif state.script and state.script.title:
+            project_name = state.script.title
+
+    if not project_name:
+        project_name = f"movie_{int(time.time())}"
+
+    # Sanitize project name for filesystem
+    safe_name = "".join(c if c.isalnum() or c in "_- " else "_" for c in project_name)
+    safe_name = safe_name.strip().replace(" ", "_")[:50]  # Limit length
+
+    project_dir = config.output_dir / "movie" / safe_name
+
+    # Create project-specific directories
+    subdirs = [
+        project_dir,
+        project_dir / "characters",
+        project_dir / "characters" / "variations",
+        project_dir / "scenes",
+        project_dir / "scenes" / "variations",
+        project_dir / "scenes" / "sources",
+        project_dir / "audio",
+        project_dir / "videos",
+    ]
+
+    for dir_path in subdirs:
+        dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Store in state if available
+    if "movie_state" in st.session_state:
+        st.session_state.movie_state.project_dir = str(project_dir)
+
+    return project_dir
+
+
+def get_movie_project_dir() -> Optional[Path]:
+    """Get the current movie project directory.
+
+    Returns:
+        Path to project directory, or None if not set
+    """
+    if "movie_state" not in st.session_state:
+        return None
+
+    state = st.session_state.movie_state
+    if state.project_dir:
+        return Path(state.project_dir)
+    return None
+
+
 def load_movie_state(filepath: Path) -> bool:
     """
     Load movie mode state from a saved JSON file.
@@ -706,11 +780,24 @@ def load_movie_state(filepath: Path) -> bool:
 
         state_dict = save_data.get("state", save_data)
 
+        # Handle backward compatibility for old projects without project_dir
+        if "project_dir" not in state_dict:
+            state_dict["project_dir"] = None
+
         # Create new MovieModeState from loaded data
         loaded_state = MovieModeState.model_validate(state_dict)
 
+        # Set state first so ensure_movie_directories can access it
         st.session_state.movie_state = loaded_state
         st.session_state.movie_mode = True
+
+        # Create project directories (will set project_dir in state if needed)
+        project_dir = ensure_movie_directories()
+
+        # Update the loaded state with the project directory
+        if loaded_state.project_dir is None:
+            loaded_state.project_dir = str(project_dir)
+
         return True
     except Exception as e:
         st.error(f"Failed to load movie project: {e}")
@@ -1295,6 +1382,7 @@ def render_project_sidebar() -> None:
         st.divider()
         st.markdown("##### Special Modes")
         if st.button("🎬 Movie Mode", key="sidebar_movie_mode", use_container_width=True):
-            # Enable movie mode
+            # Enable movie mode and ensure directories exist
             st.session_state.movie_mode = True
+            ensure_movie_directories()
             st.rerun()

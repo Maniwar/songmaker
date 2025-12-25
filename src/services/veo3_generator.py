@@ -35,6 +35,7 @@ class Veo3Generator:
         self.resolution = resolution
         self.duration = duration
         self._client = None
+        self._uploaded_files = {}  # Cache for uploaded video files
 
     def _get_client(self):
         """Lazy-load the Gemini client."""
@@ -53,6 +54,81 @@ class Veo3Generator:
             self._client = genai.Client(api_key=api_key)
 
         return self._client
+
+    def upload_video_reference(self, video_path: Path) -> Optional[object]:
+        """Upload a video file using Files API for use as reference.
+
+        Per Gemini docs: Use Files API when total request size >20MB
+        or when reusing the file across multiple requests.
+
+        Args:
+            video_path: Path to the video file to upload
+
+        Returns:
+            Uploaded file object, or None if upload failed
+        """
+        if not video_path.exists():
+            logger.warning(f"Video reference path does not exist: {video_path}")
+            return None
+
+        # Check cache first
+        cache_key = str(video_path)
+        if cache_key in self._uploaded_files:
+            logger.info(f"Using cached video reference: {video_path.name}")
+            return self._uploaded_files[cache_key]
+
+        client = self._get_client()
+
+        try:
+            logger.info(f"Uploading video reference via Files API: {video_path.name}")
+            uploaded_file = client.files.upload(file=str(video_path))
+            logger.info(f"Video uploaded: {uploaded_file.name}, URI: {uploaded_file.uri}")
+
+            # Cache the uploaded file
+            self._uploaded_files[cache_key] = uploaded_file
+            return uploaded_file
+
+        except Exception as e:
+            logger.error(f"Failed to upload video reference: {e}")
+            return None
+
+    def analyze_video_for_continuity(
+        self,
+        video_path: Path,
+        prompt: str = "Describe the ending of this video clip in detail, including character positions, actions, and visual style."
+    ) -> Optional[str]:
+        """Analyze a video to extract continuity information for the next scene.
+
+        Uses Gemini's video understanding to describe the ending state,
+        which can be used to maintain visual continuity.
+
+        Args:
+            video_path: Path to the video to analyze
+            prompt: Analysis prompt
+
+        Returns:
+            Analysis text, or None if failed
+        """
+        client = self._get_client()
+
+        # Upload the video
+        uploaded_video = self.upload_video_reference(video_path)
+        if not uploaded_video:
+            return None
+
+        try:
+            # Use Gemini to analyze the video
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[uploaded_video, prompt],
+            )
+            analysis = response.text
+            logger.info(f"Video analysis for continuity: {analysis[:100]}...")
+            return analysis
+
+        except Exception as e:
+            logger.error(f"Failed to analyze video: {e}")
+            return None
 
     def build_scene_prompt(
         self,
@@ -93,11 +169,15 @@ class Veo3Generator:
         # Mood
         parts.append(f"Mood: {scene.direction.mood}")
 
-        # Character descriptions for visual consistency
+        # Character descriptions for visual and voice consistency
         for char_id in scene.direction.visible_characters:
             char = script.get_character(char_id)
             if char:
                 parts.append(f"Character {char.name}: {char.description}")
+                # Add voice description for voice continuity across scenes
+                veo_voice = getattr(char, 'veo_voice_description', None)
+                if veo_voice:
+                    parts.append(f"{char.name}'s voice: {veo_voice}")
 
         # Build dialogue section with quotes
         if scene.dialogue:
@@ -147,8 +227,11 @@ class Veo3Generator:
         script: Script,
         output_path: Path,
         style: Optional[str] = None,
+        custom_prompt: Optional[str] = None,
         reference_images: Optional[list[Path]] = None,
         first_frame: Optional[Path] = None,
+        previous_video: Optional[Path] = None,
+        use_video_continuity: bool = False,
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> Optional[Path]:
         """Generate a video clip for a movie scene.
@@ -158,8 +241,11 @@ class Veo3Generator:
             script: The full script
             output_path: Where to save the video
             style: Optional visual style override
+            custom_prompt: Optional custom video prompt (overrides auto-generated prompt)
             reference_images: Up to 3 reference images for character/asset consistency
             first_frame: Optional image to use as first frame
+            previous_video: Optional path to previous scene's video for continuity
+            use_video_continuity: If True, analyze previous video for continuity cues
             progress_callback: Optional progress callback
 
         Returns:
@@ -167,8 +253,34 @@ class Veo3Generator:
         """
         client = self._get_client()
 
-        # Build the prompt
-        prompt = self.build_scene_prompt(scene, script, style)
+        # Use custom prompt if provided, otherwise build from scene
+        if custom_prompt and custom_prompt.strip():
+            # Use custom prompt but prepend style for consistency
+            visual_style = style or script.visual_style or "cinematic film"
+            prompt = f"VISUAL STYLE (CRITICAL - maintain throughout): {visual_style}\n\n{custom_prompt}"
+        else:
+            prompt = self.build_scene_prompt(scene, script, style)
+
+        # Add style enforcement at the end for consistency
+        visual_style = style or script.visual_style or "cinematic film"
+        if "photorealistic" in visual_style.lower() or "realistic" in visual_style.lower():
+            prompt += f"\n\nIMPORTANT: Maintain {visual_style} style throughout. Characters must look photorealistic and consistent with their reference images."
+
+        # Add continuity information from previous video if available
+        if previous_video and use_video_continuity and previous_video.exists():
+            if progress_callback:
+                progress_callback(f"Analyzing previous scene for continuity...", 0.05)
+
+            continuity_info = self.analyze_video_for_continuity(previous_video)
+            if continuity_info:
+                prompt = f"""CONTINUITY FROM PREVIOUS SCENE:
+{continuity_info}
+
+CURRENT SCENE (continue seamlessly from above):
+{prompt}
+
+IMPORTANT: Maintain visual continuity with the previous scene - match character positions, lighting, and style."""
+
         logger.info("Generating scene %d with Veo 3.1", scene.index)
         logger.debug("Prompt: %s", prompt)
 
@@ -178,13 +290,12 @@ class Veo3Generator:
         try:
             from google.genai import types
 
-            # Build config
+            # Build config - don't specify person_generation as allow_adult is not supported in some regions
             config = types.GenerateVideosConfig(
                 aspect_ratio="16:9",
                 number_of_videos=1,
                 duration_seconds=self.duration,
                 resolution=self.resolution,
-                person_generation="allow_adult",  # Required for image-to-video
             )
 
             # Add reference images for character consistency (Veo 3.1 only)
@@ -268,6 +379,7 @@ class Veo3Generator:
         output_dir: Path,
         style: Optional[str] = None,
         use_character_references: bool = True,
+        use_scene_continuity: bool = True,
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> list[Path]:
         """Generate video clips for all scenes in a script.
@@ -277,6 +389,7 @@ class Veo3Generator:
             output_dir: Directory for output videos
             style: Optional visual style
             use_character_references: Use character portrait images as references
+            use_scene_continuity: Use scene images for visual continuity between clips
             progress_callback: Optional progress callback
 
         Returns:
@@ -295,6 +408,8 @@ class Veo3Generator:
                     if len(reference_images) >= 3:  # Veo 3.1 max is 3
                         break
 
+        previous_scene_image = None
+
         for i, scene in enumerate(script.scenes):
             output_path = output_dir / f"scene_{scene.index:03d}.mp4"
 
@@ -303,12 +418,19 @@ class Veo3Generator:
                     overall = (i + prog) / total_scenes
                     progress_callback(msg, overall)
 
+            # Determine first frame for scene continuity
+            first_frame = None
+            if use_scene_continuity and i > 0 and previous_scene_image:
+                first_frame = previous_scene_image
+                logger.info("Using previous scene image for continuity in scene %d", scene.index)
+
             result = self.generate_scene(
                 scene=scene,
                 script=script,
                 output_path=output_path,
                 style=style,
                 reference_images=reference_images if reference_images else None,
+                first_frame=first_frame,
                 progress_callback=scene_progress,
             )
 
@@ -316,6 +438,10 @@ class Veo3Generator:
                 generated.append(result)
                 # Store path in scene for later use
                 scene.video_path = result
+
+                # Update previous_scene_image if scene has an image
+                if scene.image_path and Path(scene.image_path).exists():
+                    previous_scene_image = Path(scene.image_path)
             else:
                 logger.warning("Failed to generate scene %d", scene.index)
 

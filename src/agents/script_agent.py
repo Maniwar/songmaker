@@ -195,6 +195,8 @@ class ScriptAgent:
 
         # Build technical context based on generation method
         if generation_method == "veo3":
+            # Calculate correct word limit: ~2.5 words/second speaking rate
+            max_words_per_scene = int(veo_duration * 2.5)
             tech_context = f"""
 TECHNICAL SETTINGS (Video Generation):
 - Method: Veo 3.1 AI Video (generates video with spoken dialogue directly)
@@ -202,11 +204,34 @@ TECHNICAL SETTINGS (Video Generation):
 - Clip Duration: {veo_duration} seconds per scene
 - Resolution: {veo_resolution}
 
-IMPORTANT FOR VEO: Each scene's dialogue will be spoken by Veo's AI voices. Write dialogue that:
-- Sounds natural when spoken aloud
-- Fits within ~{veo_duration} seconds per scene (roughly {veo_duration * 15} words max per scene)
-- Includes clear emotion/delivery cues for the AI voices
-- Has distinct character voices that can be differentiated"""
+⚠️ CRITICAL VEO CONSTRAINT: Each scene = ONE {veo_duration}-second video clip!
+
+STRICT SCENE STRUCTURE FOR VEO:
+1. Each scene MUST fit in {veo_duration} seconds of video
+2. Maximum dialogue per scene: ~{max_words_per_scene} words TOTAL (all characters combined)
+3. That's roughly {max_words_per_scene // 2} words per character if 2 characters speak
+4. Short, punchy exchanges work best - NOT long monologues
+
+WORD COUNT GUIDE (at 2.5 words/second speaking rate):
+- 4-second clip: max ~10 words total
+- 6-second clip: max ~15 words total
+- 8-second clip: max ~20 words total
+
+SCENE DESIGN FOR VEO:
+- Write MANY short scenes instead of FEW long scenes
+- Each scene = one camera angle, one moment, one beat
+- Break conversations into multiple scenes/clips
+- Think of it like movie cuts - quick exchanges across scenes
+
+EXAMPLE (8-second clip):
+SCENE 5: INT. OFFICE - DAY
+MAYA: (excited) Did you see the results?
+ALEX: (surprised) They're incredible!
+[End Scene - ~8 words = fits in 8 seconds]
+
+NOT THIS (too long for one clip):
+BAD: MAYA gives a 50-word explanation in one scene
+INSTEAD: Break it into 3-4 separate scenes with shorter lines"""
         else:
             voice_labels = {
                 "edge": "Edge TTS (Free)",
@@ -223,18 +248,25 @@ IMPORTANT FOR TTS: Dialogue will be converted to speech. Write dialogue that:
 - Has appropriate pacing and punctuation for speech synthesis
 - Avoids complex words that TTS might mispronounce"""
 
+        # For Veo mode, calculate recommended scenes based on clip duration
+        if generation_method == "veo3":
+            # Each scene = one clip, so scenes = total_duration / clip_duration
+            veo_recommended_scenes = cfg.target_duration // veo_duration
+            scene_guidance = f"""- Target: {veo_recommended_scenes} scenes (= {veo_recommended_scenes} clips × {veo_duration}s each)
+- This gives {veo_recommended_scenes * veo_duration} seconds of video to match {duration_str} target"""
+        else:
+            scene_guidance = f"- Recommended Scenes: {recommended_scenes} scenes (aim for this number to achieve the target duration)"
+
         context = f"""
 PROJECT REQUIREMENTS (from user's setup):
 - Format: {format_text}
 - Target Duration: {duration_str}
-- Recommended Scenes: {recommended_scenes} scenes (aim for this number to achieve the target duration)
+{scene_guidance}
 - Characters: {char_desc}
 - Tone: {tone_text}
 - Visual Style: {cfg.visual_style}
 - Overlapping Dialogue: {"allowed (characters can interrupt each other)" if allow_overlap else "not allowed (sequential dialogue only)"}
 {tech_context}
-
-IMPORTANT: Tailor your script to match these requirements. Aim for approximately {recommended_scenes} scenes to achieve the target duration of {duration_str}. Each scene should have enough dialogue to fill its portion of the total runtime.
 """
         return context
 
@@ -363,26 +395,49 @@ IMPORTANT: Tailor your script to match these requirements. Aim for approximately
         """
         client = self._get_client()
 
-        extraction_prompt = """Based on our conversation, extract the complete script as JSON.
+        # Build Veo-specific extraction constraints if in Veo mode
+        veo_constraints = ""
+        if self._project_config:
+            generation_method = getattr(self._project_config, 'generation_method', 'tts_images')
+            if generation_method == "veo3":
+                veo_duration = getattr(self._project_config, 'veo_duration', 8)
+                max_words = int(veo_duration * 2.5)
+                veo_constraints = f"""
+
+⚠️ CRITICAL VEO MODE CONSTRAINTS:
+This is for Veo 3.1 video generation where each scene = ONE {veo_duration}-second clip!
+
+SCENE VALIDATION RULES:
+1. Each scene's TOTAL dialogue must be ≤{max_words} words (all characters combined)
+2. If a scene has too much dialogue, SPLIT it into multiple scenes
+3. Speaking rate: ~2.5 words/second
+4. Word limits by clip duration: 4s=10 words, 6s=15 words, 8s=20 words
+
+BEFORE OUTPUTTING JSON:
+- Count words in each scene's dialogue
+- If any scene exceeds {max_words} words, split it into multiple scenes
+- Renumber scene indices sequentially after splitting"""
+
+        extraction_prompt = f"""Based on our conversation, extract the complete script as JSON.
 
 Return ONLY valid JSON with this structure:
-{
+{{
   "title": "Script Title",
   "description": "Brief description",
   "target_duration": 300,
   "visual_style": "art style description",
   "world_description": "consistent setting/world description",
   "characters": [
-    {
+    {{
       "id": "character_id",
       "name": "Character Name",
       "description": "Detailed visual description for AI image generation",
       "personality": "personality traits",
       "voice_type": "male/female, age, accent, tone"
-    }
+    }}
   ],
   "scenes": [
-    {
+    {{
       "index": 0,
       "title": "INT. LOCATION - TIME",
       "setting": "detailed setting description",
@@ -391,22 +446,22 @@ Return ONLY valid JSON with this structure:
       "mood": "scene mood",
       "visible_characters": ["character_id1", "character_id2"],
       "dialogue": [
-        {
+        {{
           "character_id": "character_id",
           "text": "dialogue text",
           "emotion": "neutral/happy/sad/angry/excited/thoughtful/surprised/scared/sarcastic/whisper",
           "action": "optional action/stage direction"
-        }
+        }}
       ]
-    }
+    }}
   ]
-}
+}}
 
 IMPORTANT:
 - target_duration is in seconds (e.g., 300 for 5 minutes)
 - character IDs must be lowercase with underscores
 - emotion must be one of: neutral, happy, sad, angry, excited, thoughtful, surprised, scared, sarcastic, whisper
-- Include ALL scenes and ALL dialogue from the script"""
+- Include ALL scenes and ALL dialogue from the script{veo_constraints}"""
 
         messages = self.conversation_history.copy()
         messages.append({"role": "user", "content": extraction_prompt})
@@ -466,11 +521,15 @@ IMPORTANT:
                     )
 
                     scenes.append(MovieScene(
-                        index=scene_data.get("index", len(scenes)),
+                        index=scene_data.get("index", len(scenes) + 1),  # 1-based indexing
                         title=scene_data.get("title"),
                         direction=direction,
                         dialogue=dialogue,
                     ))
+
+                # Re-index scenes to ensure proper 1-based ordering
+                for i, scene in enumerate(scenes):
+                    scene.index = i + 1
 
                 return Script(
                     title=data.get("title", "Untitled"),

@@ -1,13 +1,27 @@
-"""AtlasCloud animation service using Wan 2.5 image-to-video.
+"""AtlasCloud animation service using WAN 2.6 and Seedance 1.5 Pro.
 
-This service generates motion videos from images using the AtlasCloud API,
-which hosts the Wan 2.5 image-to-video model. Unlike HuggingFace free tier,
-this is a paid service with no GPU quota limits.
+This service generates motion videos from images/videos using the AtlasCloud API,
+which hosts the WAN 2.6 and Seedance 1.5 Pro models.
+
+WAN 2.6 Features:
+- Text-to-video, Image-to-video, Video-to-video
+- Up to 15 seconds duration (5, 10, or 15)
+- 480p, 720p, or 1080p resolution
+- Native audio generation with lip sync
+- Multi-language support
+- First frame / Last frame control
+
+Seedance 1.5 Pro Features:
+- Precision lip-syncing with audio
+- Multi-language support
+- Cinematic camera control
+- Native audio generation
 """
 
 import base64
 import logging
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -18,31 +32,68 @@ from src.config import Config, config as default_config
 logger = logging.getLogger(__name__)
 
 
+class WanModel(str, Enum):
+    """Available WAN 2.6 models on AtlasCloud."""
+    TEXT_TO_VIDEO = "alibaba/wan-2.6/text-to-video"
+    IMAGE_TO_VIDEO = "alibaba/wan-2.6/image-to-video"
+    VIDEO_TO_VIDEO = "alibaba/wan-2.6/video-to-video"
+    # Legacy models for backwards compatibility
+    WAN_25_FAST = "alibaba/wan-2.5/image-to-video-fast"
+
+
+class SeedanceModel(str, Enum):
+    """Available Seedance 1.5 Pro models on AtlasCloud."""
+    TEXT_TO_VIDEO = "bytedance/seedance-v1.5-pro/text-to-video"
+    IMAGE_TO_VIDEO = "bytedance/seedance-v1.5-pro/image-to-video"
+
+
 class AtlasCloudAnimator:
-    """Generate animations using AtlasCloud's Wan 2.5 image-to-video API.
+    """Generate animations using AtlasCloud's WAN 2.6 or Seedance 1.5 Pro APIs.
 
-    This service uses the Wan 2.5 model via AtlasCloud's API to animate
-    images based on text prompts describing the motion.
+    This service uses WAN 2.6 or Seedance 1.5 Pro via AtlasCloud's API to animate
+    images/videos based on text prompts describing the motion.
 
-    Features:
-    - Text prompt-driven animation
-    - No GPU quota limits (paid service)
-    - Supports 5 or 10 second durations
-    - Supports 720p or 1080p resolutions
+    WAN 2.6 Features:
+    - Text-to-video, Image-to-video, Video-to-video
+    - Up to 15 seconds duration (5, 10, or 15)
+    - 480p, 720p, or 1080p resolution
+    - Native audio with multi-person dialogue
+    - First frame / Last frame control for smooth transitions
 
-    Use cases:
-    - Playing instruments (guitar, drums, piano)
-    - Dancing or moving to music
-    - Ambient motion (wind, water, etc.)
-    - Any motion that can be described with text
+    Seedance 1.5 Pro Features:
+    - Precision lip-syncing with millisecond accuracy
+    - Multi-language support with natural speech
+    - Cinematic camera control
+    - Native audio generation
+
+    Pricing (as of Dec 2025):
+    - WAN 2.6: $0.075/second
+    - Seedance 1.5 Pro: $0.0147/second
     """
 
     BASE_URL = "https://api.atlascloud.ai/api/v1/model"
-    MODEL = "alibaba/wan-2.5/image-to-video-fast"
+    # Default to WAN 2.6 image-to-video
+    MODEL = WanModel.IMAGE_TO_VIDEO
 
-    def __init__(self, config: Optional[Config] = None):
+    def __init__(
+        self,
+        config: Optional[Config] = None,
+        model: Optional[str] = None,
+    ):
+        """Initialize AtlasCloud animator.
+
+        Args:
+            config: Configuration object
+            model: Model to use. Options:
+                - WanModel.IMAGE_TO_VIDEO (default)
+                - WanModel.TEXT_TO_VIDEO
+                - WanModel.VIDEO_TO_VIDEO
+                - SeedanceModel.IMAGE_TO_VIDEO
+                - SeedanceModel.TEXT_TO_VIDEO
+        """
         self.config = config or default_config
         self._api_key = self.config.atlascloud_api_key
+        self._model = model or WanModel.IMAGE_TO_VIDEO
 
     def _get_headers(self) -> dict:
         """Get headers for API requests."""
@@ -51,23 +102,30 @@ class AtlasCloudAnimator:
             "Content-Type": "application/json",
         }
 
-    def _encode_image(self, image_path: Path) -> str:
-        """Encode image to base64 data URL."""
-        with open(image_path, "rb") as f:
-            image_data = f.read()
+    def _encode_file(self, file_path: Path) -> str:
+        """Encode image or video to base64 data URL."""
+        with open(file_path, "rb") as f:
+            file_data = f.read()
 
         # Determine mime type
-        suffix = image_path.suffix.lower()
+        suffix = file_path.suffix.lower()
         mime_map = {
             ".png": "image/png",
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
             ".webp": "image/webp",
+            ".mp4": "video/mp4",
+            ".webm": "video/webm",
+            ".mov": "video/quicktime",
         }
-        mime_type = mime_map.get(suffix, "image/png")
+        mime_type = mime_map.get(suffix, "application/octet-stream")
 
-        base64_data = base64.b64encode(image_data).decode("utf-8")
+        base64_data = base64.b64encode(file_data).decode("utf-8")
         return f"data:{mime_type};base64,{base64_data}"
+
+    def _encode_image(self, image_path: Path) -> str:
+        """Encode image to base64 data URL (legacy compatibility)."""
+        return self._encode_file(image_path)
 
     def animate_scene(
         self,
@@ -77,20 +135,32 @@ class AtlasCloudAnimator:
         duration_seconds: float = 5.0,
         resolution: str = "720p",
         seed: int = -1,
+        model: Optional[str] = None,
+        first_frame: Optional[Path] = None,
+        last_frame: Optional[Path] = None,
+        source_video: Optional[Path] = None,
+        source_video_urls: Optional[list[str]] = None,
+        audio_path: Optional[Path] = None,
         progress_callback: Optional[Callable[[str, float], None]] = None,
         poll_interval: float = 5.0,
         max_wait_time: float = 300.0,
     ) -> Optional[Path]:
         """
-        Animate a scene image with prompt-driven motion using AtlasCloud Wan 2.5.
+        Animate a scene with WAN 2.6 or Seedance 1.5 Pro.
 
         Args:
-            image_path: Path to the scene image
-            prompt: Text description of the motion (e.g., "playing guitar passionately")
+            image_path: Path to the scene image (for image-to-video)
+            prompt: Text description of the motion
             output_path: Path to save the output video
-            duration_seconds: Video duration (5 or 10 seconds)
-            resolution: Output resolution ("720p" or "1080p")
+            duration_seconds: Video duration (5, 10, or 15 seconds for WAN 2.6)
+            resolution: Output resolution ("480p", "720p", or "1080p")
             seed: Random seed (-1 for random)
+            model: Override model (WanModel or SeedanceModel)
+            first_frame: Optional first frame image for smooth transitions
+            last_frame: Optional last frame image for smooth transitions
+            source_video: Source video for video-to-video mode (local path)
+            source_video_urls: List of video URLs for V2V mode (WAN 2.6 V2V requires URLs)
+            audio_path: Optional audio file for lip sync (Seedance 1.5 Pro)
             progress_callback: Optional callback for progress updates
             poll_interval: Seconds between status checks (default 5)
             max_wait_time: Maximum seconds to wait for completion (default 300)
@@ -104,50 +174,163 @@ class AtlasCloudAnimator:
                 progress_callback("Error: AtlasCloud API key not set", 0.0)
             return None
 
-        # Validate duration (API only supports 5 or 10 seconds)
-        valid_durations = [5, 10]
+        # Select model
+        active_model = model or self._model
+        is_seedance = "seedance" in str(active_model).lower()
+        is_video_to_video = source_video_urls is not None or source_video is not None or "video-to-video" in str(active_model)
+
+        # Validate duration
+        # WAN 2.6 I2V/T2V supports 5, 10, 15 seconds; V2V supports 5, 10 seconds
+        # Seedance supports 3-12 seconds
+        if is_seedance:
+            valid_durations = list(range(3, 13))  # 3-12 seconds per API spec
+        elif is_video_to_video:
+            valid_durations = [5, 10]  # WAN 2.6 V2V only supports 5 or 10
+        else:
+            valid_durations = [5, 10, 15]  # WAN 2.6 I2V/T2V
+
         duration = int(duration_seconds)
         if duration not in valid_durations:
-            # Round to nearest valid duration
-            duration = 5 if duration < 7.5 else 10
+            if is_seedance:
+                duration = max(3, min(15, duration))
+            else:
+                # Round to nearest valid WAN 2.6 duration
+                if duration < 7:
+                    duration = 5
+                elif duration < 12:
+                    duration = 10
+                else:
+                    duration = 15
             logger.warning(
-                f"Duration {duration_seconds}s not supported, using {duration}s"
+                f"Duration {duration_seconds}s adjusted to {duration}s"
             )
 
-        # Validate resolution
-        valid_resolutions = ["720p", "1080p"]
-        if resolution not in valid_resolutions:
-            resolution = "720p"
-            logger.warning(f"Resolution not supported, using {resolution}")
+        # Validate resolution - Seedance supports 480p/720p, WAN 2.6 supports 720p/1080p
+        if is_seedance:
+            valid_resolutions = ["480p", "720p"]
+            if resolution not in valid_resolutions:
+                resolution = "720p"
+                logger.warning(f"Seedance only supports 480p/720p, using {resolution}")
+        else:
+            # WAN 2.6 only supports 720p and 1080p (no 480p per API spec)
+            valid_resolutions = ["720p", "1080p"]
+            if resolution not in valid_resolutions:
+                resolution = "720p"
+                logger.warning(f"WAN 2.6 only supports 720p/1080p, using {resolution}")
 
         if progress_callback:
-            progress_callback("Encoding image...", 0.1)
+            progress_callback("Encoding media...", 0.1)
 
         try:
-            # Encode image to base64 data URL
-            image_data_url = self._encode_image(image_path)
+            # Determine which model to actually use based on inputs
+            if is_video_to_video and source_video:
+                actual_model = WanModel.VIDEO_TO_VIDEO
+            elif is_seedance:
+                actual_model = (
+                    SeedanceModel.IMAGE_TO_VIDEO
+                    if image_path
+                    else SeedanceModel.TEXT_TO_VIDEO
+                )
+            else:
+                actual_model = (
+                    WanModel.IMAGE_TO_VIDEO
+                    if image_path
+                    else WanModel.TEXT_TO_VIDEO
+                )
 
             if progress_callback:
                 progress_callback("Submitting to AtlasCloud...", 0.2)
 
-            # Build request payload - fields at root level per AtlasCloud API schema
-            payload = {
-                "model": self.MODEL,
-                "image": image_data_url,
-                "prompt": prompt,
-                "resolution": resolution,
-                "duration": duration,
-            }
+            # Build request payload - different format for V2V vs I2V/T2V
+            if is_video_to_video and not is_seedance:
+                # WAN 2.6 Video-to-Video uses different API format
+                # Size format: "1280*720" instead of "720p"
+                size_map = {
+                    "720p": "1280*720",
+                    "1080p": "1920*1080",
+                    "480p": "854*480",
+                }
+                v2v_size = size_map.get(resolution, "1280*720")
 
-            if seed >= 0:
-                payload["seed"] = seed
+                payload = {
+                    "model": WanModel.VIDEO_TO_VIDEO.value,
+                    "prompt": prompt,
+                    "size": v2v_size,
+                    "duration": duration,
+                    "enable_prompt_expansion": False,  # Disable for precise control
+                    "shot_type": "single",  # Single camera angle for consistency
+                }
+
+                # V2V requires video URLs (not base64)
+                if source_video_urls:
+                    payload["videos"] = source_video_urls[:3]  # Max 3 videos
+                    logger.info(f"Using {len(payload['videos'])} video URLs for V2V")
+                else:
+                    logger.warning("V2V mode selected but no video URLs provided - V2V requires URLs, not local files")
+                    # Fall back to I2V if we have an image
+                    if image_path and image_path.exists():
+                        logger.info("Falling back to I2V mode")
+                        is_video_to_video = False
+                        payload = {
+                            "model": WanModel.IMAGE_TO_VIDEO.value,
+                            "prompt": prompt,
+                            "resolution": resolution,
+                            "duration": duration,
+                        }
+                        payload["image"] = self._encode_file(image_path)
+
+                if seed >= 0:
+                    payload["seed"] = seed
+                else:
+                    payload["seed"] = -1
+
+            else:
+                # Standard I2V/T2V payload format
+                payload = {
+                    "model": str(actual_model.value if hasattr(actual_model, 'value') else actual_model),
+                    "prompt": prompt,
+                    "resolution": resolution,
+                    "duration": duration,
+                }
+
+                # Add image for image-to-video
+                if image_path and image_path.exists():
+                    payload["image"] = self._encode_file(image_path)
+
+                # Add last frame for Seedance transitions (WAN 2.6 doesn't support first/last frame per API spec)
+                if last_frame and last_frame.exists() and is_seedance:
+                    payload["last_image"] = self._encode_file(last_frame)
+
+                # Seedance-specific parameters
+                if is_seedance:
+                    payload["aspect_ratio"] = "16:9"  # Default to 16:9 for video
+                    payload["camera_fixed"] = False   # Allow camera movement
+                    payload["generate_audio"] = True  # Generate audio with video
+                else:
+                    # WAN 2.6 specific parameters
+                    payload["enable_prompt_expansion"] = False  # Disable prompt expansion for precise control
+                    payload["shot_type"] = "single"  # Single camera angle for consistency
+                    payload["generate_audio"] = True  # Auto-generate audio
+
+                # Add audio for Seedance lip sync (if provided separately)
+                if audio_path and audio_path.exists() and is_seedance:
+                    payload["audio"] = self._encode_file(audio_path)
+                    logger.info("Added audio for lip sync")
+
+                if seed >= 0:
+                    payload["seed"] = seed
+                elif not is_seedance:
+                    # WAN 2.6 defaults to seed=0, use -1 for random
+                    payload["seed"] = -1
+
+            logger.info(f"Using model: {payload['model']}, duration: {duration}s")
 
             # Submit generation request
             response = requests.post(
                 f"{self.BASE_URL}/generateVideo",
                 headers=self._get_headers(),
                 json=payload,
-                timeout=60,
+                timeout=180,  # 3 minutes for initial request
             )
             response.raise_for_status()
             result = response.json()
@@ -166,9 +349,12 @@ class AtlasCloudAnimator:
             if progress_callback:
                 progress_callback("Processing animation...", 0.3)
 
-            # Poll for completion using /prediction/{id} endpoint
-            poll_url = f"{self.BASE_URL}/prediction/{prediction_id}"
+            # Poll for completion using /result/{id} endpoint (per API spec)
+            poll_url = f"{self.BASE_URL}/result/{prediction_id}"
             start_time = time.time()
+            consecutive_timeouts = 0
+            max_consecutive_timeouts = 5  # Allow up to 5 timeout retries
+
             while True:
                 elapsed = time.time() - start_time
                 if elapsed > max_wait_time:
@@ -177,14 +363,37 @@ class AtlasCloudAnimator:
                         progress_callback("Error: Request timed out", 0.0)
                     return None
 
-                # Check status
-                status_response = requests.get(
-                    poll_url,
-                    headers={"Authorization": f"Bearer {self._api_key}"},
-                    timeout=30,
-                )
-                status_response.raise_for_status()
-                status_result = status_response.json()
+                # Check status with retry on timeout
+                try:
+                    status_response = requests.get(
+                        poll_url,
+                        headers={"Authorization": f"Bearer {self._api_key}"},
+                        timeout=120,  # 2 minutes for poll requests (increased from 60s)
+                    )
+                    status_response.raise_for_status()
+                    status_result = status_response.json()
+                    consecutive_timeouts = 0  # Reset on success
+                except requests.exceptions.ReadTimeout:
+                    consecutive_timeouts += 1
+                    logger.warning(f"Poll request timed out ({consecutive_timeouts}/{max_consecutive_timeouts}), retrying...")
+                    if consecutive_timeouts >= max_consecutive_timeouts:
+                        logger.error(f"Too many consecutive timeouts for: {prediction_id}")
+                        if progress_callback:
+                            progress_callback("Error: Poll requests keep timing out", 0.0)
+                        return None
+                    # Wait a bit before retry
+                    time.sleep(poll_interval)
+                    continue
+                except requests.exceptions.ConnectionError as e:
+                    consecutive_timeouts += 1
+                    logger.warning(f"Connection error during poll ({consecutive_timeouts}/{max_consecutive_timeouts}): {e}")
+                    if consecutive_timeouts >= max_consecutive_timeouts:
+                        logger.error(f"Too many connection errors for: {prediction_id}")
+                        if progress_callback:
+                            progress_callback("Error: Connection errors during polling", 0.0)
+                        return None
+                    time.sleep(poll_interval)
+                    continue
 
                 # Status is in result["data"]["status"]
                 poll_data = status_result.get("data", {})
@@ -206,7 +415,7 @@ class AtlasCloudAnimator:
                         progress_callback("Downloading video...", 0.9)
 
                     # Download video
-                    video_response = requests.get(video_url, timeout=120)
+                    video_response = requests.get(video_url, timeout=300)  # 5 minutes for download
                     video_response.raise_for_status()
 
                     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -328,6 +537,180 @@ class AtlasCloudAnimator:
         return results
 
 
+    def video_to_video(
+        self,
+        source_video: Path,
+        prompt: str,
+        output_path: Path,
+        duration_seconds: float = 5.0,
+        resolution: str = "720p",
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> Optional[Path]:
+        """Transform a video using WAN 2.6 video-to-video.
+
+        Applies style or motion transformations to an existing video.
+
+        Args:
+            source_video: Path to the source video
+            prompt: Description of the transformation
+            output_path: Path to save the output video
+            duration_seconds: Output duration (5, 10, or 15 seconds)
+            resolution: Output resolution ("480p", "720p", or "1080p")
+            progress_callback: Optional progress callback
+
+        Returns:
+            Path to the transformed video, or None if failed
+        """
+        return self.animate_scene(
+            image_path=None,  # No image for video-to-video
+            prompt=prompt,
+            output_path=output_path,
+            duration_seconds=duration_seconds,
+            resolution=resolution,
+            model=WanModel.VIDEO_TO_VIDEO,
+            source_video=source_video,
+            progress_callback=progress_callback,
+        )
+
+    def text_to_video(
+        self,
+        prompt: str,
+        output_path: Path,
+        duration_seconds: float = 5.0,
+        resolution: str = "720p",
+        first_frame: Optional[Path] = None,
+        last_frame: Optional[Path] = None,
+        use_seedance: bool = False,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> Optional[Path]:
+        """Generate video purely from text prompt.
+
+        Args:
+            prompt: Description of the video content
+            output_path: Path to save the output video
+            duration_seconds: Output duration
+            resolution: Output resolution
+            first_frame: Optional first frame for smooth start
+            last_frame: Optional last frame for smooth end
+            use_seedance: Use Seedance 1.5 Pro instead of WAN 2.6
+            progress_callback: Optional progress callback
+
+        Returns:
+            Path to the generated video, or None if failed
+        """
+        model = SeedanceModel.TEXT_TO_VIDEO if use_seedance else WanModel.TEXT_TO_VIDEO
+
+        return self.animate_scene(
+            image_path=None,
+            prompt=prompt,
+            output_path=output_path,
+            duration_seconds=duration_seconds,
+            resolution=resolution,
+            model=model,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            progress_callback=progress_callback,
+        )
+
+    def lip_sync_video(
+        self,
+        image_path: Path,
+        audio_path: Path,
+        prompt: str,
+        output_path: Path,
+        resolution: str = "720p",
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> Optional[Path]:
+        """Generate video with lip-synced audio using Seedance 1.5 Pro.
+
+        Creates a video from an image with lip movements synchronized
+        to the provided audio. Great for talking head videos.
+
+        Args:
+            image_path: Path to the character/face image
+            audio_path: Path to the audio file (speech)
+            prompt: Description of the character's expression and movement
+            output_path: Path to save the output video
+            resolution: Output resolution ("480p", "720p", or "1080p")
+            progress_callback: Optional progress callback
+
+        Returns:
+            Path to the lip-synced video, or None if failed
+        """
+        # Calculate duration from audio
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(audio_path)],
+                capture_output=True, text=True
+            )
+            duration = float(result.stdout.strip())
+            # Clamp to Seedance limits (3-15 seconds)
+            duration = max(3, min(15, int(duration)))
+        except Exception:
+            duration = 8  # Default if we can't determine
+
+        return self.animate_scene(
+            image_path=image_path,
+            prompt=prompt,
+            output_path=output_path,
+            duration_seconds=duration,
+            resolution=resolution,
+            model=SeedanceModel.IMAGE_TO_VIDEO,
+            audio_path=audio_path,
+            progress_callback=progress_callback,
+        )
+
+
 def check_atlascloud_available() -> bool:
     """Check if AtlasCloud animation is available (API key configured)."""
     return bool(default_config.atlascloud_api_key)
+
+
+def get_wan26_pricing(duration_seconds: float, num_scenes: int = 1) -> dict:
+    """Estimate WAN 2.6 costs.
+
+    Args:
+        duration_seconds: Duration per scene
+        num_scenes: Number of scenes
+
+    Returns:
+        Dict with pricing breakdown
+    """
+    cost_per_second = 0.075  # $0.075/second for WAN 2.6
+    total_seconds = duration_seconds * num_scenes
+    total_cost = total_seconds * cost_per_second
+
+    return {
+        "model": "WAN 2.6",
+        "cost_per_second": cost_per_second,
+        "duration_per_scene": duration_seconds,
+        "num_scenes": num_scenes,
+        "total_seconds": total_seconds,
+        "estimated_cost": round(total_cost, 2),
+    }
+
+
+def get_seedance_pricing(duration_seconds: float, num_scenes: int = 1) -> dict:
+    """Estimate Seedance 1.5 Pro costs.
+
+    Args:
+        duration_seconds: Duration per scene
+        num_scenes: Number of scenes
+
+    Returns:
+        Dict with pricing breakdown
+    """
+    cost_per_second = 0.0147  # $0.0147/second for Seedance 1.5 Pro
+    total_seconds = duration_seconds * num_scenes
+    total_cost = total_seconds * cost_per_second
+
+    return {
+        "model": "Seedance 1.5 Pro",
+        "cost_per_second": cost_per_second,
+        "duration_per_scene": duration_seconds,
+        "num_scenes": num_scenes,
+        "total_seconds": total_seconds,
+        "estimated_cost": round(total_cost, 2),
+    }

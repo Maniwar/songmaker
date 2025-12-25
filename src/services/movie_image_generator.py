@@ -31,6 +31,7 @@ class MovieImageGenerator:
         scene: MovieScene,
         script: Script,
         include_characters: bool = True,
+        has_reference_image: bool = False,
     ) -> str:
         """Build a comprehensive prompt for a scene with character descriptions.
 
@@ -38,45 +39,55 @@ class MovieImageGenerator:
             scene: The scene to generate an image for
             script: The full script (for character lookup)
             include_characters: Whether to include character descriptions
+            has_reference_image: If True, minimize setting descriptions (preserve from reference)
 
         Returns:
             Complete prompt string for image generation
         """
         parts = []
-
-        # Start with scene direction
         direction = scene.direction
+        visual_style = script.visual_style or self.style
 
-        # Setting and camera
-        parts.append(f"{direction.camera} of {direction.setting}")
+        if has_reference_image:
+            # MINIMAL PROMPT - preserve environment from reference image
+            parts.append(f"VISUAL STYLE: {visual_style}")
+            parts.append(f"{direction.camera}")  # Just camera angle, no setting description
 
-        # Add characters if present
-        if include_characters and direction.visible_characters:
-            char_descriptions = []
-            for char_id in direction.visible_characters:
-                character = script.get_character(char_id)
-                if character:
-                    char_descriptions.append(f"{character.name}: {character.description}")
+            # Only describe character positions/actions, not their full appearance
+            if include_characters and direction.visible_characters:
+                char_positions = []
+                for char_id in direction.visible_characters:
+                    character = script.get_character(char_id)
+                    if character:
+                        char_positions.append(f"{character.name} visible")
+                if char_positions:
+                    parts.append("Characters: " + ", ".join(char_positions))
 
-            if char_descriptions:
-                parts.append("Characters present: " + "; ".join(char_descriptions))
+            parts.append(f"Mood: {direction.mood}")
+            parts.append("PRESERVE the room, furniture, lighting, and environment exactly from reference image. Only adjust character positions.")
+        else:
+            # FULL PROMPT - no reference, describe everything
+            parts.append(f"VISUAL STYLE: {visual_style}")
+            parts.append(f"{direction.camera} of {direction.setting}")
 
-        # Add lighting if specified
-        if direction.lighting:
-            parts.append(f"Lighting: {direction.lighting}")
+            if include_characters and direction.visible_characters:
+                char_descriptions = []
+                for char_id in direction.visible_characters:
+                    character = script.get_character(char_id)
+                    if character:
+                        char_descriptions.append(f"{character.name}: {character.description}")
+                if char_descriptions:
+                    parts.append("Characters present: " + "; ".join(char_descriptions))
 
-        # Add mood
-        parts.append(f"Mood: {direction.mood}")
+            if direction.lighting:
+                parts.append(f"Lighting: {direction.lighting}")
 
-        # Add world description if available
-        if script.world_description:
-            parts.append(f"Setting style: {script.world_description}")
+            parts.append(f"Mood: {direction.mood}")
 
-        # Add visual style
-        parts.append(f"Style: {script.visual_style or self.style}")
+            if script.world_description:
+                parts.append(f"Setting style: {script.world_description}")
 
-        # Quality modifiers
-        parts.append("highly detailed, professional cinematography")
+            parts.append("highly detailed, professional cinematography")
 
         return ". ".join(parts)
 
@@ -86,7 +97,11 @@ class MovieImageGenerator:
         script: Script,
         output_dir: Path,
         reference_image: Optional[Path] = None,
+        character_portraits: Optional[list[Path]] = None,
         progress_callback: Optional[Callable[[str, float], None]] = None,
+        model: Optional[str] = None,
+        image_size: Optional[str] = None,
+        aspect_ratio: Optional[str] = None,
     ) -> Optional[Path]:
         """Generate an image for a movie scene.
 
@@ -94,39 +109,75 @@ class MovieImageGenerator:
             scene: The scene to generate
             script: Full script for character lookup
             output_dir: Directory to save images
-            reference_image: Optional reference image for style consistency
+            reference_image: Optional reference image for style consistency (e.g., previous scene)
+            character_portraits: Optional list of character portrait paths for all visible characters
             progress_callback: Optional progress callback
+            model: Optional image model override (e.g., "gemini-3-pro-image-preview")
+            image_size: Optional image size override (e.g., "2K", "4K")
+            aspect_ratio: Optional aspect ratio override (e.g., "16:9", "1:1")
 
         Returns:
             Path to generated image, or None if failed
         """
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Determine if we have reference images (affects prompt building)
+        has_refs = bool(reference_image) or bool(character_portraits)
+
         # Use custom visual prompt if provided, otherwise build from scene data
         if scene.visual_prompt and scene.visual_prompt.strip():
             prompt = scene.visual_prompt
+            # If we have references, add preservation instruction
+            if has_refs:
+                prompt = prompt + ". PRESERVE room, furniture, and environment from reference image."
             logger.info(f"Using custom visual prompt for scene {scene.index}")
         else:
-            prompt = self.build_scene_prompt(scene, script)
+            prompt = self.build_scene_prompt(scene, script, has_reference_image=has_refs)
 
         if progress_callback:
             progress_callback(f"Generating image for scene {scene.index + 1}...", 0.0)
 
-        logger.info(f"Generating scene {scene.index}: {prompt[:100]}...")
+        logger.info(f"Generating scene {scene.index} (refs={has_refs}): {prompt[:100]}...")
 
-        # Generate the image
-        output_path = output_dir / f"scene_{scene.index:03d}.png"
+        # Generate the image with timestamp to create variants instead of overwriting
+        import time
+        timestamp = int(time.time())
+        output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.png"
 
         try:
-            result = self.image_generator.generate(
+            from PIL import Image as PILImage
+
+            # Load all character portraits as reference images
+            ref_images = []
+            if character_portraits:
+                for portrait_path in character_portraits:
+                    if portrait_path and portrait_path.exists():
+                        try:
+                            ref_images.append(PILImage.open(portrait_path))
+                            logger.info(f"Added character portrait: {portrait_path.name}")
+                        except Exception as e:
+                            logger.warning(f"Could not load portrait {portrait_path}: {e}")
+
+            # Add style reference image (e.g., previous scene) if provided
+            ref_img = None
+            if reference_image and reference_image.exists():
+                ref_img = PILImage.open(reference_image)
+
+            result = self.image_generator.generate_scene_image(
                 prompt=prompt,
+                style_prefix=script.visual_style or self.style,
+                visual_world=script.world_description,
+                reference_image=ref_img,
+                reference_images=ref_images if ref_images else None,
                 output_path=output_path,
-                reference_image=reference_image,
+                model=model,
+                image_size=image_size,
+                aspect_ratio=aspect_ratio or "16:9",
             )
 
-            if result and result.exists():
-                logger.info(f"Generated scene image: {result}")
-                return result
+            if result and output_path.exists():
+                logger.info(f"Generated scene image: {output_path}")
+                return output_path
             else:
                 logger.error(f"Failed to generate scene {scene.index}")
                 return None
