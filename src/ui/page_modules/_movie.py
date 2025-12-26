@@ -8276,14 +8276,30 @@ def _apply_music_tail(
     if music_only_path and music_only_path.exists():
         # We have a separate music-only track for the tail
         # Strategy:
-        # - Main video (0 to fade_start): use video audio (TTS + music)
-        # - Fade (fade_start to video_duration): crossfade video audio → music-only
-        # - Tail (video_duration to end): music-only, with volume swell + fade out
+        # - Main video (0 to video_duration): use video audio (TTS + music)
+        # - Tail (video_duration to end): music-only continuing from where it was, with volume swell + fade out
         inputs.extend(["-i", str(music_only_path)])
 
-        # Volume expression for music during fade and tail
+        # Get music duration to calculate where we are at video_duration
+        music_probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            str(music_only_path)
+        ]
+        try:
+            music_result = subprocess.run(music_probe_cmd, capture_output=True, text=True)
+            music_duration = float(music_result.stdout.strip())
+        except (ValueError, AttributeError):
+            music_duration = 180.0  # Fallback to 3 minutes
+
+        # Calculate where in the music we'd be at video_duration (accounting for looping)
+        # If music loops during video, we need to find the position within the loop
+        music_position_at_video_end = video_duration % music_duration if music_duration > 0 else 0
+
+        # Volume expression for music during tail
         if swell_factor > 1.0:
-            # Ramp up during fade, stay high, then fade out
+            # Ramp up at start of tail, stay high, then fade out
             music_vol_expr = (
                 f"if(lt(t,{video_fade_duration}),1+({swell_factor}-1)*t/{video_fade_duration},"
                 f"if(lt(t,{tail_duration - fade_out_duration}),{swell_factor},"
@@ -8298,17 +8314,20 @@ def _apply_music_tail(
 
         # Build audio filter chain:
         # 1. Take video audio up to video_duration
-        # 2. Take music and trim/loop for tail_duration, apply volume curve
+        # 2. Take music starting from where it would be at video_duration, trim for tail_duration
         # 3. Concat them
         filter_parts.append(
             f"[0:a]atrim=0:{video_duration},asetpts=PTS-STARTPTS[amain]"
         )
 
-        # Music for tail: loop if needed to cover tail_duration
-        music_loops = max(1, int(tail_duration / 60) + 2)  # Assume ~1min music, loop extra
+        # Music for tail: loop to ensure enough content, start from where video ended
+        # We need enough loops to cover: music_position_at_video_end + tail_duration
+        total_music_needed = music_position_at_video_end + tail_duration
+        music_loops = max(1, int(total_music_needed / music_duration) + 2)
+
         filter_parts.append(
             f"[1:a]aloop=loop={music_loops}:size=2147483647,"
-            f"atrim=0:{tail_duration},asetpts=PTS-STARTPTS,"
+            f"atrim=start={music_position_at_video_end}:duration={tail_duration},asetpts=PTS-STARTPTS,"
             f"volume='{music_vol_expr}':eval=frame[atail]"
         )
 
