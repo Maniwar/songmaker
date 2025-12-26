@@ -8253,11 +8253,18 @@ def _apply_music_tail(
     # Build the filter_complex
     filter_parts = []
 
-    # Video chain: fade to black, then pad with black color (not clone)
-    # tpad with color=black creates actual black frames
+    # Video chain: fade to black, then concatenate with black frames
+    # 1. Fade the original video to black
+    # 2. Generate black frames for the tail duration
+    # 3. Concat them together
     filter_parts.append(
-        f"[0:v]fade=t=out:st={fade_start}:d={video_fade_duration}:color=black,"
-        f"tpad=stop_mode=color:color=black:stop_duration={tail_duration}[vout]"
+        f"[0:v]fade=t=out:st={fade_start}:d={video_fade_duration}:color=black[vfaded]"
+    )
+    filter_parts.append(
+        f"color=c=black:s={width}x{height}:d={tail_duration}:r={fps}[vblack]"
+    )
+    filter_parts.append(
+        f"[vfaded][vblack]concat=n=2:v=1:a=0[vout]"
     )
 
     # Audio chain: loop to extend, apply volume curve, then fade out
