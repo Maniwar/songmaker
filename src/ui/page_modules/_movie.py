@@ -8166,13 +8166,14 @@ def _apply_music_tail(
     swell_factor: float = 1.0,
     fade_out_duration: float = 2.0,
     video_fade_duration: float = 1.0,
+    music_only_path: Optional[Path] = None,
 ) -> Path:
     """Apply music tail effect: fade video to black while music continues.
 
     This creates a cinematic ending where:
     1. Video fades to black over video_fade_duration
     2. Music volume optionally increases (swell) during the fade
-    3. Black screen continues for tail_duration
+    3. Black screen continues for tail_duration with ONLY background music
     4. Music fades out at the end
 
     Args:
@@ -8182,6 +8183,8 @@ def _apply_music_tail(
         swell_factor: Volume multiplier during fade (1.0 = no change, 2.0 = double)
         fade_out_duration: Duration of final audio fade out (seconds)
         video_fade_duration: Duration of video fade to black (seconds)
+        music_only_path: Optional path to background music only (for tail portion).
+                        If not provided, loops all video audio (including TTS).
 
     Returns:
         Path to the output video with music tail
@@ -8267,42 +8270,83 @@ def _apply_music_tail(
         f"[vfaded][vblack]concat=n=2:v=1:a=0[vout]"
     )
 
-    # Audio chain: loop to extend, apply volume curve, then fade out
-    # aloop loops the audio - we need enough loops to cover tail_duration
-    # Then trim to exact length
-    loops_needed = int((tail_duration / video_duration) + 2)  # Extra for safety
+    # Audio chain depends on whether we have a separate music-only track
+    inputs = ["-i", str(video_path)]
 
-    if swell_factor > 1.0:
-        # Volume expression: ramp up during video fade, stay high, then fade out
-        # - Before fade_start: volume = 1.0
-        # - During fade (fade_start to video_duration): ramp from 1.0 to swell_factor
-        # - During tail (video_duration to fade_out_start): stay at swell_factor
-        # - During final fade (fade_out_start to end): ramp down to 0
-        vol_expr = (
-            f"if(lt(t,{fade_start}),1,"
-            f"if(lt(t,{video_duration}),1+({swell_factor}-1)*(t-{fade_start})/{video_fade_duration},"
-            f"if(lt(t,{fade_out_start}),{swell_factor},"
-            f"{swell_factor}*(1-(t-{fade_out_start})/{fade_out_duration}))))"
-        )
+    if music_only_path and music_only_path.exists():
+        # We have a separate music-only track for the tail
+        # Strategy:
+        # - Main video (0 to fade_start): use video audio (TTS + music)
+        # - Fade (fade_start to video_duration): crossfade video audio → music-only
+        # - Tail (video_duration to end): music-only, with volume swell + fade out
+        inputs.extend(["-i", str(music_only_path)])
+
+        # Volume expression for music during fade and tail
+        if swell_factor > 1.0:
+            # Ramp up during fade, stay high, then fade out
+            music_vol_expr = (
+                f"if(lt(t,{video_fade_duration}),1+({swell_factor}-1)*t/{video_fade_duration},"
+                f"if(lt(t,{tail_duration - fade_out_duration}),{swell_factor},"
+                f"{swell_factor}*(1-(t-{tail_duration - fade_out_duration})/{fade_out_duration})))"
+            )
+        else:
+            # Just fade out at end
+            music_vol_expr = (
+                f"if(lt(t,{tail_duration - fade_out_duration}),1,"
+                f"1-(t-{tail_duration - fade_out_duration})/{fade_out_duration})"
+            )
+
+        # Build audio filter chain:
+        # 1. Take video audio up to video_duration
+        # 2. Take music and trim/loop for tail_duration, apply volume curve
+        # 3. Concat them
         filter_parts.append(
-            f"[0:a]aloop=loop={loops_needed}:size=2147483647,"
-            f"atrim=0:{total_duration},"
-            f"volume='{vol_expr}':eval=frame[aout]"
+            f"[0:a]atrim=0:{video_duration},asetpts=PTS-STARTPTS[amain]"
+        )
+
+        # Music for tail: loop if needed to cover tail_duration
+        music_loops = max(1, int(tail_duration / 60) + 2)  # Assume ~1min music, loop extra
+        filter_parts.append(
+            f"[1:a]aloop=loop={music_loops}:size=2147483647,"
+            f"atrim=0:{tail_duration},asetpts=PTS-STARTPTS,"
+            f"volume='{music_vol_expr}':eval=frame[atail]"
+        )
+
+        # Concat main audio and tail
+        filter_parts.append(
+            f"[amain][atail]concat=n=2:v=0:a=1[aout]"
         )
     else:
-        # No swell, just loop, trim, and fade out at end
-        filter_parts.append(
-            f"[0:a]aloop=loop={loops_needed}:size=2147483647,"
-            f"atrim=0:{total_duration},"
-            f"afade=t=out:st={fade_out_start}:d={fade_out_duration}[aout]"
-        )
+        # No separate music track - loop all audio (original behavior)
+        loops_needed = int((tail_duration / video_duration) + 2)  # Extra for safety
+
+        if swell_factor > 1.0:
+            # Volume expression: ramp up during video fade, stay high, then fade out
+            vol_expr = (
+                f"if(lt(t,{fade_start}),1,"
+                f"if(lt(t,{video_duration}),1+({swell_factor}-1)*(t-{fade_start})/{video_fade_duration},"
+                f"if(lt(t,{fade_out_start}),{swell_factor},"
+                f"{swell_factor}*(1-(t-{fade_out_start})/{fade_out_duration}))))"
+            )
+            filter_parts.append(
+                f"[0:a]aloop=loop={loops_needed}:size=2147483647,"
+                f"atrim=0:{total_duration},"
+                f"volume='{vol_expr}':eval=frame[aout]"
+            )
+        else:
+            # No swell, just loop, trim, and fade out at end
+            filter_parts.append(
+                f"[0:a]aloop=loop={loops_needed}:size=2147483647,"
+                f"atrim=0:{total_duration},"
+                f"afade=t=out:st={fade_out_start}:d={fade_out_duration}[aout]"
+            )
 
     filter_complex = ";".join(filter_parts)
 
     # Run FFmpeg with filter_complex
     cmd = [
         "ffmpeg", "-y",
-        "-i", str(video_path),
+        *inputs,
         "-filter_complex", filter_complex,
         "-map", "[vout]",
         "-map", "[aout]",
@@ -9224,6 +9268,10 @@ def render_render_page() -> None:
             if track.file_path and Path(track.file_path).exists()
         ]
 
+        # Track music-only path for the music tail feature
+        # This will be set to the background music (without TTS) if available
+        music_only_for_tail: Optional[Path] = None
+
         # Resolution mapping
         res_map = {
             "1080p": (1920, 1080),
@@ -9493,7 +9541,16 @@ def render_render_page() -> None:
                     status_text.text(f"Mixing {len(audio_tracks_to_mix)} audio track(s) with dialogue...")
                     progress_bar.progress(0.65, text="Mixing audio tracks...")
 
-                    # Build FFmpeg filter for multi-track mixing
+                    # First create a music-only mix for the tail feature
+                    music_only_for_tail = output_dir / f"music_only_{timestamp}.mp3"
+                    _mix_audio_tracks(
+                        base_audio_path=None,  # No TTS - music only
+                        tracks=audio_tracks_to_mix,
+                        output_path=music_only_for_tail,
+                        video_duration=video_duration,
+                    )
+
+                    # Then mix TTS + music for the main video
                     mixed_audio_path = output_dir / f"mixed_audio_{timestamp}.mp3"
                     master_audio_path = _mix_audio_tracks(
                         base_audio_path=master_audio_path,
@@ -9527,16 +9584,18 @@ def render_render_page() -> None:
                     status_text.text(f"Adding {len(audio_tracks_to_mix)} audio track(s) to video...")
                     progress_bar.progress(0.65, text="Adding audio tracks...")
 
-                    if keep_video_audio:
-                        # First mix all tracks together, then mix with video audio
-                        tracks_audio_path = output_dir / f"tracks_mixed_{timestamp}.mp3"
-                        _mix_audio_tracks(
-                            base_audio_path=None,  # No base audio
-                            tracks=audio_tracks_to_mix,
-                            output_path=tracks_audio_path,
-                            video_duration=video_duration,
-                        )
+                    # Mix all audio tracks (this IS the music-only version for tail)
+                    tracks_audio_path = output_dir / f"tracks_mixed_{timestamp}.mp3"
+                    _mix_audio_tracks(
+                        base_audio_path=None,  # No base audio
+                        tracks=audio_tracks_to_mix,
+                        output_path=tracks_audio_path,
+                        video_duration=video_duration,
+                    )
+                    # This is music-only, save for tail
+                    music_only_for_tail = tracks_audio_path
 
+                    if keep_video_audio:
                         # Mix tracks audio with video audio
                         combine_cmd = [
                             "ffmpeg", "-y",
@@ -9554,14 +9613,6 @@ def render_render_page() -> None:
                         ]
                     else:
                         # Use only audio tracks (no video audio)
-                        tracks_audio_path = output_dir / f"tracks_mixed_{timestamp}.mp3"
-                        _mix_audio_tracks(
-                            base_audio_path=None,
-                            tracks=audio_tracks_to_mix,
-                            output_path=tracks_audio_path,
-                            video_duration=video_duration,
-                        )
-
                         combine_cmd = [
                             "ffmpeg", "-y",
                             "-i", str(video_only_path),
@@ -9604,6 +9655,7 @@ def render_render_page() -> None:
                         swell_factor=state.music_tail_swell,
                         fade_out_duration=state.music_tail_fade_out,
                         video_fade_duration=1.0,  # 1 second fade to black
+                        music_only_path=music_only_for_tail,  # Use just the music for the tail
                     )
 
                     # Replace final_output with the tail version
