@@ -4176,19 +4176,47 @@ def _regenerate_scene_prompt(
 
     # Use per-scene generation model if set, otherwise fall back to global config
     scene_gen_model = getattr(scene, 'generation_model', None)
+    is_seedance_fast = False  # Track if using Seedance Fast vs Pro
+    is_wan_t2v = False  # Track if using WAN Text-to-Video (no input image)
+    is_wan_fast = False  # Track if using WAN 2.5 Fast
     if scene_gen_model:
         # Map scene model to gen_method format
         if scene_gen_model == "veo3":
             gen_method = "veo3"
         elif "wan" in scene_gen_model.lower():
-            gen_method = "wan26"  # Triggers concise I2V prompts
+            gen_method = "wan26"  # Triggers WAN-specific prompts
+            is_wan_t2v = "t2v" in scene_gen_model.lower()
+            is_wan_fast = "fast" in scene_gen_model.lower()
         elif "seedance" in scene_gen_model.lower():
-            gen_method = "seedance"  # Triggers concise I2V prompts
+            gen_method = "seedance"  # Triggers Seedance-specific prompts
+            is_seedance_fast = "fast" in scene_gen_model.lower()
         else:
             gen_method = scene_gen_model
-        logger.info(f"Using per-scene model for prompt generation: {scene_gen_model} -> {gen_method}")
+        logger.info(f"Using per-scene model for prompt generation: {scene_gen_model} -> {gen_method} (is_seedance_fast={is_seedance_fast}, is_wan_t2v={is_wan_t2v}, is_wan_fast={is_wan_fast})")
+        # Show detected model to user
+        if "seedance" in gen_method:
+            model_display = "Seedance Fast" if is_seedance_fast else "Seedance 1.5 Pro"
+        elif "wan" in gen_method:
+            model_display = "WAN 2.6 T2V" if is_wan_t2v else ("WAN 2.5 Fast" if is_wan_fast else "WAN 2.6 I2V")
+        else:
+            model_display = gen_method
+        st.toast(f"🎬 Generating prompt for: {model_display}", icon="🎯")
     else:
         gen_method = state.config.generation_method if state.config else "veo3"
+        if gen_method and "seedance" in gen_method.lower():
+            is_seedance_fast = "fast" in gen_method.lower()
+        if gen_method and "wan" in gen_method.lower():
+            is_wan_t2v = "t2v" in gen_method.lower()
+            is_wan_fast = "fast" in gen_method.lower()
+        logger.info(f"Using global config for prompt generation: {gen_method} (is_seedance_fast={is_seedance_fast}, is_wan_t2v={is_wan_t2v}, is_wan_fast={is_wan_fast})")
+        # Show detected model to user
+        if gen_method and "seedance" in gen_method.lower():
+            model_display = "Seedance Fast" if is_seedance_fast else "Seedance 1.5 Pro"
+        elif gen_method and "wan" in gen_method.lower():
+            model_display = "WAN 2.6 T2V" if is_wan_t2v else ("WAN 2.5 Fast" if is_wan_fast else "WAN 2.6 I2V")
+        else:
+            model_display = gen_method if gen_method else "default"
+        st.toast(f"🎬 Generating prompt for: {model_display} (project default)", icon="📁")
 
     # Build dialogue context
     dialogue_lines = []
@@ -4353,36 +4381,81 @@ Generate an image prompt in {visual_style} style. Start with the style, then des
 - Include emotion cues in parentheses
 - Example: 'Sarah (curious) leans forward and says "I never expected this." Her expression shifts to surprise.'"""
             elif "seedance" in gen_method:
-                format_guidance = """Format for Seedance 1.5 Pro (image-to-video with lip-sync) - PHOTOREALISTIC:
+                seedance_model_name = "Seedance Fast" if is_seedance_fast else "Seedance 1.5 Pro"
+                format_guidance = f"""Format for {seedance_model_name} (image-to-video with lip-sync) - MULTI-SHOT CINEMATIC:
 
 CRITICAL I2V RULES:
 1. PHOTOREALISTIC - output must match source image exactly, NO CGI look
 2. NO STYLE DESCRIPTION - style is in the image
-3. MAX 40 WORDS total - shorter = more faithful
+3. MAX 50 WORDS total - shorter = more faithful
 4. Reference "the person in the image"
-5. Focus on: lip movements, subtle expressions ONLY
-6. Dialogue: speaks: "line"
-7. ALWAYS END WITH: "Photorealistic. Camera locked. Preserve exact appearance."
+5. Focus on: lip movements, subtle expressions, natural dialogue delivery
+6. Dialogue format: speaks: "line"
+7. MULTI-SHOT CAMERA: Include cinematic variety - "camera work transitions from wide to medium to close-up"
+8. ALWAYS END WITH: "Photorealistic. Preserve exact appearance."
 
 GOOD EXAMPLE:
-"The person in the image speaks to camera: 'I've been waiting for this moment.' Subtle expression. Photorealistic. Camera locked. Preserve exact appearance."
+"The person in the image speaks: 'I've been waiting for this moment.' Subtle expression shifts. Camera work: wide establishing shot, transitions to medium shot, pushes in to close-up on emotional beats. Photorealistic. Preserve exact appearance."
 """
-            else:  # wan26
-                format_guidance = """Format for WAN 2.6 (image-to-video) - CINEMATIC PHOTOREALISTIC:
+            else:  # wan26 (I2V, T2V, or Fast)
+                # Determine WAN model variant name
+                if is_wan_t2v:
+                    wan_model_name = "WAN 2.6 T2V (Text-to-Video)"
+                elif is_wan_fast:
+                    wan_model_name = "WAN 2.5 Fast"
+                else:
+                    wan_model_name = "WAN 2.6 I2V (Image-to-Video)"
 
-PROMPT STRUCTURE: Dialogue + Motion + Camera + Lighting + Style
+                # Different rules for T2V (no input image) vs I2V (has input image)
+                if is_wan_t2v:
+                    format_guidance = f"""Format for {wan_model_name} - MULTI-SHOT CINEMATIC:
+
+WAN 2.6 T2V generates video from TEXT ONLY (no input image).
+You MUST fully describe characters, setting, and appearance in the prompt.
+
+PROMPT STRUCTURE (shot breakdown format):
+Wide establishing shot: [setting description, character appearance, positioning]
+Medium shot: [character interaction, dialogue, body language]
+Close-up: [emotional expressions, reactions, facial details]
 
 RULES:
-1. DIALOGUE: If provided, include ALL lines using: [Character] speaks: "line"
-2. MOTION: Use concrete verbs (sway, glide, tilt, blink) with speed adverbs (gently, slowly)
-3. CAMERA: Film terminology (slow dolly in, static shot, gentle pan right)
-4. LIGHTING: Cinematic descriptors (soft key light, warm rim, natural lighting)
-5. STYLE: "Cinematic, photorealistic, natural skin texture, true-to-life"
-6. END WITH: "Preserve identity, maintain appearance"
-7. Keep total under 80 words
+1. DESCRIBE CHARACTERS FULLY: Include appearance, clothing, hair, build
+2. DIALOGUE: Include ALL lines using: [Character] speaks: "line"
+3. MOTION: Use concrete verbs with speed adverbs (gently sways, slowly tilts)
+4. MULTI-SHOT: Provide descriptions for wide/medium/close-up angles
+5. STYLE: "Cinematic, photorealistic, natural skin texture"
+6. Keep total under 120 words
 
 EXAMPLE PROMPT:
-"Marcus speaks: 'I've been waiting for this moment.' Gentle eye movement, subtle expression shift. Slow dolly in, steady. Soft key light with warm rim. Cinematic, photorealistic, natural skin texture. Preserve identity, maintain appearance."
+"Wide shot: Marcus, a 30-year-old man with short dark hair and stubble, wearing a navy sweater, sits in a warm-lit living room.
+Medium shot: Marcus speaks: 'I've been waiting for this moment.' Natural body language, gentle eye movement.
+Close-up: His expression shifts from anticipation to understanding, subtle facial movements.
+Cinematic, photorealistic, natural skin texture."
+"""
+                else:
+                    format_guidance = f"""Format for {wan_model_name} - MULTI-SHOT CINEMATIC:
+
+WAN 2.6 I2V uses MULTI-SHOT mode by default, generating varied camera angles for cinematic storytelling.
+The input image shows the character - reference them as "the person in the image".
+
+PROMPT STRUCTURE (shot breakdown format):
+Wide establishing shot: [main action/setting description]
+Medium shot: [character interaction, dialogue, body language]
+Close-up: [emotional expressions, reactions, facial movements]
+
+RULES:
+1. DIALOGUE: Include ALL lines using: [Character] speaks: "line"
+2. MOTION: Use concrete verbs with speed adverbs (gently sways, slowly tilts)
+3. MULTI-SHOT: Provide descriptions for wide/medium/close-up angles
+4. STYLE: "Cinematic, photorealistic, natural skin texture"
+5. END WITH: "Preserve identity, maintain appearance"
+6. Keep total under 100 words
+
+EXAMPLE PROMPT:
+"Wide shot: The person in the image in a warm-lit living room, soft key light.
+Medium shot: They speak: 'I've been waiting for this moment.' Natural body language, gentle eye movement.
+Close-up: Expression shifts from anticipation to understanding, subtle facial movements.
+Cinematic, photorealistic, natural skin texture. Preserve identity, maintain appearance."
 """
 
             # Different system prompts for different video models
@@ -4403,25 +4476,50 @@ RULES:
 
 Respond with ONLY the video prompt text, no JSON or explanations."""
             else:
-                # WAN 2.6 and Seedance - cinematic I2V prompts with style reinforcement
-                system_prompt = f"""You create CINEMATIC image-to-video prompts for WAN 2.6. OUTPUT MUST BE PHOTOREALISTIC.
+                # WAN 2.6 and Seedance - MULTI-SHOT cinematic prompts
+                if "seedance" in gen_method:
+                    model_name = "Seedance Fast" if is_seedance_fast else "Seedance 1.5 Pro"
+                    prompt_type_desc = "image-to-video"
+                else:
+                    # WAN variant names
+                    if is_wan_t2v:
+                        model_name = "WAN 2.6 T2V"
+                        prompt_type_desc = "text-to-video"
+                    elif is_wan_fast:
+                        model_name = "WAN 2.5 Fast"
+                        prompt_type_desc = "image-to-video"
+                    else:
+                        model_name = "WAN 2.6 I2V"
+                        prompt_type_desc = "image-to-video"
+
+                # Adjust rules based on T2V vs I2V
+                if is_wan_t2v:
+                    identity_rule = "DESCRIBE CHARACTERS: Include full physical description (appearance, clothing, hair)"
+                    max_words = 120
+                else:
+                    identity_rule = "END WITH: \"Preserve identity, maintain appearance\""
+                    max_words = 100
+
+                system_prompt = f"""You create MULTI-SHOT CINEMATIC {prompt_type_desc} prompts for {model_name}. OUTPUT MUST BE PHOTOREALISTIC.
 
 {format_guidance}
 {image_context}
 
-PROMPT STRUCTURE (follow this order):
-1. DIALOGUE (if provided): MUST include ALL lines using format: [Character] speaks: "exact line"
-2. MOTION: What moves? Use concrete verbs + speed adverbs (gently sways, slowly tilts)
-3. CAMERA: Film terminology (slow dolly in, static shot, gentle pan)
-4. LIGHTING: Cinematic descriptors (soft key light, warm rim, natural lighting)
-5. STYLE: "Cinematic, photorealistic, natural skin texture, true-to-life"
-6. END WITH: "Preserve identity, maintain appearance"
+MULTI-SHOT MODE (DEFAULT):
+The video will use multiple camera angles for cinematic variety:
+- Wide establishing shot → Medium shot → Close-up
+- The AI chooses when to transition between angles
+
+YOUR PROMPT SHOULD:
+1. DIALOGUE (CRITICAL): Include ALL dialogue lines using format: [Character] speaks: "exact line"
+2. SHOT BREAKDOWN: Describe what happens at each camera angle (wide/medium/close-up)
+3. MOTION: Concrete verbs + speed adverbs (gently sways, slowly tilts)
+4. {identity_rule}
 
 RULES:
-- CRITICAL: If dialogue is provided, include ALL lines verbatim - do not skip any!
-- Format: [Character name] speaks: "their exact line"
-- MAX 80 words - dialogue takes priority over other elements
-- One primary motion + optional secondary (e.g., "hair sways, jacket flutters")
+- If dialogue provided, include ALL lines - do not skip!
+- Use shot breakdown format: "Wide shot: ... Medium shot: ... Close-up: ..."
+- MAX {max_words} words - dialogue takes priority
 
 Output ONLY the prompt."""
 
@@ -4445,43 +4543,55 @@ Generate a video animation prompt that:
 3. Describes character movements and expressions
 4. Flows naturally from the scene image"""
             else:
-                # WAN 2.6 / Seedance - cinematic I2V with all elements
+                # WAN 2.6 / Seedance - MULTI-SHOT cinematic prompts with all elements
                 # Include ALL dialogue lines for the scene
                 all_dialogue = dialogue_lines if dialogue_lines else []
                 dialogue_text = "\n".join(all_dialogue) if all_dialogue else None
+                if "seedance" in gen_method:
+                    model_label = "Seedance Fast" if is_seedance_fast else "Seedance 1.5 Pro"
+                else:
+                    # WAN variant labels
+                    if is_wan_t2v:
+                        model_label = "WAN 2.6 T2V"
+                    elif is_wan_fast:
+                        model_label = "WAN 2.5 Fast"
+                    else:
+                        model_label = "WAN 2.6 I2V"
 
-                # Build user prompt with emphasis on dialogue
+                # Build user prompt with emphasis on dialogue and MULTI-SHOT format
                 if dialogue_text:
-                    user_prompt = f"""Create a CINEMATIC I2V prompt for WAN 2.6. MAX 80 WORDS.
+                    user_prompt = f"""Create a MULTI-SHOT CINEMATIC I2V prompt for {model_label}. MAX 100 WORDS.
 
 **DIALOGUE (MUST INCLUDE ALL LINES):**
 {dialogue_text}
 
 Scene mood: {scene.direction.mood}
-Camera: {scene.direction.camera}
+Setting: {scene.direction.setting}
 
-STRUCTURE YOUR PROMPT AS:
-1. DIALOGUE: Include ALL dialogue lines above using format: Character speaks: "line"
-2. Motion (subtle movement while speaking - gentle head movement, expression)
-3. Camera (slow dolly in, static shot, gentle pan)
-4. Lighting + Style: "Cinematic, photorealistic, natural skin texture, true-to-life"
-5. End with: "Preserve identity, maintain appearance"
+USE MULTI-SHOT FORMAT:
+Wide shot: [establishing - setting, character position, lighting]
+Medium shot: [dialogue, body language] - Include ALL dialogue here as: Character speaks: "line"
+Close-up: [emotional reactions, facial expressions]
 
-CRITICAL: Include ALL dialogue lines verbatim. Format each as: [Character] speaks: "line"
+End with: "Cinematic, photorealistic. Preserve identity, maintain appearance."
+
+CRITICAL: Include ALL dialogue lines verbatim using format: [Character] speaks: "line"
 
 Output ONLY the prompt text."""
                 else:
-                    user_prompt = f"""Create a CINEMATIC I2V prompt for WAN 2.6. MAX 60 WORDS.
+                    user_prompt = f"""Create a MULTI-SHOT CINEMATIC I2V prompt for {model_label}. MAX 80 WORDS.
 
 Scene mood: {scene.direction.mood}
-Camera: {scene.direction.camera}
+Setting: {scene.direction.setting}
 (No dialogue in this scene)
 
-STRUCTURE YOUR PROMPT AS:
-1. Motion (what the person does - use verbs like sway, tilt, blink)
-2. Camera (slow dolly in, static shot, gentle pan)
-3. Lighting + Style: "Cinematic, photorealistic, natural skin texture, true-to-life"
-4. End with: "Preserve identity, maintain appearance"
+USE MULTI-SHOT FORMAT:
+Wide shot: [establishing - setting, atmosphere]
+Medium shot: [character action, body language]
+Close-up: [emotional expressions, subtle movements]
+
+Include motion verbs (sway, tilt, blink) with speed adverbs (gently, slowly).
+End with: "Cinematic, photorealistic. Preserve identity, maintain appearance."
 
 Output ONLY the prompt text."""
 
@@ -5326,11 +5436,16 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
     with prompt_col2:
         st.markdown("**Video Animation Prompt**")
         current_video_prompt = getattr(scene, 'video_prompt', None) or ""
+
+        # Use version-based key to force widget refresh after regeneration
+        vid_prompt_version = st.session_state.get(f"edit_video_prompt_version_{scene.index}", 0)
+        vid_prompt_key = f"edit_video_prompt_{scene.index}_v{vid_prompt_version}"
+
         new_video_prompt = st.text_area(
             "Video Prompt",
             value=current_video_prompt,
             height=100,
-            key=f"edit_video_prompt_{scene.index}",
+            key=vid_prompt_key,
             placeholder="Describe character movements, actions, dialogue in quotes...",
             label_visibility="collapsed",
         )
@@ -5371,6 +5486,8 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
                     except Exception:
                         object.__setattr__(scene, 'video_prompt', new_prompt)
                     save_movie_state()
+                    # Increment version to force widget to refresh with new value
+                    st.session_state[f"edit_video_prompt_version_{scene.index}"] = vid_prompt_version + 1
                     st.success("Video prompt generated!")
                     st.rerun()
 
@@ -5404,6 +5521,7 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
         if new_model != current_model:
             scene.generation_model = new_model
             st.session_state.scenes_dirty = True
+            save_movie_state()  # Persist the model change
 
         # Determine effective model for duration/resolution options
         effective_model = new_model or project_gen_method
