@@ -4266,6 +4266,46 @@ Be specific and concise. Focus on actionable details for video animation."""
             logger.warning(f"Failed to analyze scene image: {e}")
             image_context = ""
 
+    # Camera continuity context (for video prompts with cinematography plan)
+    camera_continuity_context = ""
+    if prompt_type == "video" and hasattr(state, 'cinematography_plan') and state.cinematography_plan:
+        try:
+            from src.services.cinematography import build_camera_continuity_context
+
+            # Get current scene's camera context from plan
+            current_ctx = next(
+                (c for c in state.cinematography_plan.scenes if c.scene_index == scene.index),
+                None
+            )
+
+            # Get previous scene and its camera context
+            prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
+            prev_ctx = next(
+                (c for c in state.cinematography_plan.scenes if c.scene_index == scene.index - 1),
+                None
+            ) if prev_scene else None
+
+            # Get next scene for transition awareness
+            next_scene = next((s for s in script.scenes if s.index == scene.index + 1), None)
+
+            # Get camera override if set by user
+            camera_override = getattr(scene, 'camera_override', None)
+
+            if current_ctx:
+                camera_continuity_context = build_camera_continuity_context(
+                    current_scene=scene,
+                    previous_scene=prev_scene,
+                    next_scene=next_scene,
+                    camera_context=current_ctx,
+                    previous_camera_context=prev_ctx,
+                    camera_override=camera_override,
+                    is_multi_shot=True,  # Default to multi-shot for cinematic feel
+                )
+                logger.info(f"Scene {scene.index} camera context: {current_ctx.camera_angle.value} ({current_ctx.narrative_role})")
+        except Exception as e:
+            logger.warning(f"Failed to build camera continuity context: {e}")
+            camera_continuity_context = ""
+
     try:
         from anthropic import Anthropic
         from src.config import config
@@ -4467,12 +4507,14 @@ REQUIRED Visual Style: {visual_style}
 
 {format_guidance}
 {image_context}
+{camera_continuity_context}
 
 RULES:
 1. START with: "VISUAL STYLE: {visual_style}."
 2. Include ALL dialogue in quotes with character names and emotions
 3. Describe character actions, expressions, and movements
 4. Characters are already positioned in scene - describe how they move
+5. FOLLOW the camera continuity guidance above for professional cinematography
 
 Respond with ONLY the video prompt text, no JSON or explanations."""
             else:
@@ -4504,17 +4546,18 @@ Respond with ONLY the video prompt text, no JSON or explanations."""
 
 {format_guidance}
 {image_context}
+{camera_continuity_context}
 
 MULTI-SHOT MODE (DEFAULT):
-The video will use multiple camera angles for cinematic variety:
-- Wide establishing shot → Medium shot → Close-up
-- The AI chooses when to transition between angles
+The video will use multiple camera angles for cinematic variety.
+FOLLOW the camera continuity guidance above for scene-to-scene flow.
 
 YOUR PROMPT SHOULD:
 1. DIALOGUE (CRITICAL): Include ALL dialogue lines using format: [Character] speaks: "exact line"
-2. SHOT BREAKDOWN: Describe what happens at each camera angle (wide/medium/close-up)
+2. SHOT BREAKDOWN: Start with the planned camera angle, progress through the shot sequence
 3. MOTION: Concrete verbs + speed adverbs (gently sways, slowly tilts)
 4. {identity_rule}
+5. CAMERA CONTINUITY: Follow the planned camera angle and transitions for professional cinematography
 
 RULES:
 - If dialogue provided, include ALL lines - do not skip!
@@ -5552,6 +5595,97 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
                 st.session_state.scenes_dirty = True
                 save_movie_state()
 
+        # Camera angle override (from cinematography plan)
+        state = get_movie_state()
+        if hasattr(state, 'cinematography_plan') and state.cinematography_plan:
+            # Get planned camera for this scene
+            planned_ctx = next(
+                (c for c in state.cinematography_plan.scenes if c.scene_index == scene.index),
+                None
+            )
+            planned_camera = planned_ctx.camera_angle.value if planned_ctx else "medium_shot"
+            planned_display = planned_camera.replace("_", " ").title()
+
+            camera_options = {
+                None: f"Auto ({planned_display})",
+                "wide_shot": "Wide Shot",
+                "medium_shot": "Medium Shot",
+                "close_up": "Close-up",
+                "over_shoulder": "Over-the-shoulder",
+                "two_shot": "Two Shot",
+                "extreme_close": "Extreme Close-up",
+            }
+            current_camera = getattr(scene, 'camera_override', None)
+            camera_keys = list(camera_options.keys())
+            camera_idx = camera_keys.index(current_camera) if current_camera in camera_keys else 0
+            new_camera = st.selectbox(
+                "Camera Angle",
+                options=camera_keys,
+                index=camera_idx,
+                format_func=lambda x: camera_options.get(x, str(x)),
+                key=f"edit_camera_{scene.index}",
+                help="Override the auto-planned camera angle for this scene"
+            )
+            if new_camera != current_camera:
+                try:
+                    scene.camera_override = new_camera
+                except Exception:
+                    object.__setattr__(scene, 'camera_override', new_camera)
+                st.session_state.scenes_dirty = True
+                save_movie_state()
+
+        # Transition override controls (for context-aware rendering)
+        trans_col1, trans_col2 = st.columns(2)
+        with trans_col1:
+            transition_options = {
+                None: "Auto (context-aware)",
+                "none": "Hard Cut",
+                "crossfade": "Crossfade",
+                "fade": "Fade to Black",
+                "dissolve": "Dissolve",
+            }
+            current_trans = getattr(scene, 'transition_override', None)
+            trans_keys = list(transition_options.keys())
+            trans_idx = trans_keys.index(current_trans) if current_trans in trans_keys else 0
+            new_trans = st.selectbox(
+                "Transition (after scene)",
+                options=trans_keys,
+                index=trans_idx,
+                format_func=lambda x: transition_options.get(x, str(x)),
+                key=f"edit_transition_{scene.index}",
+                help="Override the transition effect after this scene"
+            )
+            if new_trans != current_trans:
+                try:
+                    scene.transition_override = new_trans
+                except Exception:
+                    object.__setattr__(scene, 'transition_override', new_trans)
+                st.session_state.scenes_dirty = True
+                save_movie_state()
+
+        with trans_col2:
+            current_trans_dur = getattr(scene, 'transition_duration_override', None)
+            new_trans_dur = st.number_input(
+                "Transition Duration (s)",
+                min_value=0.1,
+                max_value=2.0,
+                value=current_trans_dur if current_trans_dur else 0.5,
+                step=0.1,
+                key=f"edit_trans_dur_{scene.index}",
+                help="Override transition duration (only used if transition type is set)",
+                disabled=(new_trans is None)  # Disable if using auto
+            )
+            # Only save if not auto and value changed
+            if new_trans is not None:
+                effective_dur = new_trans_dur if new_trans is not None else None
+                if effective_dur != current_trans_dur:
+                    try:
+                        scene.transition_duration_override = effective_dur
+                    except Exception:
+                        object.__setattr__(scene, 'transition_duration_override', effective_dur)
+                    st.session_state.scenes_dirty = True
+                    save_movie_state()
+
         v_col1, v_col2, v_col3 = st.columns(3)
 
         with v_col1:
@@ -6122,6 +6256,25 @@ def render_visuals_page() -> None:
     project_config = state.config
     generation_method = project_config.generation_method if project_config else "tts_images"
 
+    # Auto-generate cinematography plan if not exists or stale
+    if generation_method != "tts_images" and state.script.scenes:
+        plan_needed = False
+        if not hasattr(state, 'cinematography_plan') or state.cinematography_plan is None:
+            plan_needed = True
+        elif len(state.cinematography_plan.scenes) != len(state.script.scenes):
+            plan_needed = True
+
+        if plan_needed:
+            try:
+                from src.services.cinematography import generate_cinematography_plan
+                from src.models.schemas import CinematographyPlan
+                plan = generate_cinematography_plan(state.script.scenes)
+                state.cinematography_plan = plan
+                save_movie_state()
+                logger.info(f"Auto-generated cinematography plan for {len(plan.scenes)} scenes")
+            except Exception as e:
+                logger.warning(f"Failed to auto-generate cinematography plan: {e}")
+
     st.subheader("Generate Scene Videos")
 
     # Model info based on generation method
@@ -6245,6 +6398,52 @@ def render_visuals_page() -> None:
             value=False,
             help=v2v_help.get(generation_method, "Use previous scene's video for continuity"),
         )
+
+    # Cinematography Planning section
+    if generation_method != "tts_images":
+        with st.expander("🎬 Cinematography Planning", expanded=False):
+            st.markdown("**Camera continuity** ensures natural shot flow between scenes.")
+
+            # Show enable/disable toggle
+            enable_continuity = st.checkbox(
+                "Enable context-aware camera work",
+                value=getattr(state, 'enable_camera_continuity', True),
+                help="Automatically plan camera angles that flow naturally between scenes",
+                key="enable_camera_continuity_checkbox"
+            )
+            if enable_continuity != getattr(state, 'enable_camera_continuity', True):
+                state.enable_camera_continuity = enable_continuity
+                save_movie_state()
+
+            if enable_continuity and hasattr(state, 'cinematography_plan') and state.cinematography_plan:
+                # Show current plan summary
+                plan = state.cinematography_plan
+                st.caption(f"📷 Camera plan generated: {len(plan.scenes)} scenes ({plan.pacing} pacing)")
+
+                # Show camera angles in a compact grid
+                cam_cols = st.columns(min(6, len(plan.scenes)))
+                for i, ctx in enumerate(plan.scenes[:6]):  # Show first 6
+                    with cam_cols[i % len(cam_cols)]:
+                        camera_display = ctx.camera_angle.value.replace("_", " ").title()
+                        role_icon = {"opening": "🎬", "climax": "🔥", "resolution": "🌅"}.get(ctx.narrative_role, "📷")
+                        st.metric(f"S{ctx.scene_index + 1}", f"{role_icon}", camera_display)
+
+                if len(plan.scenes) > 6:
+                    st.caption(f"... and {len(plan.scenes) - 6} more scenes")
+
+                # Regenerate button
+                if st.button("🔄 Regenerate Camera Plan", key="regen_camera_plan"):
+                    try:
+                        from src.services.cinematography import generate_cinematography_plan
+                        plan = generate_cinematography_plan(state.script.scenes)
+                        state.cinematography_plan = plan
+                        save_movie_state()
+                        st.success(f"Regenerated camera plan for {len(plan.scenes)} scenes!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to regenerate plan: {e}")
+            elif enable_continuity:
+                st.info("Camera plan will be generated automatically when you regenerate video prompts.")
 
     # Scene list with per-scene settings
     st.markdown("### Scenes to Generate")
@@ -7604,12 +7803,46 @@ def _render_traditional_generation(state) -> None:
             st.error(f"Image generation failed: {e}")
 
 
+def _get_encoding_params(quality: str) -> dict:
+    """Get encoding parameters based on quality preset.
+
+    Args:
+        quality: One of "draft", "standard", "professional"
+
+    Returns:
+        Dictionary with preset, crf, and audio_bitrate settings
+    """
+    presets = {
+        "draft": {
+            "preset": "ultrafast",
+            "crf": 23,
+            "audio_bitrate": "128k",
+            "description": "Fast preview (lower quality)"
+        },
+        "standard": {
+            "preset": "fast",
+            "crf": 18,
+            "audio_bitrate": "192k",
+            "description": "Good balance of quality and speed"
+        },
+        "professional": {
+            "preset": "slow",
+            "crf": 15,
+            "audio_bitrate": "320k",
+            "description": "Best quality (slower encoding)"
+        },
+    }
+    return presets.get(quality, presets["standard"])
+
+
 def _concatenate_with_transitions(
     clip_paths: list[Path],
     output_path: Path,
     transition_type: Optional[str] = None,
     transition_duration: float = 0.5,
     keep_audio: bool = True,
+    quality: str = "standard",
+    normalize_audio: bool = False,
 ) -> bool:
     """Concatenate video clips with optional transitions and audio preservation.
 
@@ -7619,6 +7852,8 @@ def _concatenate_with_transitions(
         transition_type: None for hard cut, "xfade" for crossfade, "fade" for fade to black
         transition_duration: Duration of transition in seconds
         keep_audio: If True, preserve audio from video clips
+        quality: Quality preset - "draft", "standard", or "professional"
+        normalize_audio: If True, apply loudnorm filter to normalize audio levels
 
     Returns:
         True if successful, False otherwise
@@ -7635,6 +7870,9 @@ def _concatenate_with_transitions(
         shutil.copy(clip_paths[0], output_path)
         return True
 
+    # Get encoding parameters based on quality
+    enc_params = _get_encoding_params(quality)
+
     try:
         # Create a concat file for FFmpeg
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
@@ -7644,16 +7882,31 @@ def _concatenate_with_transitions(
 
         if transition_type is None or transition_duration <= 0:
             # Simple concatenation without transitions
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", concat_file,
-            ]
+            # Use filter_complex with concat filter instead of demuxer for better first-frame handling
+            inputs_cmd = []
+            for clip in clip_paths:
+                inputs_cmd.extend(["-i", str(clip)])
+
+            # Build concat filter
+            n = len(clip_paths)
+            stream_labels = "".join(f"[{i}:v][{i}:a]" if keep_audio else f"[{i}:v]" for i in range(n))
             if keep_audio:
-                cmd.extend(["-c:v", "libx264", "-c:a", "aac", "-b:a", "192k"])
+                if normalize_audio:
+                    # Output concat audio to intermediate, then apply loudnorm
+                    filter_complex = f"{stream_labels}concat=n={n}:v=1:a=1[vout][aout_raw];[aout_raw]loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
+                else:
+                    filter_complex = f"{stream_labels}concat=n={n}:v=1:a=1[vout][aout]"
             else:
-                cmd.extend(["-c:v", "libx264", "-an"])  # Strip audio
+                filter_complex = f"{stream_labels}concat=n={n}:v=1:a=0[vout]"
+
+            cmd = ["ffmpeg", "-y", *inputs_cmd, "-filter_complex", filter_complex]
+            cmd.extend(["-map", "[vout]"])
+            if keep_audio:
+                cmd.extend(["-map", "[aout]"])
+            # Use quality preset encoding parameters with consistent color space
+            cmd.extend(["-c:v", "libx264", "-preset", enc_params["preset"], "-crf", str(enc_params["crf"]), "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-x264-params", "keyint=30:min-keyint=30"])
+            if keep_audio:
+                cmd.extend(["-c:a", "aac", "-b:a", enc_params["audio_bitrate"]])
             cmd.append(str(output_path))
 
             subprocess.run(cmd, check=True, capture_output=True)
@@ -7686,25 +7939,43 @@ def _concatenate_with_transitions(
                 inputs_cmd.extend(["-i", str(clip)])
 
             # Build video xfade chain
+            # Calculate offsets for video transitions (where each clip starts appearing)
+            video_offsets = [0.0]  # First clip starts at 0
+            for i in range(len(clip_paths) - 1):
+                # Next clip starts appearing at: previous start + duration - overlap
+                next_offset = video_offsets[-1] + durations[i] - transition_duration
+                video_offsets.append(next_offset)
+
             if len(clip_paths) == 2:
                 offset = durations[0] - transition_duration
                 filter_parts.append(f"[0:v][1:v]xfade=transition=fade:duration={transition_duration}:offset={offset}[vout]")
-                if keep_audio:
-                    audio_parts.append(f"[0:a][1:a]acrossfade=d={transition_duration}[aout]")
             else:
-                # Chain multiple xfades
-                prev_label = "[0:v]"
-                offset = 0
+                # Chain multiple xfades for video
+                prev_video_label = "[0:v]"
                 for i in range(1, len(clip_paths)):
-                    offset += durations[i-1] - transition_duration
+                    offset = video_offsets[i]
                     out_label = f"[v{i}]" if i < len(clip_paths) - 1 else "[vout]"
-                    filter_parts.append(f"{prev_label}[{i}:v]xfade=transition=fade:duration={transition_duration}:offset={offset}{out_label}")
-                    prev_label = out_label
+                    filter_parts.append(f"{prev_video_label}[{i}:v]xfade=transition=fade:duration={transition_duration}:offset={offset}{out_label}")
+                    prev_video_label = out_label
 
-                if keep_audio:
-                    # Concatenate all audio streams
-                    audio_inputs = "".join(f"[{i}:a]" for i in range(len(clip_paths)))
-                    audio_parts.append(f"{audio_inputs}concat=n={len(clip_paths)}:v=0:a=1[aout]")
+            # For audio: use adelay to position each clip at its video offset, then amix
+            # This matches the exact timing of video xfade offsets
+            if keep_audio:
+                # Position each audio clip at its video start offset using adelay
+                for i, offset_ms in enumerate([int(o * 1000) for o in video_offsets]):
+                    if offset_ms > 0:
+                        audio_parts.append(f"[{i}:a]adelay={offset_ms}|{offset_ms}[ad{i}]")
+                    else:
+                        audio_parts.append(f"[{i}:a]acopy[ad{i}]")
+
+                # Mix all delayed audio streams together
+                mix_inputs = "".join(f"[ad{i}]" for i in range(len(clip_paths)))
+
+                # Apply loudnorm if requested
+                if normalize_audio:
+                    audio_parts.append(f"{mix_inputs}amix=inputs={len(clip_paths)}:dropout_transition=0:normalize=0[amix];[amix]loudnorm=I=-16:TP=-1.5:LRA=11[aout]")
+                else:
+                    audio_parts.append(f"{mix_inputs}amix=inputs={len(clip_paths)}:dropout_transition=0:normalize=0[aout]")
 
             filter_complex = ";".join(filter_parts + audio_parts)
 
@@ -7712,26 +7983,166 @@ def _concatenate_with_transitions(
             cmd.extend(["-map", "[vout]"])
             if keep_audio and audio_parts:
                 cmd.extend(["-map", "[aout]"])
-            cmd.extend(["-c:v", "libx264", "-preset", "fast"])
+            cmd.extend(["-c:v", "libx264", "-preset", enc_params["preset"], "-crf", str(enc_params["crf"]), "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"])
             if keep_audio:
-                cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+                cmd.extend(["-c:a", "aac", "-b:a", enc_params["audio_bitrate"]])
+            cmd.append(str(output_path))
+
+            subprocess.run(cmd, check=True, capture_output=True)
+
+        elif transition_type == "fade":
+            # Fade to black transitions
+            # Each clip fades out to black at end, next clip fades in from black at start
+            durations = []
+            for clip in clip_paths:
+                probe_cmd = [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "csv=p=0", str(clip)
+                ]
+                result = subprocess.run(probe_cmd, capture_output=True, text=True)
+                try:
+                    durations.append(float(result.stdout.strip()))
+                except ValueError:
+                    durations.append(5.0)
+
+            inputs_cmd = []
+            for clip in clip_paths:
+                inputs_cmd.extend(["-i", str(clip)])
+
+            # Apply fade in/out to each clip
+            filter_parts = []
+            fade_duration = min(transition_duration, 1.0)
+
+            for i, dur in enumerate(durations):
+                fade_out_start = max(0, dur - fade_duration)
+                if i == 0:
+                    # First clip: only fade out
+                    filter_parts.append(f"[{i}:v]fade=t=out:st={fade_out_start}:d={fade_duration}[v{i}]")
+                elif i == len(clip_paths) - 1:
+                    # Last clip: only fade in
+                    filter_parts.append(f"[{i}:v]fade=t=in:st=0:d={fade_duration}[v{i}]")
+                else:
+                    # Middle clips: both fade in and out
+                    filter_parts.append(f"[{i}:v]fade=t=in:st=0:d={fade_duration},fade=t=out:st={fade_out_start}:d={fade_duration}[v{i}]")
+
+            # Concatenate the faded clips
+            stream_labels = "".join(f"[v{i}][{i}:a]" if keep_audio else f"[v{i}]" for i in range(len(clip_paths)))
+            if keep_audio:
+                if normalize_audio:
+                    filter_parts.append(f"{stream_labels}concat=n={len(clip_paths)}:v=1:a=1[vout][aout_raw];[aout_raw]loudnorm=I=-16:TP=-1.5:LRA=11[aout]")
+                else:
+                    filter_parts.append(f"{stream_labels}concat=n={len(clip_paths)}:v=1:a=1[vout][aout]")
+            else:
+                filter_parts.append(f"{stream_labels}concat=n={len(clip_paths)}:v=1:a=0[vout]")
+
+            filter_complex = ";".join(filter_parts)
+
+            cmd = ["ffmpeg", "-y", *inputs_cmd, "-filter_complex", filter_complex]
+            cmd.extend(["-map", "[vout]"])
+            if keep_audio:
+                cmd.extend(["-map", "[aout]"])
+            cmd.extend(["-c:v", "libx264", "-preset", enc_params["preset"], "-crf", str(enc_params["crf"]), "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"])
+            if keep_audio:
+                cmd.extend(["-c:a", "aac", "-b:a", enc_params["audio_bitrate"]])
+            cmd.append(str(output_path))
+
+            subprocess.run(cmd, check=True, capture_output=True)
+
+        elif transition_type == "dissolve":
+            # Dissolve transitions using xfade with dissolve effect
+            durations = []
+            for clip in clip_paths:
+                probe_cmd = [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "csv=p=0", str(clip)
+                ]
+                result = subprocess.run(probe_cmd, capture_output=True, text=True)
+                try:
+                    durations.append(float(result.stdout.strip()))
+                except ValueError:
+                    durations.append(5.0)
+
+            inputs_cmd = []
+            for clip in clip_paths:
+                inputs_cmd.extend(["-i", str(clip)])
+
+            # Calculate offsets for video transitions (where each clip starts appearing)
+            video_offsets = [0.0]  # First clip starts at 0
+            for i in range(len(clip_paths) - 1):
+                # Next clip starts appearing at: previous start + duration - overlap
+                next_offset = video_offsets[-1] + durations[i] - transition_duration
+                video_offsets.append(next_offset)
+
+            filter_parts = []
+            audio_parts = []
+
+            if len(clip_paths) == 2:
+                offset = durations[0] - transition_duration
+                filter_parts.append(f"[0:v][1:v]xfade=transition=dissolve:duration={transition_duration}:offset={offset}[vout]")
+            else:
+                # Chain multiple xfades for video (dissolve effect)
+                prev_video_label = "[0:v]"
+                for i in range(1, len(clip_paths)):
+                    offset = video_offsets[i]
+                    out_label = f"[v{i}]" if i < len(clip_paths) - 1 else "[vout]"
+                    filter_parts.append(f"{prev_video_label}[{i}:v]xfade=transition=dissolve:duration={transition_duration}:offset={offset}{out_label}")
+                    prev_video_label = out_label
+
+            # For audio: use adelay to position each clip at its video offset, then amix
+            # This matches the exact timing of video xfade offsets
+            if keep_audio:
+                # Position each audio clip at its video start offset using adelay
+                for i, offset_ms in enumerate([int(o * 1000) for o in video_offsets]):
+                    if offset_ms > 0:
+                        audio_parts.append(f"[{i}:a]adelay={offset_ms}|{offset_ms}[ad{i}]")
+                    else:
+                        audio_parts.append(f"[{i}:a]acopy[ad{i}]")
+
+                # Mix all delayed audio streams together
+                mix_inputs = "".join(f"[ad{i}]" for i in range(len(clip_paths)))
+
+                # Apply loudnorm if requested
+                if normalize_audio:
+                    audio_parts.append(f"{mix_inputs}amix=inputs={len(clip_paths)}:dropout_transition=0:normalize=0[amix];[amix]loudnorm=I=-16:TP=-1.5:LRA=11[aout]")
+                else:
+                    audio_parts.append(f"{mix_inputs}amix=inputs={len(clip_paths)}:dropout_transition=0:normalize=0[aout]")
+
+            filter_complex = ";".join(filter_parts + audio_parts)
+
+            cmd = ["ffmpeg", "-y", *inputs_cmd, "-filter_complex", filter_complex]
+            cmd.extend(["-map", "[vout]"])
+            if keep_audio and audio_parts:
+                cmd.extend(["-map", "[aout]"])
+            cmd.extend(["-c:v", "libx264", "-preset", enc_params["preset"], "-crf", str(enc_params["crf"]), "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"])
+            if keep_audio:
+                cmd.extend(["-c:a", "aac", "-b:a", enc_params["audio_bitrate"]])
             cmd.append(str(output_path))
 
             subprocess.run(cmd, check=True, capture_output=True)
 
         else:
             # Default to simple concat for unsupported transitions
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", concat_file,
-                "-c:v", "libx264",
-            ]
+            # Use filter_complex for better first-frame handling (same as None transition)
+            inputs_cmd = []
+            for clip in clip_paths:
+                inputs_cmd.extend(["-i", str(clip)])
+
+            n = len(clip_paths)
+            stream_labels = "".join(f"[{i}:v][{i}:a]" if keep_audio else f"[{i}:v]" for i in range(n))
             if keep_audio:
-                cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+                filter_complex = f"{stream_labels}concat=n={n}:v=1:a=1[vout][aout]"
             else:
-                cmd.append("-an")
+                filter_complex = f"{stream_labels}concat=n={n}:v=1:a=0[vout]"
+
+            cmd = ["ffmpeg", "-y", *inputs_cmd, "-filter_complex", filter_complex]
+            cmd.extend(["-map", "[vout]"])
+            if keep_audio:
+                cmd.extend(["-map", "[aout]"])
+            cmd.extend(["-c:v", "libx264", "-preset", enc_params["preset"], "-crf", str(enc_params["crf"]), "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-x264-params", "keyint=30:min-keyint=30"])
+            if keep_audio:
+                cmd.extend(["-c:a", "aac", "-b:a", enc_params["audio_bitrate"]])
             cmd.append(str(output_path))
 
             subprocess.run(cmd, check=True, capture_output=True)
@@ -7745,6 +8156,323 @@ def _concatenate_with_transitions(
         return False
     except Exception as e:
         logger.error(f"Concatenation failed: {e}")
+        return False
+
+
+def _mix_audio_tracks(
+    base_audio_path: Optional[Path],
+    tracks: list,
+    output_path: Path,
+    video_duration: float,
+) -> Path:
+    """Mix multiple audio tracks with support for loop, fade, and positioning.
+
+    Args:
+        base_audio_path: Optional base audio (e.g., TTS dialogue) to mix with tracks
+        tracks: List of AudioTrack objects to mix
+        output_path: Path to save the mixed audio
+        video_duration: Total video duration (for looping calculation)
+
+    Returns:
+        Path to the mixed audio file
+    """
+    import subprocess
+
+    if not tracks:
+        # No tracks to mix, return base audio path or create silence
+        if base_audio_path and base_audio_path.exists():
+            return base_audio_path
+        # Create silent audio
+        silence_cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", f"anullsrc=r=44100:cl=stereo:d={video_duration}",
+            "-c:a", "aac",
+            str(output_path)
+        ]
+        subprocess.run(silence_cmd, check=True, capture_output=True)
+        return output_path
+
+    # Build complex filter for multi-track mixing
+    inputs_cmd = []
+    filter_parts = []
+    track_labels = []
+
+    input_idx = 0
+
+    # Add base audio as first input if provided
+    if base_audio_path and base_audio_path.exists():
+        inputs_cmd.extend(["-i", str(base_audio_path)])
+        filter_parts.append(f"[{input_idx}:a]acopy[base]")
+        track_labels.append("[base]")
+        input_idx += 1
+
+    # Process each audio track
+    for i, track in enumerate(tracks):
+        if not track.file_path or not Path(track.file_path).exists():
+            continue
+
+        inputs_cmd.extend(["-i", str(track.file_path)])
+        track_label = f"[track{i}]"
+
+        # Build filter chain for this track
+        track_filters = []
+
+        # Calculate how long this track needs to be
+        track_duration = track.duration or video_duration
+        needed_duration = video_duration - track.start_time
+
+        # Step 1: Loop if needed
+        if track.loop and track_duration < needed_duration:
+            # Calculate number of loops needed
+            loops_needed = int(needed_duration / track_duration) + 2
+            track_filters.append(f"aloop=loop={loops_needed}:size={int(track_duration * 44100)}")
+            # Trim to exact needed duration
+            track_filters.append(f"atrim=0:{needed_duration}")
+            track_filters.append("asetpts=PTS-STARTPTS")
+
+        # Step 2: Apply volume
+        if track.volume != 1.0:
+            track_filters.append(f"volume={track.volume}")
+
+        # Step 3: Apply fade in
+        if track.fade_in > 0:
+            track_filters.append(f"afade=t=in:st=0:d={track.fade_in}")
+
+        # Step 4: Apply fade out (calculate from end of track)
+        if track.fade_out > 0:
+            if track.loop:
+                # For looped tracks, fade out at end of video
+                fade_start = max(0, needed_duration - track.fade_out)
+            else:
+                # For non-looped, fade out at end of track
+                fade_start = max(0, min(track_duration, needed_duration) - track.fade_out)
+            track_filters.append(f"afade=t=out:st={fade_start}:d={track.fade_out}")
+
+        # Step 5: Delay to start position
+        if track.start_time > 0:
+            delay_ms = int(track.start_time * 1000)
+            track_filters.append(f"adelay={delay_ms}|{delay_ms}")
+
+        # Combine all filters for this track
+        if track_filters:
+            filter_str = ",".join(track_filters)
+            filter_parts.append(f"[{input_idx}:a]{filter_str}{track_label}")
+        else:
+            filter_parts.append(f"[{input_idx}:a]acopy{track_label}")
+
+        track_labels.append(track_label)
+        input_idx += 1
+
+    # Mix all tracks together
+    if len(track_labels) == 1:
+        # Only one track, just use it directly
+        final_label = track_labels[0]
+        filter_parts[-1] = filter_parts[-1].replace(track_labels[0], "[aout]")
+    else:
+        # Multiple tracks - use amix
+        mix_inputs = "".join(track_labels)
+        filter_parts.append(f"{mix_inputs}amix=inputs={len(track_labels)}:dropout_transition=0:normalize=0[aout]")
+
+    filter_complex = ";".join(filter_parts)
+
+    # Build and run FFmpeg command
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs_cmd,
+        "-filter_complex", filter_complex,
+        "-map", "[aout]",
+        "-ac", "2",
+        "-ar", "44100",
+        str(output_path)
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        logger.info(f"Mixed {len(tracks)} audio tracks to {output_path}")
+        return output_path
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Audio mixing failed: {e.stderr.decode() if e.stderr else e}")
+        # Fallback: return base audio or first track
+        if base_audio_path and base_audio_path.exists():
+            return base_audio_path
+        if tracks and tracks[0].file_path:
+            return Path(tracks[0].file_path)
+        raise
+
+
+def _concatenate_with_context_aware_transitions(
+    clip_paths: list[Path],
+    output_path: Path,
+    scenes: list,
+    base_duration: float = 0.5,
+    keep_audio: bool = True,
+    quality: str = "standard",
+    normalize_audio: bool = False,
+) -> bool:
+    """Concatenate video clips with context-aware per-scene transitions.
+
+    Uses cinematography planning to determine optimal transition type and
+    duration for each scene based on emotional intensity and narrative role.
+
+    Args:
+        clip_paths: List of video clip paths to concatenate
+        output_path: Output video path
+        scenes: List of MovieScene objects (for context analysis)
+        base_duration: Base transition duration (actual varies by context)
+        keep_audio: If True, preserve audio from video clips
+        quality: Quality preset - "draft", "standard", or "professional"
+        normalize_audio: If True, apply loudnorm filter
+
+    Returns:
+        True if successful, False otherwise
+    """
+    import subprocess
+    from src.services.cinematography import (
+        generate_cinematography_plan,
+        generate_transition_plan,
+    )
+
+    if not clip_paths:
+        return False
+
+    if len(clip_paths) == 1:
+        import shutil
+        shutil.copy(clip_paths[0], output_path)
+        return True
+
+    enc_params = _get_encoding_params(quality)
+
+    try:
+        # Generate cinematography plan and transition plan
+        cinematography_plan = generate_cinematography_plan(scenes)
+        transition_plan = generate_transition_plan(cinematography_plan, base_duration)
+
+        # Apply per-scene overrides from MovieScene.transition_override
+        for i, scene in enumerate(scenes):
+            if i < len(transition_plan):
+                trans_override = getattr(scene, 'transition_override', None)
+                dur_override = getattr(scene, 'transition_duration_override', None)
+                if trans_override is not None:
+                    # Map override string to transition type
+                    override_map = {
+                        "none": (None, 0.0),
+                        "crossfade": ("xfade", dur_override or base_duration),
+                        "fade": ("fade", dur_override or base_duration),
+                        "dissolve": ("dissolve", dur_override or base_duration),
+                    }
+                    if trans_override in override_map:
+                        transition_plan[i] = override_map[trans_override]
+                    elif dur_override:
+                        # Just duration override, keep transition type
+                        trans_type, _ = transition_plan[i]
+                        transition_plan[i] = (trans_type, dur_override)
+
+        # Get clip durations
+        durations = []
+        for clip in clip_paths:
+            probe_cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0", str(clip)
+            ]
+            result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            try:
+                durations.append(float(result.stdout.strip()))
+            except ValueError:
+                durations.append(5.0)
+
+        # Build filter graph with per-scene transitions
+        inputs_cmd = []
+        for clip in clip_paths:
+            inputs_cmd.extend(["-i", str(clip)])
+
+        # Calculate video offsets based on per-scene transition durations
+        video_offsets = [0.0]
+        for i in range(len(clip_paths) - 1):
+            trans_type, trans_dur = transition_plan[i]
+            # For hard cuts (None), no overlap
+            overlap = trans_dur if trans_type else 0.0
+            next_offset = video_offsets[-1] + durations[i] - overlap
+            video_offsets.append(next_offset)
+
+        # Build video filter chain
+        filter_parts = []
+        audio_parts = []
+
+        # For video: chain transitions between clips
+        prev_video_label = "[0:v]"
+        for i in range(1, len(clip_paths)):
+            trans_type, trans_dur = transition_plan[i - 1]
+            offset = video_offsets[i]
+            out_label = f"[v{i}]" if i < len(clip_paths) - 1 else "[vout]"
+
+            if trans_type is None:
+                # Hard cut - just concat at this point (handled via timing)
+                # For hard cuts, we need to use concat filter instead
+                # This is complex with mixed transitions, so treat None as very short xfade
+                trans_type = "xfade"
+                trans_dur = 0.05  # Near-instant crossfade for hard cut effect
+
+            # Map transition types to xfade effects
+            xfade_effect = {
+                "xfade": "fade",
+                "fade": "fade",
+                "dissolve": "dissolve",
+            }.get(trans_type, "fade")
+
+            filter_parts.append(
+                f"{prev_video_label}[{i}:v]xfade=transition={xfade_effect}:duration={trans_dur}:offset={offset}{out_label}"
+            )
+            prev_video_label = out_label
+
+        # For audio: use adelay to position each clip at its video offset, then amix
+        if keep_audio:
+            for i, offset_ms in enumerate([int(o * 1000) for o in video_offsets]):
+                if offset_ms > 0:
+                    audio_parts.append(f"[{i}:a]adelay={offset_ms}|{offset_ms}[ad{i}]")
+                else:
+                    audio_parts.append(f"[{i}:a]acopy[ad{i}]")
+
+            mix_inputs = "".join(f"[ad{i}]" for i in range(len(clip_paths)))
+            if normalize_audio:
+                audio_parts.append(
+                    f"{mix_inputs}amix=inputs={len(clip_paths)}:dropout_transition=0:normalize=0[amix];[amix]loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
+                )
+            else:
+                audio_parts.append(
+                    f"{mix_inputs}amix=inputs={len(clip_paths)}:dropout_transition=0:normalize=0[aout]"
+                )
+
+        filter_complex = ";".join(filter_parts + audio_parts)
+
+        cmd = ["ffmpeg", "-y", *inputs_cmd, "-filter_complex", filter_complex]
+        cmd.extend(["-map", "[vout]"])
+        if keep_audio and audio_parts:
+            cmd.extend(["-map", "[aout]"])
+        cmd.extend([
+            "-c:v", "libx264",
+            "-preset", enc_params["preset"],
+            "-crf", str(enc_params["crf"]),
+            "-pix_fmt", "yuv420p",
+            "-colorspace", "bt709",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709"
+        ])
+        if keep_audio:
+            cmd.extend(["-c:a", "aac", "-b:a", enc_params["audio_bitrate"]])
+        cmd.append(str(output_path))
+
+        subprocess.run(cmd, check=True, capture_output=True)
+
+        logger.info(f"Context-aware transitions applied: {len(transition_plan)} transitions")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg context-aware concatenation failed: {e.stderr.decode() if e.stderr else e}")
+        return False
+    except Exception as e:
+        logger.error(f"Context-aware concatenation failed: {e}")
         return False
 
 
@@ -7776,15 +8504,32 @@ def render_render_page() -> None:
             options=[24, 30, 60],
             index=1,
         )
+        # Quality preset
+        quality_preset = st.selectbox(
+            "Quality",
+            options=["Draft", "Standard", "Professional"],
+            index=1,  # Default to Standard
+            help="Draft: Fast preview. Standard: Good balance. Professional: Best quality (slow)."
+        )
     with col2:
         # Transition settings
         transition_type = st.selectbox(
             "Transition",
-            options=["None", "Crossfade", "Fade to Black", "Dissolve"],
+            options=["None", "Crossfade", "Fade to Black", "Dissolve", "Context-aware"],
             index=1,  # Default to Crossfade
-            help="Transition effect between scenes"
+            help="Transition effect between scenes. Context-aware picks transitions based on scene emotion."
         )
-        if transition_type != "None":
+        if transition_type == "Context-aware":
+            st.caption("📊 Transitions vary by scene emotion and narrative role")
+            transition_duration = st.slider(
+                "Base Duration (s)",
+                min_value=0.3,
+                max_value=1.5,
+                value=0.5,
+                step=0.1,
+                help="Base transition duration (varies by context)"
+            )
+        elif transition_type != "None":
             transition_duration = st.slider(
                 "Duration (s)",
                 min_value=0.1,
@@ -7801,7 +8546,11 @@ def render_render_page() -> None:
 
     with col3:
         show_subtitles = st.checkbox("Show Subtitles", value=True)
-        add_music = st.checkbox("Add Background Music", value=False)
+        normalize_audio = st.checkbox(
+            "Normalize Audio",
+            value=False,
+            help="Apply loudness normalization for consistent audio levels (recommended for final export)"
+        )
         # Only show video audio option in video mode
         if not is_tts_mode:
             keep_video_audio = st.checkbox(
@@ -7829,6 +8578,337 @@ def render_render_page() -> None:
         else:
             use_lip_sync = False
             st.caption("ℹ️ Using pre-generated videos")
+
+    # Audio Timeline Editor
+    st.markdown("### 🎵 Audio Timeline")
+
+    # Calculate estimated video duration
+    video_duration = sum(s.duration for s in state.script.scenes if s.duration > 0)
+    if video_duration <= 0:
+        video_duration = len(state.script.scenes) * 5.0  # Estimate 5s per scene
+    st.caption(f"Estimated video duration: {video_duration:.1f}s")
+
+    # Initialize audio tracks if needed
+    from src.models.schemas import AudioTrack
+    import uuid
+
+    # Track colors for visual distinction
+    track_colors = ["#4A90D9", "#50C878", "#FFB347", "#FF6B6B", "#9B59B6", "#3498DB"]
+
+    # Verify audio track file paths and attempt recovery if files moved
+    audio_dir = get_project_dir() / "audio"
+    tracks_updated = False
+    for track in state.audio_tracks:
+        if track.file_path:
+            file_path = Path(track.file_path)
+            if not file_path.exists():
+                # Try to find the file in the current project's audio folder
+                # The file might be named "track_{id}_{original_name}"
+                if audio_dir.exists():
+                    # Search by track id
+                    matching_files = list(audio_dir.glob(f"track_{track.id}_*"))
+                    if matching_files:
+                        # Found a matching file - update the path
+                        track.file_path = str(matching_files[0])
+                        tracks_updated = True
+                    else:
+                        # Also try matching by original filename
+                        original_name = file_path.name
+                        if (audio_dir / original_name).exists():
+                            track.file_path = str(audio_dir / original_name)
+                            tracks_updated = True
+
+    if tracks_updated:
+        save_movie_state()
+
+    with st.expander("📼 Audio Tracks", expanded=len(state.audio_tracks) > 0):
+        # Add new track button
+        if st.button("➕ Add Audio Track", key="add_audio_track"):
+            new_track = AudioTrack(
+                id=str(uuid.uuid4())[:8],
+                name=f"Track {len(state.audio_tracks) + 1}",
+                color=track_colors[len(state.audio_tracks) % len(track_colors)]
+            )
+            state.audio_tracks.append(new_track)
+            save_movie_state()
+            st.rerun()
+
+        if not state.audio_tracks:
+            st.info("No audio tracks. Click 'Add Audio Track' to add background music or sound effects.")
+        else:
+            # Display each track with controls
+            tracks_to_remove = []
+            for idx, track in enumerate(state.audio_tracks):
+                with st.container():
+                    st.markdown(f"---")
+                    track_col1, track_col2 = st.columns([3, 1])
+
+                    with track_col1:
+                        # Track name
+                        new_name = st.text_input(
+                            "Track Name",
+                            value=track.name,
+                            key=f"track_name_{track.id}",
+                            label_visibility="collapsed"
+                        )
+                        if new_name != track.name:
+                            track.name = new_name
+                            save_movie_state()
+
+                    with track_col2:
+                        if st.button("🗑️ Remove", key=f"remove_track_{track.id}"):
+                            tracks_to_remove.append(idx)
+
+                    # Check if track already has a file
+                    has_existing_file = track.file_path and Path(track.file_path).exists()
+
+                    if has_existing_file:
+                        # Show existing file info prominently
+                        file_name = Path(track.file_path).name
+                        duration_str = f" ({track.duration:.1f}s)" if track.duration else ""
+                        st.info(f"🎵 **{file_name}**{duration_str}")
+
+                        # Show replace button
+                        replace_key = f"replace_audio_{track.id}"
+                        if replace_key not in st.session_state:
+                            st.session_state[replace_key] = False
+
+                        if st.session_state[replace_key]:
+                            # Show uploader for replacement
+                            uploaded_file = st.file_uploader(
+                                f"Select new audio for {track.name}",
+                                type=["mp3", "wav", "m4a", "aac", "ogg"],
+                                key=f"track_file_replace_{track.id}",
+                                label_visibility="collapsed"
+                            )
+                            col_cancel, col_space = st.columns([1, 3])
+                            with col_cancel:
+                                if st.button("Cancel", key=f"cancel_replace_{track.id}"):
+                                    st.session_state[replace_key] = False
+                                    st.rerun()
+                        else:
+                            uploaded_file = None
+                            if st.button("🔄 Replace Audio", key=f"show_replace_{track.id}"):
+                                st.session_state[replace_key] = True
+                                st.rerun()
+                    else:
+                        # No file or file missing
+                        if track.file_path:
+                            # File path was saved but file is missing
+                            st.warning(f"⚠️ Audio file not found: {Path(track.file_path).name}")
+                        # Show uploader
+                        uploaded_file = st.file_uploader(
+                            f"Audio File for {track.name}",
+                            type=["mp3", "wav", "m4a", "aac", "ogg"],
+                            key=f"track_file_{track.id}",
+                            label_visibility="collapsed"
+                        )
+
+                    # Handle new file upload (both new and replacement)
+                    if uploaded_file:
+                        # Save uploaded file to project directory
+                        audio_dir = get_project_dir() / "audio"
+                        audio_dir.mkdir(parents=True, exist_ok=True)
+                        file_path = audio_dir / f"track_{track.id}_{uploaded_file.name}"
+                        with open(file_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                        track.file_path = str(file_path)
+
+                        # Get audio duration using ffprobe
+                        try:
+                            import subprocess
+                            probe_cmd = [
+                                "ffprobe", "-v", "error",
+                                "-show_entries", "format=duration",
+                                "-of", "csv=p=0", str(file_path)
+                            ]
+                            result = subprocess.run(probe_cmd, capture_output=True, text=True)
+                            track.duration = float(result.stdout.strip())
+                        except Exception:
+                            track.duration = None
+
+                        # Clear replace mode if it was active
+                        replace_key = f"replace_audio_{track.id}"
+                        if replace_key in st.session_state:
+                            st.session_state[replace_key] = False
+
+                        save_movie_state()
+                        st.success(f"✅ Saved: {uploaded_file.name}")
+                        st.rerun()
+
+                    if has_existing_file:
+                        # Track controls in columns
+                        ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns(4)
+
+                        with ctrl_col1:
+                            new_start = st.number_input(
+                                "Start (s)",
+                                min_value=0.0,
+                                max_value=max(0.0, video_duration - 1),
+                                value=float(track.start_time),
+                                step=0.5,
+                                key=f"track_start_{track.id}",
+                                help="When to start playing this track"
+                            )
+                            if new_start != track.start_time:
+                                track.start_time = new_start
+                                save_movie_state()
+
+                        with ctrl_col2:
+                            new_volume = st.slider(
+                                "Volume",
+                                min_value=0.0,
+                                max_value=1.0,
+                                value=float(track.volume),
+                                step=0.05,
+                                key=f"track_volume_{track.id}"
+                            )
+                            if new_volume != track.volume:
+                                track.volume = new_volume
+                                save_movie_state()
+
+                        with ctrl_col3:
+                            new_loop = st.checkbox(
+                                "🔁 Loop",
+                                value=track.loop,
+                                key=f"track_loop_{track.id}",
+                                help="Loop this track to fill video duration"
+                            )
+                            if new_loop != track.loop:
+                                track.loop = new_loop
+                                save_movie_state()
+
+                        with ctrl_col4:
+                            fade_col1, fade_col2 = st.columns(2)
+                            with fade_col1:
+                                new_fade_in = st.number_input(
+                                    "Fade In",
+                                    min_value=0.0,
+                                    max_value=5.0,
+                                    value=float(track.fade_in),
+                                    step=0.5,
+                                    key=f"track_fadein_{track.id}"
+                                )
+                                if new_fade_in != track.fade_in:
+                                    track.fade_in = new_fade_in
+                                    save_movie_state()
+                            with fade_col2:
+                                new_fade_out = st.number_input(
+                                    "Fade Out",
+                                    min_value=0.0,
+                                    max_value=5.0,
+                                    value=float(track.fade_out),
+                                    step=0.5,
+                                    key=f"track_fadeout_{track.id}"
+                                )
+                                if new_fade_out != track.fade_out:
+                                    track.fade_out = new_fade_out
+                                    save_movie_state()
+
+                        # Visual timeline bar for this track
+                        if track.duration and track.duration > 0:
+                            # Calculate track end time (with looping consideration)
+                            if track.loop:
+                                track_end = video_duration
+                            else:
+                                track_end = min(track.start_time + track.duration, video_duration)
+
+                            # Calculate percentages for CSS
+                            start_pct = (track.start_time / video_duration) * 100 if video_duration > 0 else 0
+                            width_pct = ((track_end - track.start_time) / video_duration) * 100 if video_duration > 0 else 0
+
+                            st.markdown(
+                                f"""
+                                <div style="
+                                    background: #333;
+                                    height: 24px;
+                                    border-radius: 4px;
+                                    position: relative;
+                                    margin: 8px 0;
+                                ">
+                                    <div style="
+                                        position: absolute;
+                                        left: {start_pct}%;
+                                        width: {width_pct}%;
+                                        height: 100%;
+                                        background: {track.color};
+                                        border-radius: 4px;
+                                        opacity: 0.8;
+                                    "></div>
+                                    <span style="
+                                        position: absolute;
+                                        left: 50%;
+                                        transform: translateX(-50%);
+                                        color: white;
+                                        font-size: 11px;
+                                        line-height: 24px;
+                                    ">{track.name}: {track.start_time:.1f}s - {track_end:.1f}s{' 🔁' if track.loop else ''}</span>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+
+            # Remove tracks marked for deletion
+            if tracks_to_remove:
+                for idx in sorted(tracks_to_remove, reverse=True):
+                    state.audio_tracks.pop(idx)
+                save_movie_state()
+                st.rerun()
+
+        # Timeline overview (video + all audio tracks)
+        if state.audio_tracks:
+            st.markdown("#### Timeline Overview")
+
+            # Video bar
+            st.markdown(
+                f"""
+                <div style="margin-bottom: 4px;">
+                    <span style="font-size: 12px; color: #888;">Video ({video_duration:.1f}s)</span>
+                    <div style="
+                        background: linear-gradient(90deg, #666 0%, #888 50%, #666 100%);
+                        height: 20px;
+                        border-radius: 4px;
+                    "></div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            # Audio track bars
+            for track in state.audio_tracks:
+                if track.file_path and track.duration:
+                    if track.loop:
+                        track_end = video_duration
+                    else:
+                        track_end = min(track.start_time + track.duration, video_duration)
+
+                    start_pct = (track.start_time / video_duration) * 100 if video_duration > 0 else 0
+                    width_pct = ((track_end - track.start_time) / video_duration) * 100 if video_duration > 0 else 0
+
+                    st.markdown(
+                        f"""
+                        <div style="margin-bottom: 4px;">
+                            <span style="font-size: 12px; color: #888;">{track.name}</span>
+                            <div style="
+                                background: #333;
+                                height: 16px;
+                                border-radius: 4px;
+                                position: relative;
+                            ">
+                                <div style="
+                                    position: absolute;
+                                    left: {start_pct}%;
+                                    width: {width_pct}%;
+                                    height: 100%;
+                                    background: {track.color};
+                                    border-radius: 4px;
+                                    opacity: 0.7;
+                                "></div>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
 
     # Asset check
     st.markdown("### Asset Check")
@@ -7901,6 +8981,12 @@ def render_render_page() -> None:
         video_gen = VideoGenerator()
         output_dir = get_project_dir() / "videos"
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Collect valid audio tracks from timeline
+        audio_tracks_to_mix = [
+            track for track in state.audio_tracks
+            if track.file_path and Path(track.file_path).exists()
+        ]
 
         # Resolution mapping
         res_map = {
@@ -8082,22 +9168,40 @@ def render_render_page() -> None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             video_only_path = output_dir / f"video_only_{timestamp}.mp4"
 
-            # Map transition type to FFmpeg filter
-            transition_map = {
-                "None": None,
-                "Crossfade": "xfade",
-                "Fade to Black": "fade",
-                "Dissolve": "dissolve",
-            }
+            # Map quality preset to parameter name (lowercase)
+            quality_map = {"Draft": "draft", "Standard": "standard", "Professional": "professional"}
 
-            # Use custom concatenation with transitions and audio preservation
-            _concatenate_with_transitions(
-                clip_paths=scene_clips,
-                output_path=video_only_path,
-                transition_type=transition_map.get(transition_type),
-                transition_duration=transition_duration,
-                keep_audio=keep_video_audio,
-            )
+            if transition_type == "Context-aware":
+                # Use context-aware per-scene transitions
+                status_text.text("Analyzing scenes for optimal transitions...")
+                _concatenate_with_context_aware_transitions(
+                    clip_paths=scene_clips,
+                    output_path=video_only_path,
+                    scenes=state.script.scenes,
+                    base_duration=transition_duration,
+                    keep_audio=keep_video_audio,
+                    quality=quality_map.get(quality_preset, "standard"),
+                    normalize_audio=normalize_audio,
+                )
+            else:
+                # Map transition type to FFmpeg filter
+                transition_map = {
+                    "None": None,
+                    "Crossfade": "xfade",
+                    "Fade to Black": "fade",
+                    "Dissolve": "dissolve",
+                }
+
+                # Use custom concatenation with uniform transitions
+                _concatenate_with_transitions(
+                    clip_paths=scene_clips,
+                    output_path=video_only_path,
+                    transition_type=transition_map.get(transition_type),
+                    transition_duration=transition_duration,
+                    keep_audio=keep_video_audio,
+                    quality=quality_map.get(quality_preset, "standard"),
+                    normalize_audio=normalize_audio,
+                )
 
             # Step 3: Handle audio
             # In video mode with keep_audio=True, the audio is already in the video
@@ -8148,6 +9252,20 @@ def render_render_page() -> None:
 
                 subprocess.run(audio_cmd, check=True, capture_output=True)
 
+                # Mix with audio tracks from timeline if provided
+                if audio_tracks_to_mix:
+                    status_text.text(f"Mixing {len(audio_tracks_to_mix)} audio track(s) with dialogue...")
+                    progress_bar.progress(0.65, text="Mixing audio tracks...")
+
+                    # Build FFmpeg filter for multi-track mixing
+                    mixed_audio_path = output_dir / f"mixed_audio_{timestamp}.mp3"
+                    master_audio_path = _mix_audio_tracks(
+                        base_audio_path=master_audio_path,
+                        tracks=audio_tracks_to_mix,
+                        output_path=mixed_audio_path,
+                        video_duration=video_duration,
+                    )
+
                 # Step 4: Combine video and audio
                 status_text.text("Combining video and audio...")
                 progress_bar.progress(0.7, text="Combining video and audio...")
@@ -8168,7 +9286,62 @@ def render_render_page() -> None:
                 subprocess.run(combine_cmd, check=True, capture_output=True)
             else:
                 # No TTS audio to add
-                if keep_video_audio:
+                if audio_tracks_to_mix:
+                    # Add audio tracks from timeline to video
+                    status_text.text(f"Adding {len(audio_tracks_to_mix)} audio track(s) to video...")
+                    progress_bar.progress(0.65, text="Adding audio tracks...")
+
+                    if keep_video_audio:
+                        # First mix all tracks together, then mix with video audio
+                        tracks_audio_path = output_dir / f"tracks_mixed_{timestamp}.mp3"
+                        _mix_audio_tracks(
+                            base_audio_path=None,  # No base audio
+                            tracks=audio_tracks_to_mix,
+                            output_path=tracks_audio_path,
+                            video_duration=video_duration,
+                        )
+
+                        # Mix tracks audio with video audio
+                        combine_cmd = [
+                            "ffmpeg", "-y",
+                            "-i", str(video_only_path),
+                            "-i", str(tracks_audio_path),
+                            "-filter_complex",
+                            "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+                            "-map", "0:v",
+                            "-map", "[aout]",
+                            "-c:v", "copy",
+                            "-c:a", "aac",
+                            "-b:a", "192k",
+                            "-shortest",
+                            str(final_output)
+                        ]
+                    else:
+                        # Use only audio tracks (no video audio)
+                        tracks_audio_path = output_dir / f"tracks_mixed_{timestamp}.mp3"
+                        _mix_audio_tracks(
+                            base_audio_path=None,
+                            tracks=audio_tracks_to_mix,
+                            output_path=tracks_audio_path,
+                            video_duration=video_duration,
+                        )
+
+                        combine_cmd = [
+                            "ffmpeg", "-y",
+                            "-i", str(video_only_path),
+                            "-i", str(tracks_audio_path),
+                            "-map", "0:v",
+                            "-map", "1:a",
+                            "-c:v", "copy",
+                            "-c:a", "aac",
+                            "-b:a", "192k",
+                            "-shortest",
+                            str(final_output)
+                        ]
+                    subprocess.run(combine_cmd, check=True, capture_output=True)
+                    status_text.text("Audio tracks added successfully!")
+                    progress_bar.progress(0.7, text="Audio mixed with video")
+                elif keep_video_audio:
                     # Video already has audio, just copy/rename it
                     import shutil
                     shutil.copy(video_only_path, final_output)
