@@ -305,6 +305,14 @@ PROJECT REQUIREMENTS (from user's setup):
         if config_context:
             system_prompt = system_prompt + "\n" + config_context
 
+        # Log the prompt being sent
+        logger.info("=" * 60)
+        logger.info("SCRIPT AGENT PROMPT:")
+        logger.info("-" * 60)
+        logger.info(f"User message: {user_message[:200]}..." if len(user_message) > 200 else f"User message: {user_message}")
+        logger.info(f"Conversation history: {len(self.conversation_history)} messages")
+        logger.info("=" * 60)
+
         response = client.messages.create(
             model=model_to_use,
             max_tokens=default_config.claude_max_tokens,  # Use model's max output tokens
@@ -465,6 +473,15 @@ IMPORTANT:
 
         messages = self.conversation_history.copy()
         messages.append({"role": "user", "content": extraction_prompt})
+
+        # Log the extraction prompt
+        logger.info("=" * 60)
+        logger.info("SCRIPT EXTRACTION PROMPT:")
+        logger.info("-" * 60)
+        logger.info(f"Extracting script from {len(self.conversation_history)} conversation messages")
+        if veo_constraints:
+            logger.info("VEO MODE: Scene dialogue constraints enabled")
+        logger.info("=" * 60)
 
         response = client.messages.create(
             model=default_config.claude_model,  # Use global config for model

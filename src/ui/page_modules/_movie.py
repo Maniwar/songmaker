@@ -32,6 +32,64 @@ from src.ui.components.state import (
 )
 
 
+def get_readable_timestamp() -> str:
+    """Get a human-readable timestamp for file naming (YYYYMMDD_HHMMSS)."""
+    from datetime import datetime
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def get_image_anti_prompt(visual_style: str) -> str:
+    """Get the 'avoid' keywords for image generation based on visual style.
+
+    Note: Gemini's native image generation doesn't have a negative_prompt parameter.
+    These are keywords that are implicitly avoided by using the right positive prompts.
+    This is shown to the user for transparency.
+
+    Args:
+        visual_style: The visual style setting (e.g., "photorealistic", "anime")
+
+    Returns:
+        String of keywords to avoid
+    """
+    style_lower = visual_style.lower() if visual_style else ""
+
+    if any(kw in style_lower for kw in ["photorealistic", "realistic", "photo", "cinematic"]):
+        return "CGI, cartoon, anime, 3D render, digital art, stylized, artificial, plastic skin, video game, smooth skin, airbrushed, illustration"
+    elif "anime" in style_lower or "manga" in style_lower:
+        return "photorealistic, real photo, live action, realistic skin texture, film grain"
+    elif "3d" in style_lower or "pixar" in style_lower:
+        return "photorealistic, real photo, live action, 2D, flat, anime"
+    else:
+        # Default/artistic styles
+        return "low quality, blurry, distorted, deformed"
+
+
+def get_video_negative_prompt(visual_style: str, model: str = "wan26") -> str:
+    """Get the negative prompt for video generation based on visual style and model.
+
+    Args:
+        visual_style: The visual style setting (e.g., "photorealistic", "anime")
+        model: The video generation model ("wan26", "seedance15", "veo3")
+
+    Returns:
+        Negative prompt string for the model, or empty string if not applicable
+    """
+    # Veo doesn't use traditional negative prompts (handled via prompt text)
+    if "veo" in model.lower():
+        return ""
+
+    style_lower = visual_style.lower() if visual_style else ""
+
+    if any(kw in style_lower for kw in ["photorealistic", "realistic", "photo", "cinematic"]):
+        # Include face preservation terms
+        return "CGI, cartoon, animated, 3D render, digital art, stylized, artificial, plastic skin, video game, unrealistic, smooth skin, airbrushed, different person, face change, morphing face, wrong face"
+    elif "anime" in style_lower or "cartoon" in style_lower:
+        return "photorealistic, real photo, live action, realistic skin texture"
+    else:
+        # Default
+        return "low quality, blurry, distorted, deformed, ugly"
+
+
 def get_movie_state() -> MovieModeState:
     """Get or initialize movie mode state."""
     if "movie_state" not in st.session_state:
@@ -506,7 +564,8 @@ def render_setup_page() -> None:
             "tts_images": "TTS + Images (Ken Burns, Cheaper)",
             "veo3": "Veo 3.1 (Google, Premium quality)",
             "wan26": "WAN 2.6 (AtlasCloud, 15s clips, ~$0.05-0.08/s)",
-            "seedance15": "Seedance 1.5 Pro (AtlasCloud, Lip-sync, ~$0.02-0.06/s)",
+            "seedance15": "Seedance 1.5 Pro (AtlasCloud, Lip-sync, ~$0.015/s)",
+            "seedance_fast": "Seedance Fast (AtlasCloud, Faster, ~$0.01/s)",
         }
 
         # Get current method with fallback
@@ -527,7 +586,9 @@ def render_setup_page() -> None:
         if selected_gen == "wan26":
             st.info("**WAN 2.6** by Alibaba: Up to 15s per clip, native audio, multi-shot storytelling, character consistency.")
         elif selected_gen == "seedance15":
-            st.info("**Seedance 1.5 Pro** by ByteDance: Millisecond lip-sync precision, cinematic camera control, 3-15s flexible duration.")
+            st.info("**Seedance 1.5 Pro** by ByteDance: Best quality, millisecond lip-sync, cinematic camera control, 3-12s duration.")
+        elif selected_gen == "seedance_fast":
+            st.info("**Seedance Fast** by ByteDance: Faster generation, good quality, 3-12s duration. Great for iteration.")
 
         # Voice provider - only show for TTS + Images mode
         if selected_gen == "tts_images":
@@ -551,13 +612,10 @@ def render_setup_page() -> None:
         if selected_gen == "veo3":
             st.markdown("**Veo Settings**")
 
-            # Model selection with grouped options
+            # Model selection - Veo 3.1 is the latest (3.0 deprecated)
             veo_models = {
                 "veo-3.1-generate-preview": "Veo 3.1 Standard (Best quality, audio)",
                 "veo-3.1-fast-generate-preview": "Veo 3.1 Fast (Quicker, audio)",
-                "veo-3-generate-preview": "Veo 3 Standard (High quality, audio)",
-                "veo-3-fast-generate-preview": "Veo 3 Fast (Quick, audio)",
-                "veo-2-generate-preview": "Veo 2 (No audio, cheaper)",
             }
             # Get current veo settings with backward compatibility
             cfg_veo_model = getattr(current_config, 'veo_model', 'veo-3.1-generate-preview')
@@ -681,6 +739,12 @@ def render_setup_page() -> None:
             selected_wan_duration = getattr(current_config, 'wan_duration', 10)
             selected_wan_resolution = getattr(current_config, 'wan_resolution', '720p')
             selected_wan_audio = getattr(current_config, 'wan_enable_audio', True)
+            # WAN advanced params
+            selected_wan_guidance = getattr(current_config, 'wan_guidance_scale', 6.5)
+            selected_wan_flow = getattr(current_config, 'wan_flow_shift', 2.5)
+            selected_wan_steps = getattr(current_config, 'wan_inference_steps', 40)
+            selected_wan_seed = getattr(current_config, 'wan_seed', 0)
+            selected_wan_shot = getattr(current_config, 'wan_shot_type', 'single')
             selected_seedance_model = getattr(current_config, 'seedance_model', 'bytedance/seedance-v1.5-pro-i2v-720p')
             selected_seedance_duration = getattr(current_config, 'seedance_duration', 8)
             selected_seedance_resolution = getattr(current_config, 'seedance_resolution', '720p')
@@ -737,6 +801,51 @@ def render_setup_page() -> None:
             est_total = recommended_scenes * selected_wan_duration * cost_per_sec
             st.caption(f"💰 Estimated: ~${est_total:.2f} ({recommended_scenes} clips × {selected_wan_duration}s × ${cost_per_sec:.2f}/sec)")
 
+            # Advanced WAN parameters
+            with st.expander("⚙️ Advanced WAN Parameters", expanded=False):
+                cfg_guidance = getattr(current_config, 'wan_guidance_scale', 6.5)
+                cfg_flow = getattr(current_config, 'wan_flow_shift', 2.5)
+                cfg_steps = getattr(current_config, 'wan_inference_steps', 40)
+                cfg_seed = getattr(current_config, 'wan_seed', 0)
+                cfg_shot = getattr(current_config, 'wan_shot_type', 'single')
+
+                adv_col1, adv_col2 = st.columns(2)
+                with adv_col1:
+                    selected_wan_guidance = st.slider(
+                        "Guidance Scale",
+                        min_value=1.0, max_value=10.0, value=float(cfg_guidance), step=0.5,
+                        key="setup_wan_guidance",
+                        help="5-7 = realistic, 8+ = 'AI look'. Higher = follows prompt more strictly"
+                    )
+                    selected_wan_steps = st.slider(
+                        "Inference Steps",
+                        min_value=10, max_value=40, value=int(cfg_steps), step=5,
+                        key="setup_wan_steps",
+                        help="More steps = higher quality but slower (default 30, max 40)"
+                    )
+                with adv_col2:
+                    selected_wan_flow = st.slider(
+                        "Flow Shift",
+                        min_value=1.0, max_value=10.0, value=float(cfg_flow), step=0.5,
+                        key="setup_wan_flow",
+                        help="2-3 = best identity preservation, 4-5 = balanced, 6+ = more motion"
+                    )
+                    selected_wan_seed = st.number_input(
+                        "Seed",
+                        min_value=-1, max_value=999999, value=int(cfg_seed),
+                        key="setup_wan_seed",
+                        help="0 = reproducible, -1 = random"
+                    )
+                shot_options = {"single": "Single Camera (consistent)", "multi": "Multi Camera (dynamic)"}
+                selected_wan_shot = st.selectbox(
+                    "Shot Type",
+                    options=list(shot_options.keys()),
+                    index=0 if cfg_shot == "single" else 1,
+                    format_func=lambda x: shot_options[x],
+                    key="setup_wan_shot",
+                    help="Single = better character consistency, Multi = AI picks camera angles"
+                )
+
             # Initialize Veo/Seedance defaults when using WAN
             selected_veo_model = getattr(current_config, 'veo_model', 'veo-3.1-generate-preview')
             selected_veo_duration = getattr(current_config, 'veo_duration', 8)
@@ -786,7 +895,7 @@ def render_setup_page() -> None:
                     "Enable Lip-Sync",
                     value=cfg_sd_lip_sync,
                     key="setup_seedance_lip_sync",
-                    help="Precise millisecond lip-sync for dialogue scenes"
+                    help="2-step process: generates video, then applies lip-sync with bytedance/lipsync model"
                 )
 
             # Extract resolution from model name
@@ -812,6 +921,12 @@ def render_setup_page() -> None:
             selected_wan_duration = getattr(current_config, 'wan_duration', 10)
             selected_wan_resolution = getattr(current_config, 'wan_resolution', '720p')
             selected_wan_audio = getattr(current_config, 'wan_enable_audio', True)
+            # WAN advanced params
+            selected_wan_guidance = getattr(current_config, 'wan_guidance_scale', 6.5)
+            selected_wan_flow = getattr(current_config, 'wan_flow_shift', 2.5)
+            selected_wan_steps = getattr(current_config, 'wan_inference_steps', 40)
+            selected_wan_seed = getattr(current_config, 'wan_seed', 0)
+            selected_wan_shot = getattr(current_config, 'wan_shot_type', 'single')
 
         else:
             # Default values when not using video gen models (TTS + Images mode)
@@ -823,20 +938,26 @@ def render_setup_page() -> None:
             selected_wan_duration = getattr(current_config, 'wan_duration', 10)
             selected_wan_resolution = getattr(current_config, 'wan_resolution', '720p')
             selected_wan_audio = getattr(current_config, 'wan_enable_audio', True)
+            # WAN advanced params
+            selected_wan_guidance = getattr(current_config, 'wan_guidance_scale', 6.5)
+            selected_wan_flow = getattr(current_config, 'wan_flow_shift', 2.5)
+            selected_wan_steps = getattr(current_config, 'wan_inference_steps', 40)
+            selected_wan_seed = getattr(current_config, 'wan_seed', 0)
+            selected_wan_shot = getattr(current_config, 'wan_shot_type', 'single')
             selected_seedance_model = getattr(current_config, 'seedance_model', 'bytedance/seedance-v1.5-pro-i2v-720p')
             selected_seedance_duration = getattr(current_config, 'seedance_duration', 8)
             selected_seedance_resolution = getattr(current_config, 'seedance_resolution', '720p')
             selected_seedance_lip_sync = getattr(current_config, 'seedance_lip_sync', True)
 
-        # Visual style with custom option
+        # Visual style with custom option - photorealistic first for realistic output
         visual_styles = [
+            "photorealistic, cinematic lighting, 8K quality",
+            "cinematic film, natural lighting",
             "animated digital art",
-            "photorealistic",
-            "3D animated",
+            "3D animated, Pixar style",
             "anime style",
             "watercolor illustration",
             "comic book style",
-            "minimalist flat design",
             "✏️ Custom...",
         ]
 
@@ -868,6 +989,23 @@ def render_setup_page() -> None:
             else:
                 selected_style = selected_style_option
                 st.markdown("")  # Empty space for alignment
+
+        # Show WAN 2.6 negative prompt preview based on style
+        style_lower = (selected_style or "").lower()
+        if "photorealistic" in style_lower or "realistic" in style_lower or "photo" in style_lower:
+            neg_prompt_preview = "CGI, cartoon, animated, 3D render, digital art, stylized..."
+            neg_prompt_style = "photorealistic"
+        elif "anime" in style_lower or "cartoon" in style_lower:
+            neg_prompt_preview = "photorealistic, real photo, live action..."
+            neg_prompt_style = "anime/cartoon"
+        elif "3d" in style_lower or "pixar" in style_lower or "animated" in style_lower:
+            neg_prompt_preview = "photorealistic, real photo, live action, 2D, flat"
+            neg_prompt_style = "3D animated"
+        else:
+            neg_prompt_preview = "(no negative prompt - add 'photorealistic', 'anime', or '3D' to style)"
+            neg_prompt_style = "unrecognized"
+
+        st.caption(f"🚫 **WAN 2.6 Negative Prompt** ({neg_prompt_style}): _{neg_prompt_preview}_")
 
         # Overlap setting
         allow_overlap = st.checkbox(
@@ -947,6 +1085,12 @@ def render_setup_page() -> None:
             wan_duration=selected_wan_duration,
             wan_resolution=selected_wan_resolution,
             wan_enable_audio=selected_wan_audio,
+            # WAN advanced parameters
+            wan_guidance_scale=selected_wan_guidance,
+            wan_flow_shift=selected_wan_flow,
+            wan_inference_steps=selected_wan_steps,
+            wan_seed=selected_wan_seed,
+            wan_shot_type=selected_wan_shot,
             # Seedance 1.5 Pro settings
             seedance_model=selected_seedance_model,
             seedance_duration=selected_seedance_duration,
@@ -1216,7 +1360,7 @@ def render_characters_page() -> None:
             visual_style = (
                 (state.config.visual_style if state.config else None)
                 or (state.script.visual_style if state.script else None)
-                or "cinematic digital art"
+                or "photorealistic, cinematic lighting"
             )
 
             # Create two-column layout for portrait section
@@ -1784,7 +1928,7 @@ def _generate_single_video_inline(state, scene, generation_method: str, config, 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Use timestamp suffix to create variants instead of overwriting
-    timestamp = int(time_module.time())
+    timestamp = get_readable_timestamp()
     output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
 
     # Get base model for duration calculation
@@ -1855,24 +1999,50 @@ def _generate_single_video_inline(state, scene, generation_method: str, config, 
                     st.error("Image-to-Video requires a scene image. Generate one first or use T2V mode.")
                     return
 
+                # Get visual style for conditional negative prompts
+                visual_style = config.visual_style if config else state.script.visual_style
+
                 if scene_model == "seedance15":
                     animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
                     result = animator.animate_scene(image_path=Path(scene.image_path), prompt=prompt,
-                                                    output_path=output_path, duration_seconds=duration, resolution=resolution)
+                                                    output_path=output_path, duration_seconds=duration, resolution=resolution,
+                                                    visual_style=visual_style)
+                elif scene_model in ("seedance_fast", "seedance_fast_i2v"):
+                    animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO_FAST)
+                    result = animator.animate_scene(image_path=Path(scene.image_path), prompt=prompt,
+                                                    output_path=output_path, duration_seconds=duration, resolution=resolution,
+                                                    visual_style=visual_style)
                 elif scene_model == "seedance15_t2v":
                     animator = AtlasCloudAnimator(model=SeedanceModel.TEXT_TO_VIDEO)
                     # T2V: Pass None for image_path, animator will detect and use text-to-video
                     result = animator.animate_scene(image_path=None, prompt=prompt,
-                                                    output_path=output_path, duration_seconds=duration, resolution=resolution)
+                                                    output_path=output_path, duration_seconds=duration, resolution=resolution,
+                                                    visual_style=visual_style)
                 elif scene_model == "wan26_t2v":
                     animator = AtlasCloudAnimator(model=WanModel.TEXT_TO_VIDEO)
                     # T2V: Pass None for image_path
-                    result = animator.animate_scene(image_path=None, prompt=prompt,
-                                                    output_path=output_path, duration_seconds=duration, resolution=resolution)
+                    result = animator.animate_scene(
+                        image_path=None, prompt=prompt,
+                        output_path=output_path, duration_seconds=duration, resolution=resolution,
+                        visual_style=visual_style,
+                        guidance_scale=config.wan_guidance_scale if config else None,
+                        flow_shift=config.wan_flow_shift if config else None,
+                        inference_steps=config.wan_inference_steps if config else None,
+                        shot_type=config.wan_shot_type if config else None,
+                        seed=config.wan_seed if config else 0,
+                    )
                 elif scene_model == "wan26_fast":
                     animator = AtlasCloudAnimator(model=WanModel.WAN_25_FAST)
-                    result = animator.animate_scene(image_path=Path(scene.image_path), prompt=prompt,
-                                                    output_path=output_path, duration_seconds=duration, resolution=resolution)
+                    result = animator.animate_scene(
+                        image_path=Path(scene.image_path), prompt=prompt,
+                        output_path=output_path, duration_seconds=duration, resolution=resolution,
+                        visual_style=visual_style,
+                        guidance_scale=config.wan_guidance_scale if config else None,
+                        flow_shift=config.wan_flow_shift if config else None,
+                        inference_steps=config.wan_inference_steps if config else None,
+                        shot_type=config.wan_shot_type if config else None,
+                        seed=config.wan_seed if config else 0,
+                    )
                 else:  # wan26 (default image-to-video, with optional V2V)
                     # If V2V enabled and we have previous video, use V2V model
                     if previous_video and use_prev_video:
@@ -1882,12 +2052,26 @@ def _generate_single_video_inline(state, scene, generation_method: str, config, 
                         result = animator.animate_scene(
                             image_path=Path(scene.image_path), prompt=prompt,
                             output_path=output_path, duration_seconds=duration,
-                            resolution=resolution, source_video=previous_video
+                            resolution=resolution, source_video=previous_video,
+                            visual_style=visual_style,
+                            guidance_scale=config.wan_guidance_scale if config else None,
+                            flow_shift=config.wan_flow_shift if config else None,
+                            inference_steps=config.wan_inference_steps if config else None,
+                            shot_type=config.wan_shot_type if config else None,
+                            seed=config.wan_seed if config else 0,
                         )
                     else:
                         animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
-                        result = animator.animate_scene(image_path=Path(scene.image_path), prompt=prompt,
-                                                        output_path=output_path, duration_seconds=duration, resolution=resolution)
+                        result = animator.animate_scene(
+                            image_path=Path(scene.image_path), prompt=prompt,
+                            output_path=output_path, duration_seconds=duration, resolution=resolution,
+                            visual_style=visual_style,
+                            guidance_scale=config.wan_guidance_scale if config else None,
+                            flow_shift=config.wan_flow_shift if config else None,
+                            inference_steps=config.wan_inference_steps if config else None,
+                            shot_type=config.wan_shot_type if config else None,
+                            seed=config.wan_seed if config else 0,
+                        )
 
             if result:
                 scene.video_path = result
@@ -1942,7 +2126,7 @@ def _generate_all_videos_inline(state, scenes, generation_method: str, config) -
         prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
 
         # Use timestamp suffix to create variants instead of overwriting
-        timestamp = int(time_module.time())
+        timestamp = get_readable_timestamp()
         output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
 
         # Check requirements
@@ -1987,6 +2171,8 @@ def _generate_all_videos_inline(state, scenes, generation_method: str, config) -
                 if scene_model not in animators:
                     if scene_model == "seedance15":
                         animators[scene_model] = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
+                    elif scene_model in ("seedance_fast", "seedance_fast_i2v"):
+                        animators[scene_model] = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO_FAST)
                     elif scene_model == "seedance15_t2v":
                         animators[scene_model] = AtlasCloudAnimator(model=SeedanceModel.TEXT_TO_VIDEO)
                     elif scene_model == "wan26_t2v":
@@ -1998,8 +2184,18 @@ def _generate_all_videos_inline(state, scenes, generation_method: str, config) -
 
                 animator = animators[scene_model]
                 image_path = Path(scene.image_path) if has_image and not is_t2v else None
-                result = animator.animate_scene(image_path=image_path, prompt=prompt,
-                                                output_path=output_path, duration_seconds=duration, resolution=resolution)
+                visual_style = config.visual_style if config else state.script.visual_style
+                # Pass WAN config params (ignored by non-WAN models)
+                result = animator.animate_scene(
+                    image_path=image_path, prompt=prompt,
+                    output_path=output_path, duration_seconds=duration, resolution=resolution,
+                    visual_style=visual_style,
+                    guidance_scale=config.wan_guidance_scale if config else None,
+                    flow_shift=config.wan_flow_shift if config else None,
+                    inference_steps=config.wan_inference_steps if config else None,
+                    shot_type=config.wan_shot_type if config else None,
+                    seed=config.wan_seed if config else 0,
+                )
 
             if result:
                 scene.video_path = result
@@ -2036,7 +2232,7 @@ def render_scenes_page() -> None:
     visual_style = (
         (state.config.visual_style if state.config else None)
         or (script.visual_style if script else None)
-        or "cinematic digital art"
+        or "photorealistic, cinematic lighting"
     )
 
     # Track unsaved changes for batch saving
@@ -2449,7 +2645,7 @@ Keep responses concise and actionable.""",
     # Check if in video mode
     gen_method = state.config.generation_method if state.config else "tts_images"
     is_video_mode = gen_method in ("veo3", "wan26", "seedance15")
-    visual_style = state.config.visual_style if state.config else "cinematic digital art"
+    visual_style = state.config.visual_style if state.config else "photorealistic, cinematic lighting"
 
     # Get current scene for display
     current_scene_idx = st.session_state.selected_scene_idx
@@ -2605,10 +2801,9 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                 "Project Default": (None, None),
                 "Veo 3.1 Standard (Best)": ("veo3", "veo-3.1-generate-preview"),
                 "Veo 3.1 Fast": ("veo3", "veo-3.1-fast-generate-preview"),
-                "Veo 3.0 Standard": ("veo3", "veo-3-generate-preview"),
-                "Veo 3.0 Fast": ("veo3", "veo-3-fast-generate-preview"),
                 "WAN 2.6 (AtlasCloud)": ("wan26", None),
                 "Seedance 1.5 Pro": ("seedance15", None),
+                "Seedance Fast": ("seedance_fast", None),
             }
             batch_vid_model = st.selectbox(
                 "Set all to:",
@@ -2796,15 +2991,34 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                 col_idx += 1
 
                         # === VARIANT PICKERS (visible on card) ===
-                        # Count image variants
+                        # Count image variants - check multiple locations
                         scene_img_dir = get_project_dir() / "scenes" / f"scene_{scene.index:03d}" / "images"
+                        scenes_dir = get_project_dir() / "scenes"
                         all_img_variants = set()
+
+                        # From scene.image_variants list
                         for var_path in scene.image_variants:
                             if Path(var_path).exists():
                                 all_img_variants.add(str(Path(var_path).resolve()))
+
+                        # From per-scene images subdirectory
                         if scene_img_dir.exists():
                             for img_file in list(scene_img_dir.glob("*.png")) + list(scene_img_dir.glob("*.jpg")):
                                 all_img_variants.add(str(img_file.resolve()))
+
+                        # From scenes directory directly (batch generation saves here)
+                        if scenes_dir.exists():
+                            for img_file in list(scenes_dir.glob(f"scene_{scene.index:03d}*.png")) + list(scenes_dir.glob(f"scene_{scene.index:03d}*.jpg")):
+                                all_img_variants.add(str(img_file.resolve()))
+
+                        # From per-scene folder directly (old format: scenes/scene_XXX/scene_XXX.png)
+                        scene_folder = get_project_dir() / "scenes" / f"scene_{scene.index:03d}"
+                        if scene_folder.exists():
+                            for img_file in list(scene_folder.glob("*.png")) + list(scene_folder.glob("*.jpg")):
+                                if img_file.parent == scene_folder:  # Only direct children, not from images/
+                                    all_img_variants.add(str(img_file.resolve()))
+
+                        # Current image path
                         if sd["has_image"]:
                             all_img_variants.add(str(Path(scene.image_path).resolve()))
                         num_img_var = len(all_img_variants)
@@ -2814,45 +3028,50 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                         video_variants = list(video_dir.glob(f"scene_{scene.index:03d}*.mp4")) if video_dir.exists() else []
                         num_vid_var = len(video_variants)
 
-                        # Show variant pickers if any exist
-                        if num_img_var > 1 or num_vid_var > 1:
-                            var_col1, var_col2 = st.columns(2)
-                            with var_col1:
-                                if num_vid_var > 1:
-                                    vid_names = {str(v.resolve()): v.stem.replace(f"scene_{scene.index:03d}", "").lstrip("_") or "v1"
-                                                 for v in sorted(video_variants)}
-                                    cur_vid = str(Path(scene.video_path).resolve()) if scene.video_path and Path(scene.video_path).exists() else ""
-                                    vid_opts = list(vid_names.keys())
-                                    vid_idx = vid_opts.index(cur_vid) if cur_vid in vid_opts else 0
-                                    new_vid = st.selectbox(
-                                        f"🎬 ({num_vid_var})",
-                                        options=vid_opts,
-                                        index=vid_idx,
-                                        format_func=lambda x: vid_names.get(x, Path(x).stem),
-                                        key=f"grid_vid_{scene.index}",
-                                    )
-                                    if new_vid != cur_vid and new_vid:
-                                        scene.video_path = new_vid
-                                        save_movie_state()
-                            with var_col2:
-                                if num_img_var > 1:
-                                    img_list = sorted(all_img_variants)
-                                    img_names = {p: Path(p).stem[-8:] for p in img_list}
-                                    cur_img = str(Path(scene.image_path).resolve()) if sd["has_image"] else ""
-                                    img_idx = img_list.index(cur_img) if cur_img in img_list else 0
-                                    new_img = st.selectbox(
-                                        f"📷 ({num_img_var})",
-                                        options=img_list,
-                                        index=img_idx,
-                                        format_func=lambda x: img_names.get(x, Path(x).stem),
-                                        key=f"grid_img_{scene.index}",
-                                    )
-                                    if new_img != cur_img and new_img:
-                                        try:
-                                            scene.image_path = new_img
-                                        except Exception:
-                                            object.__setattr__(scene, 'image_path', new_img)
-                                        save_movie_state()
+                        # Always show variant pickers row (image and video)
+                        var_col1, var_col2 = st.columns(2)
+                        with var_col1:
+                            # Image variant picker - always show if we have images
+                            if num_img_var >= 1:
+                                img_list = sorted(all_img_variants)
+                                img_names = {p: Path(p).stem[-8:] for p in img_list}
+                                cur_img = str(Path(scene.image_path).resolve()) if sd["has_image"] else ""
+                                img_idx = img_list.index(cur_img) if cur_img in img_list else 0
+                                new_img = st.selectbox(
+                                    f"📷 Image ({num_img_var})",
+                                    options=img_list,
+                                    index=img_idx,
+                                    format_func=lambda x: img_names.get(x, Path(x).stem),
+                                    key=f"grid_img_{scene.index}",
+                                )
+                                if new_img != cur_img and new_img:
+                                    try:
+                                        scene.image_path = new_img
+                                    except Exception:
+                                        object.__setattr__(scene, 'image_path', new_img)
+                                    save_movie_state()
+                            else:
+                                st.caption("📷 No images yet")
+                        with var_col2:
+                            # Video variant picker
+                            if num_vid_var >= 1:
+                                vid_names = {str(v.resolve()): v.stem.replace(f"scene_{scene.index:03d}", "").lstrip("_") or "v1"
+                                             for v in sorted(video_variants)}
+                                cur_vid = str(Path(scene.video_path).resolve()) if scene.video_path and Path(scene.video_path).exists() else ""
+                                vid_opts = list(vid_names.keys())
+                                vid_idx = vid_opts.index(cur_vid) if cur_vid in vid_opts else 0
+                                new_vid = st.selectbox(
+                                    f"🎬 Video ({num_vid_var})",
+                                    options=vid_opts,
+                                    index=vid_idx,
+                                    format_func=lambda x: vid_names.get(x, Path(x).stem),
+                                    key=f"grid_vid_{scene.index}",
+                                )
+                                if new_vid != cur_vid and new_vid:
+                                    scene.video_path = new_vid
+                                    save_movie_state()
+                            else:
+                                st.caption("🎬 No videos yet")
 
                         # === SETTINGS ROW (visible on card) ===
                         set_c1, set_c2 = st.columns(2)
@@ -2960,12 +3179,18 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                             if context_parts:
                                 st.caption("Context: " + " | ".join(context_parts))
 
-                            # Visual prompt
+                            # Show image anti-prompt (what to avoid)
+                            img_visual_style = state.config.visual_style if state.config else (script.visual_style if script.visual_style else "")
+                            img_anti_prompt = get_image_anti_prompt(img_visual_style)
+                            st.caption(f"🚫 **Avoid:** _{img_anti_prompt}_")
+
+                            # Visual prompt - use versioned key to sync with edit menu
                             st.markdown("**Image Prompt**")
+                            widget_version = st.session_state.get(f"visual_prompt_version_{scene.index}", 0)
                             new_prompt = st.text_area(
                                 "Visual Prompt",
                                 value=scene.visual_prompt or "",
-                                key=f"prompt_{scene.index}",
+                                key=f"prompt_{scene.index}_v{widget_version}",
                                 height=60,
                                 label_visibility="collapsed",
                                 placeholder="Describe the visual scene for image generation..."
@@ -2976,6 +3201,33 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                 except Exception:
                                     object.__setattr__(scene, 'visual_prompt', new_prompt)
                                 st.session_state.scenes_dirty = True
+
+                            # Editable negative prompt for images
+                            st.markdown("**🚫 Negative Prompt (Avoid)**")
+                            default_neg = get_image_anti_prompt(img_visual_style)
+                            current_img_neg = getattr(scene, 'image_negative_prompt', None) or default_neg
+                            new_img_neg = st.text_area(
+                                "Image Negative Prompt",
+                                value=current_img_neg,
+                                key=f"img_neg_{scene.index}",
+                                height=40,
+                                label_visibility="collapsed",
+                                placeholder="Keywords to avoid in image generation..."
+                            )
+                            if new_img_neg != current_img_neg:
+                                try:
+                                    scene.image_negative_prompt = new_img_neg
+                                except Exception:
+                                    object.__setattr__(scene, 'image_negative_prompt', new_img_neg)
+                                st.session_state.scenes_dirty = True
+                            # Reset to default button
+                            if st.button("↩️ Reset to Default", key=f"reset_img_neg_{scene.index}", use_container_width=True):
+                                try:
+                                    scene.image_negative_prompt = None
+                                except Exception:
+                                    object.__setattr__(scene, 'image_negative_prompt', None)
+                                save_movie_state()
+                                st.rerun()
 
                             # Regenerate image prompt button
                             if st.button("🔄 Regenerate Image Prompt", key=f"regen_img_prompt_{scene.index}",
@@ -2988,6 +3240,8 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                         except Exception:
                                             object.__setattr__(scene, 'visual_prompt', new_img_prompt)
                                         save_movie_state()
+                                        # Increment version to sync widgets across UI
+                                        st.session_state[f"visual_prompt_version_{scene.index}"] = widget_version + 1
                                         st.success("Image prompt regenerated!")
                                         st.rerun()
 
@@ -3039,6 +3293,14 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                 # Auto-save to persist the change
                                 save_movie_state()
                                 st.session_state.scenes_dirty = False
+
+                            # Show video negative prompt for WAN/Seedance (not Veo)
+                            scene_gen_model = getattr(scene, 'generation_model', None) or project_method
+                            if scene_gen_model in ["wan26", "seedance15"]:
+                                vid_visual_style = state.config.visual_style if state.config else state.script.visual_style
+                                vid_neg_prompt = get_video_negative_prompt(vid_visual_style, scene_gen_model)
+                                if vid_neg_prompt:
+                                    st.caption(f"🚫 **Negative prompt:** _{vid_neg_prompt}_")
 
                             # Regenerate video prompt button
                             regen_col1, regen_col2 = st.columns([1, 2])
@@ -3094,14 +3356,13 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                 # Format: (display_name, generation_model, veo_variant)
                                 model_opts = {
                                     "default": (f"Default ({project_method})", None, None),
-                                    # Veo variants
+                                    # Veo variants (3.1 only - 3.0 deprecated)
                                     "veo31_standard": ("📝→🎬 Veo 3.1 Standard (Best)", "veo3", "veo-3.1-generate-preview"),
                                     "veo31_fast": ("📝→🎬 Veo 3.1 Fast", "veo3", "veo-3.1-fast-generate-preview"),
-                                    "veo30_standard": ("📝→🎬 Veo 3.0 Standard", "veo3", "veo-3-generate-preview"),
-                                    "veo30_fast": ("📝→🎬 Veo 3.0 Fast", "veo3", "veo-3-fast-generate-preview"),
                                     # I2V models (require scene image)
                                     "wan26_i2v": ("🖼️→🎬 WAN 2.6 I2V (image→video)", "wan26_i2v", None),
                                     "seedance15_i2v": ("🖼️→🎬 Seedance 1.5 I2V (lip-sync)", "seedance15_i2v", None),
+                                    "seedance_fast_i2v": ("🖼️→🎬 Seedance Fast I2V", "seedance_fast_i2v", None),
                                     # T2V models (text prompt only)
                                     "wan26_t2v": ("📝→🎬 WAN 2.6 T2V (text→video)", "wan26_t2v", None),
                                     "seedance15_t2v": ("📝→🎬 Seedance 1.5 T2V (text→video)", "seedance15_t2v", None),
@@ -3114,11 +3375,8 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                 if cur_model == "veo3":
                                     if cur_variant == "veo-3.1-fast-generate-preview":
                                         cur_key = "veo31_fast"
-                                    elif cur_variant == "veo-3-generate-preview":
-                                        cur_key = "veo30_standard"
-                                    elif cur_variant == "veo-3-fast-generate-preview":
-                                        cur_key = "veo30_fast"
                                     else:
+                                        # Default to 3.1 Standard (3.0 deprecated)
                                         cur_key = "veo31_standard"
                                 elif cur_model in model_opts:
                                     cur_key = cur_model
@@ -3153,11 +3411,12 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                             object.__setattr__(scene, 'veo_model_variant', veo_variant)
                                     st.session_state.scenes_dirty = True
                                     save_movie_state()
+                                    # Note: Prompt regeneration removed - use "Regenerate Video Prompt" button
 
                                 # Show warning if I2V selected but no image
                                 _, eff_gen_model, _ = model_opts[new_model_key]
                                 eff_model = eff_gen_model or project_method
-                                is_i2v = "i2v" in str(eff_model).lower() or eff_model in ["wan26", "seedance15"]
+                                is_i2v = "i2v" in str(eff_model).lower() or eff_model in ["wan26", "seedance15", "seedance_fast"]
                                 if is_i2v and not has_scene_image:
                                     st.warning("⚠️ I2V requires scene image - generate image first!")
 
@@ -3168,7 +3427,7 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                         dur_options = [4, 6, 8]
                                     elif "wan26" in str(eff_model):
                                         dur_options = [5, 10, 15]
-                                    else:  # seedance15
+                                    else:  # seedance (Pro or Fast)
                                         dur_options = [3, 5, 8, 10, 15]
 
                                     auto_dur = scene.get_clip_duration(eff_model)
@@ -3216,6 +3475,25 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                     if new_lip != current_lip:
                                         scene.enable_lip_sync = new_lip
                                         st.session_state.scenes_dirty = True
+
+                                # Show negative prompt that will be used (WAN 2.6 only)
+                                if "wan26" in str(eff_model).lower():
+                                    # Get visual style from config or script
+                                    scene_visual_style = state.config.visual_style if state.config else (state.script.visual_style if state.script else "")
+                                    style_lower = (scene_visual_style or "").lower()
+                                    if "photorealistic" in style_lower or "realistic" in style_lower or "photo" in style_lower:
+                                        neg_prompt = "CGI, cartoon, animated, 3D render, digital art, stylized, artificial, plastic skin, video game, unrealistic, smooth skin, airbrushed"
+                                    elif "anime" in style_lower or "cartoon" in style_lower:
+                                        neg_prompt = "photorealistic, real photo, live action, realistic skin texture"
+                                    elif "3d" in style_lower or "pixar" in style_lower or "animated" in style_lower:
+                                        neg_prompt = "photorealistic, real photo, live action, 2D, flat"
+                                    else:
+                                        neg_prompt = "(none - style not recognized)"
+
+                                    with st.expander("🚫 Negative Prompt", expanded=False):
+                                        st.caption(f"**Style:** {scene_visual_style}")
+                                        st.code(neg_prompt, language=None)
+                                        st.caption("This is auto-generated based on your visual style setting.")
 
                         # Dialogue lines
                         if scene.dialogue:
@@ -3297,7 +3575,7 @@ def _render_prompt_generator_modal(script: Script, state: MovieModeState) -> Non
         - **Best video generation model per scene** (if enabled)
         """)
 
-        visual_style = state.config.visual_style if state.config else "cinematic digital art"
+        visual_style = state.config.visual_style if state.config else "photorealistic, cinematic lighting"
         project_method = state.config.generation_method if state.config else "tts_images"
 
         # Image model selector with clear Fast vs Pro distinction
@@ -3385,13 +3663,11 @@ def _render_prompt_generator_modal(script: Script, state: MovieModeState) -> Non
         # Video generation method selector
         st.markdown("#### 🎬 Video Generation Settings")
 
-        # Combined video method + Veo variant options
+        # Combined video method + Veo variant options (Veo 3.0 deprecated)
         gen_methods = {
             "tts_images": ("🎙️ TTS + Images (Ken Burns)", None),
             "veo3_standard": ("📝→🎬 Veo 3.1 Standard (Best quality)", "veo-3.1-generate-preview"),
             "veo3_fast": ("📝→🎬 Veo 3.1 Fast", "veo-3.1-fast-generate-preview"),
-            "veo3_30_standard": ("📝→🎬 Veo 3.0 Standard", "veo-3-generate-preview"),
-            "veo3_30_fast": ("📝→🎬 Veo 3.0 Fast", "veo-3-fast-generate-preview"),
             "wan26": ("🖼️→🎬 WAN 2.6 (image→video)", None),
             "seedance15": ("🖼️→🎬 Seedance 1.5 Pro (image→video, lip-sync)", None),
         }
@@ -3481,7 +3757,7 @@ def _run_ai_scene_setup(script: Script, state: MovieModeState,
         st.warning("No scenes to set up.")
         return
 
-    visual_style = state.config.visual_style if state.config else "cinematic digital art"
+    visual_style = state.config.visual_style if state.config else "photorealistic, cinematic lighting"
     world_description = script.world_description or ""
 
     # Build character context with full details
@@ -3896,7 +4172,7 @@ def _regenerate_scene_prompt(
     """
     import json
 
-    visual_style = state.config.visual_style if state.config else "cinematic digital art"
+    visual_style = state.config.visual_style if state.config else "photorealistic, cinematic lighting"
 
     # Use per-scene generation model if set, otherwise fall back to global config
     scene_gen_model = getattr(scene, 'generation_model', None)
@@ -3973,37 +4249,100 @@ Be specific and concise. Focus on actionable details for video animation."""
         client = Anthropic(api_key=config.anthropic_api_key)
 
         if prompt_type == "visual":
-            system_prompt = f"""You are a professional cinematographer creating image generation prompts.
+            # Detect if photorealistic style
+            is_photorealistic = any(kw in visual_style.lower() for kw in ["photorealistic", "realistic", "photo", "cinematic"])
 
-REQUIRED Visual Style: {visual_style}
+            if is_photorealistic:
+                # Optimized for Gemini Native Image Generation (Nano Banana Pro) - photorealistic
+                system_prompt = f"""<role>
+You are an expert prompt engineer for Gemini Native Image Generation, specializing in photorealistic imagery.
+</role>
 
-CRITICAL RULES:
-1. START your prompt with: "VISUAL STYLE: {visual_style}." - this is REQUIRED as the first line
-2. Include camera angle and shot type
-3. Include setting/location with specific details
-4. Include ALL visible characters with their full descriptions
-5. Include lighting and atmosphere
-6. DO NOT include any dialogue or text in the image
-7. Make it suitable for AI image generation (Gemini/DALL-E)
+<output_format>
+Generate a single image prompt optimized for photorealistic output. No explanations, just the prompt.
+</output_format>
 
-Respond with ONLY the prompt text, no JSON or explanations."""
+<photorealistic_keywords>
+ALWAYS include these for photorealistic results:
+- Skin: "natural skin texture", "skin pores visible", "subsurface scattering"
+- Lighting: "natural lighting", "soft diffused light", "golden hour", "volumetric lighting"
+- Camera: "shot on Sony A7IV", "85mm f/1.4 lens", "shallow depth of field", "bokeh"
+- Quality: "8K resolution", "RAW photo", "film grain", "photojournalistic"
+- Realism: "hyperrealistic", "lifelike", "unedited photograph", "candid moment"
+</photorealistic_keywords>
 
-            user_prompt = f"""Scene {scene.index}: {scene.title or scene.direction.setting}
+<constraints>
+- NO text, watermarks, or UI elements in the image
+- NO CGI, 3D render, digital art, or illustrated look
+- NO plastic skin, airbrushed, or uncanny valley
+- Characters must look like real humans photographed in real locations
+</constraints>
 
+<example>
+INPUT: A woman sitting at a cafe
+OUTPUT: RAW photograph, candid moment of a woman sitting at a Parisian sidewalk cafe, natural skin texture with visible pores, subsurface scattering on cheeks, soft diffused afternoon light, shot on Sony A7IV with 85mm f/1.4 lens, shallow depth of field, creamy bokeh in background, 8K resolution, film grain, hyperrealistic, photojournalistic style, golden hour warm tones, unedited photograph aesthetic
+</example>"""
+
+                user_prompt = f"""<scene>
+Title: Scene {scene.index} - {scene.title or scene.direction.setting}
 Setting: {scene.direction.setting}
 Camera: {scene.direction.camera}
-Lighting: {scene.direction.lighting or 'not specified'}
+Lighting: {scene.direction.lighting or 'natural lighting'}
 Mood: {scene.direction.mood}
+</scene>
 
-Characters in scene:
-{chr(10).join(char_descriptions) if char_descriptions else 'No characters specified'}
+<characters>
+{chr(10).join(char_descriptions) if char_descriptions else 'No specific characters'}
+</characters>
 
-Dialogue context (for understanding the scene, don't include in prompt):
-{chr(10).join(dialogue_lines) if dialogue_lines else 'No dialogue'}
+<task>
+Generate a PHOTOREALISTIC image prompt following the example format. Include:
+1. "RAW photograph" or "unedited photo" at the start
+2. Natural skin texture keywords (pores, subsurface scattering)
+3. Specific camera/lens (Sony A7IV, 85mm f/1.4)
+4. Lighting description (soft diffused, golden hour, etc.)
+5. Quality markers (8K, film grain, hyperrealistic)
+6. All character descriptions exactly as provided
+</task>"""
 
-Generate a complete visual prompt for this scene that:
-1. STARTS with "VISUAL STYLE: {visual_style}." (REQUIRED - must be first line)
-2. Describes the scene in detail for image generation"""
+            else:
+                # Non-photorealistic styles (anime, 3D, illustrated, etc.)
+                system_prompt = f"""<role>
+You are an expert prompt engineer for Gemini Native Image Generation.
+</role>
+
+<style>
+Required visual style: {visual_style}
+</style>
+
+<output_format>
+Generate a single image prompt. No explanations, just the prompt text.
+</output_format>
+
+<constraints>
+- START with the visual style
+- Include camera angle and shot type
+- Include setting with specific details
+- Include ALL character descriptions exactly as provided
+- Include lighting and atmosphere
+- NO text, dialogue, or UI elements in the image
+</constraints>"""
+
+                user_prompt = f"""<scene>
+Title: Scene {scene.index} - {scene.title or scene.direction.setting}
+Setting: {scene.direction.setting}
+Camera: {scene.direction.camera}
+Lighting: {scene.direction.lighting or 'cinematic lighting'}
+Mood: {scene.direction.mood}
+</scene>
+
+<characters>
+{chr(10).join(char_descriptions) if char_descriptions else 'No specific characters'}
+</characters>
+
+<task>
+Generate an image prompt in {visual_style} style. Start with the style, then describe the scene with all characters.
+</task>"""
 
         else:  # video prompt
             # Determine video model format
@@ -4014,35 +4353,36 @@ Generate a complete visual prompt for this scene that:
 - Include emotion cues in parentheses
 - Example: 'Sarah (curious) leans forward and says "I never expected this." Her expression shifts to surprise.'"""
             elif "seedance" in gen_method:
-                format_guidance = """Format for Seedance 1.5 Pro (image-to-video with lip-sync) - CONCISE:
+                format_guidance = """Format for Seedance 1.5 Pro (image-to-video with lip-sync) - PHOTOREALISTIC:
 
 CRITICAL I2V RULES:
-1. NO STYLE DESCRIPTION - the style is already in the image
-2. PRESERVE THE IMAGE - video must look exactly like source
-3. MAX 50 WORDS total - shorter = more faithful
-4. Reference "the person in the image (Name)"
-5. Focus on: lip movements, subtle expressions
-6. Dialogue format: [Name] speaks: "line"
-7. End with: "Camera steady. Preserve image."
+1. PHOTOREALISTIC - output must match source image exactly, NO CGI look
+2. NO STYLE DESCRIPTION - style is in the image
+3. MAX 40 WORDS total - shorter = more faithful
+4. Reference "the person in the image"
+5. Focus on: lip movements, subtle expressions ONLY
+6. Dialogue: speaks: "line"
+7. ALWAYS END WITH: "Photorealistic. Camera locked. Preserve exact appearance."
 
 GOOD EXAMPLE:
-"The woman in the image (Sarah) speaks to camera. Sarah says: 'I've been waiting for this moment.' Subtle expression change. Camera steady. Preserve image."
+"The person in the image speaks to camera: 'I've been waiting for this moment.' Subtle expression. Photorealistic. Camera locked. Preserve exact appearance."
 """
             else:  # wan26
-                format_guidance = """Format for WAN 2.6 (image-to-video) - CONCISE PROMPTS ONLY:
+                format_guidance = """Format for WAN 2.6 (image-to-video) - CINEMATIC PHOTOREALISTIC:
 
-CRITICAL I2V RULES:
-1. NO STYLE DESCRIPTION - the style is already in the image
-2. PRESERVE THE IMAGE - video must look exactly like source
-3. MAX 50 WORDS total - shorter = more faithful
-4. Reference "the woman/man in the image (Name)"
-5. MINIMAL MOTION - head turns, blinks, lip movement only
-6. NO repositioning, NO new elements
-7. Dialogue format: [Name] speaks: "line"
-8. End with: "Camera steady. Preserve image."
+PROMPT STRUCTURE: Dialogue + Motion + Camera + Lighting + Style
 
-BAD: "VISUAL STYLE: cyberpunk. Theena shifts her weight..."
-GOOD: "The woman in hoodie (Theena) turns head slightly. Theena speaks: 'You think that brings them back.' Other woman (Ashbelle) blinks. Camera steady. Preserve image."
+RULES:
+1. DIALOGUE: If provided, include ALL lines using: [Character] speaks: "line"
+2. MOTION: Use concrete verbs (sway, glide, tilt, blink) with speed adverbs (gently, slowly)
+3. CAMERA: Film terminology (slow dolly in, static shot, gentle pan right)
+4. LIGHTING: Cinematic descriptors (soft key light, warm rim, natural lighting)
+5. STYLE: "Cinematic, photorealistic, natural skin texture, true-to-life"
+6. END WITH: "Preserve identity, maintain appearance"
+7. Keep total under 80 words
+
+EXAMPLE PROMPT:
+"Marcus speaks: 'I've been waiting for this moment.' Gentle eye movement, subtle expression shift. Slow dolly in, steady. Soft key light with warm rim. Cinematic, photorealistic, natural skin texture. Preserve identity, maintain appearance."
 """
 
             # Different system prompts for different video models
@@ -4063,23 +4403,27 @@ RULES:
 
 Respond with ONLY the video prompt text, no JSON or explanations."""
             else:
-                # WAN 2.6 and Seedance need CONCISE I2V prompts - NO STYLE (it's in the image)
-                system_prompt = f"""You create ULTRA-CONCISE image-to-video prompts. VIDEO MUST LOOK LIKE THE SOURCE IMAGE.
+                # WAN 2.6 and Seedance - cinematic I2V prompts with style reinforcement
+                system_prompt = f"""You create CINEMATIC image-to-video prompts for WAN 2.6. OUTPUT MUST BE PHOTOREALISTIC.
 
 {format_guidance}
 {image_context}
 
-ABSOLUTE RULES:
-1. NO "VISUAL STYLE" LINE - the style is already in the image
-2. MAX 50 WORDS TOTAL - every extra word causes image drift
-3. Reference "the woman/man in the image (Name)"
-4. MINIMAL MOTION: head turns, blinks, lip movement ONLY
-5. Dialogue: [Name] speaks: "line"
-6. End with: "Camera steady. Preserve image."
+PROMPT STRUCTURE (follow this order):
+1. DIALOGUE (if provided): MUST include ALL lines using format: [Character] speaks: "exact line"
+2. MOTION: What moves? Use concrete verbs + speed adverbs (gently sways, slowly tilts)
+3. CAMERA: Film terminology (slow dolly in, static shot, gentle pan)
+4. LIGHTING: Cinematic descriptors (soft key light, warm rim, natural lighting)
+5. STYLE: "Cinematic, photorealistic, natural skin texture, true-to-life"
+6. END WITH: "Preserve identity, maintain appearance"
 
-NEVER add style descriptions. NEVER describe colors/lighting/atmosphere - it's in the image.
+RULES:
+- CRITICAL: If dialogue is provided, include ALL lines verbatim - do not skip any!
+- Format: [Character name] speaks: "their exact line"
+- MAX 80 words - dialogue takes priority over other elements
+- One primary motion + optional secondary (e.g., "hair sways, jacket flutters")
 
-Output ONLY the prompt, no explanations."""
+Output ONLY the prompt."""
 
             # Different user prompts for different models
             if gen_method == "veo3":
@@ -4101,23 +4445,45 @@ Generate a video animation prompt that:
 3. Describes character movements and expressions
 4. Flows naturally from the scene image"""
             else:
-                # WAN 2.6 / Seedance - ULTRA CONCISE, NO STYLE (it's in the image)
-                # Condense dialogue to key line only
-                condensed_dialogue = dialogue_lines[:1] if dialogue_lines else []  # Max 1 line
+                # WAN 2.6 / Seedance - cinematic I2V with all elements
+                # Include ALL dialogue lines for the scene
+                all_dialogue = dialogue_lines if dialogue_lines else []
+                dialogue_text = "\n".join(all_dialogue) if all_dialogue else None
 
-                user_prompt = f"""Create ULTRA-CONCISE I2V prompt. MAX 50 WORDS. NO STYLE DESCRIPTION.
+                # Build user prompt with emphasis on dialogue
+                if dialogue_text:
+                    user_prompt = f"""Create a CINEMATIC I2V prompt for WAN 2.6. MAX 80 WORDS.
 
-Characters in image:
-{chr(10).join(char_descriptions) if char_descriptions else 'None'}
+**DIALOGUE (MUST INCLUDE ALL LINES):**
+{dialogue_text}
 
-Dialogue:
-{chr(10).join(condensed_dialogue) if condensed_dialogue else 'None'}
+Scene mood: {scene.direction.mood}
+Camera: {scene.direction.camera}
 
-OUTPUT FORMAT (exactly like this):
-The [woman/man] in the image (Name) [minimal action: head turn, blink]. [Name] speaks: "[line]". Camera steady. Preserve image.
+STRUCTURE YOUR PROMPT AS:
+1. DIALOGUE: Include ALL dialogue lines above using format: Character speaks: "line"
+2. Motion (subtle movement while speaking - gentle head movement, expression)
+3. Camera (slow dolly in, static shot, gentle pan)
+4. Lighting + Style: "Cinematic, photorealistic, natural skin texture, true-to-life"
+5. End with: "Preserve identity, maintain appearance"
 
-NO style lines. NO atmosphere. NO colors. Just motion + dialogue + "Camera steady. Preserve image."
-"""
+CRITICAL: Include ALL dialogue lines verbatim. Format each as: [Character] speaks: "line"
+
+Output ONLY the prompt text."""
+                else:
+                    user_prompt = f"""Create a CINEMATIC I2V prompt for WAN 2.6. MAX 60 WORDS.
+
+Scene mood: {scene.direction.mood}
+Camera: {scene.direction.camera}
+(No dialogue in this scene)
+
+STRUCTURE YOUR PROMPT AS:
+1. Motion (what the person does - use verbs like sway, tilt, blink)
+2. Camera (slow dolly in, static shot, gentle pan)
+3. Lighting + Style: "Cinematic, photorealistic, natural skin texture, true-to-life"
+4. End with: "Preserve identity, maintain appearance"
+
+Output ONLY the prompt text."""
 
         # Use configured model and max tokens from sidebar settings
         model_to_use = config.claude_model if hasattr(config, 'claude_model') else "claude-sonnet-4-5-20250929"
@@ -4133,7 +4499,15 @@ NO style lines. NO atmosphere. NO colors. Just motion + dialogue + "Camera stead
         )
 
         generated_prompt = response.content[0].text.strip()
-        logger.info(f"Generated {prompt_type} prompt for scene {scene.index}: {generated_prompt[:100]}...")
+
+        # Log the full generated prompt
+        logger.info("=" * 60)
+        logger.info(f"GENERATED {prompt_type.upper()} PROMPT (Scene {scene.index}):")
+        logger.info("-" * 60)
+        for line in generated_prompt.split('\n'):
+            logger.info(line)
+        logger.info("=" * 60)
+
         return generated_prompt
 
     except Exception as e:
@@ -4146,7 +4520,7 @@ def _generate_all_scene_images(script: Script, state: MovieModeState) -> None:
     """Generate images for all scenes that don't have one."""
     from src.services.movie_image_generator import MovieImageGenerator
 
-    visual_style = state.config.visual_style if state.config else "cinematic digital art"
+    visual_style = state.config.visual_style if state.config else "photorealistic, cinematic lighting"
     generator = MovieImageGenerator(style=visual_style)
     output_dir = get_project_dir() / "scenes"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -4214,7 +4588,7 @@ def _generate_single_scene_image(scene, script: Script, state: MovieModeState) -
     from src.services.movie_image_generator import MovieImageGenerator
     import time
 
-    visual_style = state.config.visual_style if state.config else "cinematic digital art"
+    visual_style = state.config.visual_style if state.config else "photorealistic, cinematic lighting"
     generator = MovieImageGenerator(style=visual_style)
 
     # Get image model settings - per-scene overrides global session state
@@ -4236,7 +4610,7 @@ def _generate_single_scene_image(scene, script: Script, state: MovieModeState) -
 
     # Generate unique filename for this variant
     variant_num = len(scene.image_variants) + 1
-    timestamp = int(time.time())
+    timestamp = get_readable_timestamp()
     output_path = scene_dir / f"take_{variant_num:03d}_{timestamp}.png"
 
     # Find style reference image (previous scene for continuity) - only if enabled
@@ -4259,10 +4633,12 @@ def _generate_single_scene_image(scene, script: Script, state: MovieModeState) -
 
     with st.spinner(f"Generating image variant {variant_num} for Scene {scene.index} ({image_model}, {image_size}, {aspect_ratio})..."):
         try:
+            # Pass the scenes directory (not scene_dir which already includes scene_XXX/images)
+            scenes_dir = get_project_dir() / "scenes"
             result = generator.generate_scene_image(
                 scene=scene,
                 script=script,
-                output_dir=scene_dir.parent,  # Pass parent, generator adds scene_XXX.png
+                output_dir=scenes_dir,  # Generator will create scene_XXX/images/take_XXX.png
                 reference_image=reference_image,
                 character_portraits=character_portraits if character_portraits else None,
                 model=image_model,
@@ -4326,6 +4702,18 @@ def _render_scene_image_manager(scene, script: Script, state: MovieModeState, co
         for img_file in scene_dir.glob("*.jpg"):
             if add_variant(img_file):
                 scene.add_image_variant(str(img_file))
+
+    # Check old format: scenes/scene_XXX/scene_XXX.png (direct children of scene folder)
+    scene_folder = get_project_dir() / "scenes" / f"scene_{scene.index:03d}"
+    if scene_folder.exists():
+        for img_file in scene_folder.glob("*.png"):
+            if img_file.parent == scene_folder:  # Only direct children, not from images/
+                if add_variant(img_file):
+                    scene.add_image_variant(str(img_file))
+        for img_file in scene_folder.glob("*.jpg"):
+            if img_file.parent == scene_folder:
+                if add_variant(img_file):
+                    scene.add_image_variant(str(img_file))
 
     num_variants = len(existing_variants)
 
@@ -4443,6 +4831,11 @@ def _render_scene_image_manager(scene, script: Script, state: MovieModeState, co
                     except Exception:
                         object.__setattr__(scene, 'image_aspect_ratio', new_ar)
                     save_movie_state()
+
+            # Show image anti-prompt (what to avoid) based on visual style
+            mgr_visual_style = state.config.visual_style if state.config else (script.visual_style if script.visual_style else "")
+            mgr_anti_prompt = get_image_anti_prompt(mgr_visual_style)
+            st.caption(f"🚫 **Avoid (based on visual style):** _{mgr_anti_prompt}_")
 
         # Current image display with full-size viewer
         if has_image:
@@ -4570,6 +4963,138 @@ def _render_scene_image_manager(scene, script: Script, state: MovieModeState, co
             if num_variants > 0:
                 st.metric("Variants", num_variants)
 
+
+def _render_scene_video_manager(scene: "MovieScene", state: "MovieModeState", compact: bool = False) -> None:
+    """Render scene video manager with variant carousel, similar to image manager.
+
+    Args:
+        scene: The MovieScene to manage videos for
+        state: MovieModeState
+        compact: Deprecated, kept for compatibility. Full mode is always used.
+    """
+    has_video = scene.video_path and Path(scene.video_path).exists()
+
+    # Collect all video variants
+    video_dir = get_project_dir() / "videos"
+    existing_variants = []
+    seen_paths = set()
+
+    # Helper to add variant if not already seen
+    def add_variant(path: Path):
+        resolved = str(path.resolve())
+        if resolved not in seen_paths and path.exists():
+            seen_paths.add(resolved)
+            existing_variants.append(path)
+            return True
+        return False
+
+    # First add the main scene video (so it's first)
+    if has_video:
+        add_variant(Path(scene.video_path))
+
+    # Add videos from video directory matching this scene
+    if video_dir.exists():
+        for vid_file in video_dir.glob(f"scene_{scene.index:03d}*.mp4"):
+            add_variant(vid_file)
+
+    num_variants = len(existing_variants)
+
+    # Full mode - complete video manager
+    st.markdown(f"#### 🎬 Scene {scene.index} Video Manager")
+
+    if has_video:
+        # Current video preview
+        st.video(str(scene.video_path))
+        st.caption(f"**Current:** {Path(scene.video_path).name}")
+    else:
+        st.info("No video generated yet.")
+
+    # Variant carousel (if multiple variants)
+    if num_variants > 1:
+        st.markdown("---")
+        st.markdown(f"**📂 Browse Video Variants ({num_variants})**")
+
+        # Slider for navigation
+        sorted_variants = sorted(existing_variants, key=lambda x: x.name)
+
+        # Find current selection index
+        current_var_idx = 0
+        if has_video:
+            for idx, v in enumerate(sorted_variants):
+                if str(v) == str(scene.video_path) or str(v.resolve()) == str(Path(scene.video_path).resolve()):
+                    current_var_idx = idx
+                    break
+
+        selected_idx = st.slider(
+            "Browse video variants",
+            min_value=1,
+            max_value=num_variants,
+            value=current_var_idx + 1,
+            key=f"vid_var_slider_{scene.index}",
+            format="%d of " + str(num_variants),
+        ) - 1
+
+        # Display selected variant
+        selected_var = sorted_variants[selected_idx]
+        st.video(str(selected_var))
+
+        # Show file info
+        st.caption(f"**File:** {selected_var.name}")
+
+        # Action buttons
+        act_col1, act_col2, act_col3 = st.columns(3)
+
+        with act_col1:
+            is_current = str(selected_var.resolve()) == str(Path(scene.video_path).resolve()) if has_video else False
+            if st.button(
+                "✓ Use This" if not is_current else "✓ Current",
+                key=f"use_vid_var_{scene.index}",
+                type="primary" if not is_current else "secondary",
+                disabled=is_current,
+                use_container_width=True,
+            ):
+                scene.video_path = str(selected_var)
+                save_movie_state()
+                st.success("Video updated!")
+                st.rerun()
+
+        with act_col2:
+            # Get video duration info
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", str(selected_var)],
+                    capture_output=True, text=True, timeout=5
+                )
+                duration = float(result.stdout.strip())
+                st.metric("Duration", f"{duration:.1f}s")
+            except Exception:
+                st.empty()
+
+        with act_col3:
+            # Don't allow deleting the currently used video
+            import os
+            can_delete = not is_current and num_variants > 1
+            if st.button(
+                "🗑️ Delete",
+                key=f"delete_vid_var_{scene.index}",
+                disabled=not can_delete,
+                use_container_width=True,
+                help="Can't delete currently used video" if not can_delete else "Delete this variant"
+            ):
+                try:
+                    os.remove(selected_var)
+                    save_movie_state()
+                    st.success("Deleted!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to delete: {e}")
+
+    # Stats
+    if num_variants > 0:
+        st.markdown("---")
+        st.metric("Video Variants", num_variants)
 
 
 def _render_scene_editor_form(script: Script, state: MovieModeState, visual_style: str) -> None:
@@ -4816,6 +5341,14 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
                 object.__setattr__(scene, 'video_prompt', new_video_prompt)
             st.session_state.scenes_dirty = True
 
+        # Show video negative prompt for WAN/Seedance (not Veo)
+        scene_gen_model = getattr(scene, 'generation_model', None) or (state.config.generation_method if state.config else "veo3")
+        if scene_gen_model in ["wan26", "seedance15"]:
+            vid_visual_style = state.config.visual_style if state.config else state.script.visual_style
+            vid_neg_prompt = get_video_negative_prompt(vid_visual_style, scene_gen_model)
+            if vid_neg_prompt:
+                st.caption(f"🚫 **Negative prompt:** _{vid_neg_prompt}_")
+
         # Regenerate button for video prompt - PROMINENT
         use_img_context = st.checkbox(
             "📷 Use scene image as context for video prompt",
@@ -4856,6 +5389,7 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
             "veo3": "Veo 3.1 (Google)",
             "wan26": "WAN 2.6 (AtlasCloud)",
             "seedance15": "Seedance 1.5 Pro (AtlasCloud)",
+            "seedance_fast": "Seedance Fast (AtlasCloud)",
         }
         current_model = scene.generation_model
         model_keys = list(model_options.keys())
@@ -4880,8 +5414,6 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
                 None: "Project Default",
                 "veo-3.1-generate-preview": "Veo 3.1 Standard (Best quality)",
                 "veo-3.1-fast-generate-preview": "Veo 3.1 Fast (Quicker)",
-                "veo-3-generate-preview": "Veo 3.0 Standard",
-                "veo-3-fast-generate-preview": "Veo 3.0 Fast",
             }
             current_veo_variant = getattr(scene, 'veo_model_variant', None)
             veo_keys = list(veo_variant_options.keys())
@@ -4900,6 +5432,7 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
                 except Exception:
                     object.__setattr__(scene, 'veo_model_variant', new_veo_variant)
                 st.session_state.scenes_dirty = True
+                save_movie_state()
 
         v_col1, v_col2, v_col3 = st.columns(3)
 
@@ -4949,13 +5482,14 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
                 st.session_state.scenes_dirty = True
 
         with v_col3:
-            # Lip-sync for Seedance
-            if effective_model == "seedance15":
+            # Lip-sync for Seedance (both Pro and Fast support 2-step lip sync)
+            if "seedance" in str(effective_model).lower():
                 current_lip = scene.enable_lip_sync
                 new_lip = st.checkbox(
                     "Enable Lip Sync",
                     value=current_lip if current_lip is not None else True,
-                    key=f"edit_lip_{scene.index}"
+                    key=f"edit_lip_{scene.index}",
+                    help="2-step: generates video, then applies lip-sync with bytedance/lipsync model"
                 )
                 if new_lip != current_lip:
                     scene.enable_lip_sync = new_lip
@@ -4963,13 +5497,99 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
             else:
                 st.empty()  # Placeholder
 
+        # Scene Video section
+        st.markdown("---")
+        st.markdown("##### Scene Video")
+        has_video = scene.video_path and Path(scene.video_path).exists()
+        has_video_prompt = bool(getattr(scene, 'video_prompt', None) and scene.video_prompt.strip())
+
+        # Show negative prompt / quality guidance info based on model
+        if "wan26" in str(effective_model).lower() or "wan" in str(effective_model).lower():
+            edit_visual_style = state.config.visual_style if state.config else (state.script.visual_style if state.script else "")
+            edit_style_lower = (edit_visual_style or "").lower()
+            if "photorealistic" in edit_style_lower or "realistic" in edit_style_lower or "photo" in edit_style_lower:
+                edit_neg_prompt = "CGI, cartoon, animated, 3D render, digital art, stylized, artificial, plastic skin..."
+            elif "anime" in edit_style_lower or "cartoon" in edit_style_lower:
+                edit_neg_prompt = "photorealistic, real photo, live action, realistic skin texture"
+            elif "3d" in edit_style_lower or "pixar" in edit_style_lower or "animated" in edit_style_lower:
+                edit_neg_prompt = "photorealistic, real photo, live action, 2D, flat"
+            else:
+                edit_neg_prompt = "(no negative prompt - unrecognized style)"
+            st.caption(f"🚫 **Negative prompt:** {edit_neg_prompt}")
+        elif "seedance" in str(effective_model).lower():
+            # Seedance uses embedded quality guidance in prompt, not a separate negative_prompt
+            st.caption("ℹ️ **Seedance:** Quality guidance embedded in prompt (camera behavior, style, anti-drift)")
+
+        # Collect video variants (same logic as video manager)
+        video_dir = get_project_dir() / "videos"
+        video_variants = []
+        video_seen = set()
+        if has_video:
+            video_variants.append(Path(scene.video_path))
+            video_seen.add(str(Path(scene.video_path).resolve()))
+        if video_dir.exists():
+            for vid_file in video_dir.glob(f"scene_{scene.index:03d}*.mp4"):
+                resolved = str(vid_file.resolve())
+                if resolved not in video_seen:
+                    video_variants.append(vid_file)
+                    video_seen.add(resolved)
+        num_video_variants = len(video_variants)
+
+        vid_col1, vid_col2 = st.columns([1, 2])
+        with vid_col1:
+            # Generate video button
+            btn_disabled = not has_scene_image and effective_model not in ["wan26_t2v", "seedance15_t2v", "veo3"]
+            btn_label = "🎬 Regenerate Video" if has_video else "🎬 Generate Video"
+            if not has_video_prompt:
+                btn_label += " (no prompt)"
+
+            if st.button(btn_label, key=f"gen_video_edit_{scene.index}",
+                        disabled=btn_disabled,
+                        type="primary" if not has_video else "secondary",
+                        use_container_width=True):
+                # Build defaults dict for the generator
+                defaults = {
+                    "resolution": getattr(scene, 'resolution', None) or (
+                        state.config.wan_resolution if state.config else "720p"
+                    )
+                }
+                _generate_single_scene_video(state, scene, effective_model, defaults)
+                st.rerun()
+
+            if btn_disabled:
+                st.caption("⚠️ Generate an image first (or use T2V mode)")
+
+            # Browse Videos button (matching image section layout)
+            if num_video_variants > 1:
+                if st.button(f"📂 Browse {num_video_variants} Variants", key=f"vid_browse_{scene.index}", use_container_width=True):
+                    st.session_state[f"show_video_manager_{scene.index}"] = True
+                    st.rerun()
+
+        with vid_col2:
+            # Video display only (matching image section layout)
+            if has_video:
+                st.video(str(scene.video_path))
+                if num_video_variants > 1:
+                    st.caption(f"🎬 {num_video_variants} variants available")
+            else:
+                st.info("No video generated yet")
+
+        # Show full video manager popup if requested (matching image section pattern)
+        if st.session_state.get(f"show_video_manager_{scene.index}", False):
+            with st.container(border=True):
+                _render_scene_video_manager(scene, state, compact=False)
+                if st.button("✕ Close Video Manager", key=f"close_vid_mgr_{scene.index}"):
+                    st.session_state[f"show_video_manager_{scene.index}"] = False
+                    st.rerun()
+
     # Scene image with variant management
     st.markdown("##### Scene Image")
 
     has_scene_image = scene.image_path and Path(scene.image_path).exists()
 
-    # Collect all unique variants (matching image manager logic)
+    # Collect all unique variants - check multiple locations
     scene_img_dir = get_project_dir() / "scenes" / f"scene_{scene.index:03d}" / "images"
+    scenes_dir = get_project_dir() / "scenes"
     all_variants = set()
 
     # Add variants from the scene's variant list
@@ -4977,12 +5597,24 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
         if Path(var_path).exists():
             all_variants.add(str(Path(var_path).resolve()))
 
-    # Add files from directory
+    # Add files from per-scene images subdirectory
     if scene_img_dir.exists():
         for img_file in scene_img_dir.glob("*.png"):
             all_variants.add(str(img_file.resolve()))
         for img_file in scene_img_dir.glob("*.jpg"):
             all_variants.add(str(img_file.resolve()))
+
+    # Add files from scenes directory directly (batch generation saves here)
+    if scenes_dir.exists():
+        for img_file in list(scenes_dir.glob(f"scene_{scene.index:03d}*.png")) + list(scenes_dir.glob(f"scene_{scene.index:03d}*.jpg")):
+            all_variants.add(str(img_file.resolve()))
+
+    # Check old format: scenes/scene_XXX/scene_XXX.png (direct children of scene folder)
+    scene_folder = get_project_dir() / "scenes" / f"scene_{scene.index:03d}"
+    if scene_folder.exists():
+        for img_file in list(scene_folder.glob("*.png")) + list(scene_folder.glob("*.jpg")):
+            if img_file.parent == scene_folder:  # Only direct children, not from images/
+                all_variants.add(str(img_file.resolve()))
 
     # Add the main scene image
     if has_scene_image:
@@ -5638,13 +6270,11 @@ def _render_movie_storyboard_grid(state, generation_method: str, model_info: dic
 
         with batch_col2:
             st.markdown("**Video Model**")
-            # Combined video model + Veo variant options
+            # Combined video model + Veo variant options (Veo 3.0 deprecated)
             video_models = {
                 "Project Default": (None, None),
                 "Veo 3.1 Standard (Best)": ("veo3", "veo-3.1-generate-preview"),
                 "Veo 3.1 Fast": ("veo3", "veo-3.1-fast-generate-preview"),
-                "Veo 3.0 Standard": ("veo3", "veo-3-generate-preview"),
-                "Veo 3.0 Fast": ("veo3", "veo-3-fast-generate-preview"),
                 "WAN 2.6 (AtlasCloud)": ("wan26", None),
                 "Seedance 1.5 Pro": ("seedance15", None),
             }
@@ -5743,10 +6373,18 @@ def _render_movie_storyboard_grid(state, generation_method: str, model_info: dic
 @st.cache_data(ttl=30, show_spinner=False)
 def _count_scene_variants(scene_index: int, image_variants_count: int) -> int:
     """Cache variant count to avoid repeated directory globbing."""
-    scene_dir = get_project_dir() / "scenes" / f"scene_{scene_index:03d}" / "images"
-    if scene_dir.exists():
-        return max(image_variants_count, len(list(scene_dir.glob("*.png"))) + len(list(scene_dir.glob("*.jpg"))))
-    return image_variants_count
+    count = image_variants_count
+    # Check new location: scenes/scene_XXX/images/
+    scene_img_dir = get_project_dir() / "scenes" / f"scene_{scene_index:03d}" / "images"
+    if scene_img_dir.exists():
+        count = max(count, len(list(scene_img_dir.glob("*.png"))) + len(list(scene_img_dir.glob("*.jpg"))))
+    # Check old location: scenes/scene_XXX/ (direct children only)
+    scene_folder = get_project_dir() / "scenes" / f"scene_{scene_index:03d}"
+    if scene_folder.exists():
+        direct_images = [f for f in scene_folder.glob("*.png") if f.parent == scene_folder]
+        direct_images += [f for f in scene_folder.glob("*.jpg") if f.parent == scene_folder]
+        count = max(count, len(direct_images))
+    return count
 
 
 def _render_movie_scene_card(state, scene, generation_method: str, model_info: dict, defaults: dict) -> None:
@@ -5784,7 +6422,14 @@ def _render_movie_scene_card(state, scene, generation_method: str, model_info: d
     st.caption(f"{title_text} ({duration}s)")
 
     # Show video if available, otherwise image
-    if has_video:
+    # Use tabs to switch between image and video when both exist (like Scenes page)
+    if has_video and has_image:
+        img_tab, vid_tab = st.tabs(["🖼️ Image", "🎬 Video"])
+        with img_tab:
+            st.image(str(scene.image_path), width="stretch")
+        with vid_tab:
+            st.video(str(scene.video_path))
+    elif has_video:
         st.video(str(scene.video_path))
     elif has_image:
         st.image(str(scene.image_path), width="stretch")
@@ -5817,8 +6462,9 @@ def _render_movie_scene_card(state, scene, generation_method: str, model_info: d
         # Image variant picker
         with var_col2:
             if num_img_variants > 1:
-                # Collect all image variants
+                # Collect all image variants - check multiple locations
                 scene_img_dir = get_project_dir() / "scenes" / f"scene_{scene.index:03d}" / "images"
+                scenes_dir = get_project_dir() / "scenes"
                 all_img_variants = set()
                 for var_path in scene.image_variants:
                     if Path(var_path).exists():
@@ -5826,6 +6472,16 @@ def _render_movie_scene_card(state, scene, generation_method: str, model_info: d
                 if scene_img_dir.exists():
                     for img_file in list(scene_img_dir.glob("*.png")) + list(scene_img_dir.glob("*.jpg")):
                         all_img_variants.add(str(img_file.resolve()))
+                # Also check scenes directory directly (batch generation)
+                if scenes_dir.exists():
+                    for img_file in list(scenes_dir.glob(f"scene_{scene.index:03d}*.png")) + list(scenes_dir.glob(f"scene_{scene.index:03d}*.jpg")):
+                        all_img_variants.add(str(img_file.resolve()))
+                # Check per-scene folder directly (old format: scenes/scene_XXX/scene_XXX.png)
+                scene_folder = get_project_dir() / "scenes" / f"scene_{scene.index:03d}"
+                if scene_folder.exists():
+                    for img_file in list(scene_folder.glob("*.png")) + list(scene_folder.glob("*.jpg")):
+                        if img_file.parent == scene_folder:  # Only direct children, not from images/
+                            all_img_variants.add(str(img_file.resolve()))
                 if has_image:
                     all_img_variants.add(str(Path(scene.image_path).resolve()))
 
@@ -5921,6 +6577,7 @@ def _render_movie_scene_card(state, scene, generation_method: str, model_info: d
             "Veo 3.1 (Google)": "veo3",
             "WAN 2.6 (AtlasCloud)": "wan26",
             "Seedance 1.5 Pro": "seedance15",
+            "Seedance Fast": "seedance_fast",
         }
         current_model = getattr(scene, 'generation_model', None)
         current_idx = list(model_options.values()).index(current_model) if current_model in model_options.values() else 0
@@ -5944,17 +6601,20 @@ def _render_movie_scene_card(state, scene, generation_method: str, model_info: d
 
     # Video prompt regeneration (with image context option)
     if generation_method != "tts_images":
-        has_video_prompt = bool(getattr(scene, 'video_prompt', None))
+        current_prompt = getattr(scene, 'video_prompt', None)
+        has_video_prompt = bool(current_prompt and current_prompt.strip())
         has_scene_image = scene.image_path and Path(scene.image_path).exists()
 
-        # Only show expanded controls if no video prompt
-        with st.expander("📝 Video Prompt", expanded=not has_video_prompt):
-            # Show current video prompt (truncated)
-            current_prompt = getattr(scene, 'video_prompt', None)
+        # Expander title shows prompt status
+        prompt_status = "✅" if has_video_prompt else "⚠️ Missing"
+        with st.expander(f"📝 Video Prompt {prompt_status}", expanded=not has_video_prompt):
+            # Show current video prompt (truncated but more visible)
             if current_prompt:
-                st.caption(current_prompt[:100] + "..." if len(current_prompt) > 100 else current_prompt)
+                # Show more of the prompt for visibility
+                display_len = 200 if len(current_prompt) > 200 else len(current_prompt)
+                st.markdown(f"```\n{current_prompt[:display_len]}{'...' if len(current_prompt) > display_len else ''}\n```")
             else:
-                st.warning("No video prompt set", icon="⚠️")
+                st.warning("No video prompt set - click Generate Prompt below", icon="⚠️")
 
             use_img_ctx = st.checkbox(
                 "Use image context",
@@ -6039,7 +6699,7 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Use timestamp suffix to create variants instead of overwriting
-    timestamp = int(time_module.time())
+    timestamp = get_readable_timestamp()
     output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
 
     duration = scene.get_clip_duration(scene_model)
@@ -6084,6 +6744,8 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
             else:
                 # WAN or Seedance
                 from src.services.atlascloud_animator import AtlasCloudAnimator, WanModel, SeedanceModel
+                visual_style = state.config.visual_style if state.config else state.script.visual_style
+
                 if scene_model == "seedance15":
                     animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
                     result = animator.animate_scene(
@@ -6092,6 +6754,17 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
                         output_path=output_path,
                         duration_seconds=duration,
                         resolution=resolution,
+                        visual_style=visual_style,
+                    )
+                elif scene_model in ("seedance_fast", "seedance_fast_i2v"):
+                    animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO_FAST)
+                    result = animator.animate_scene(
+                        image_path=Path(scene.image_path),
+                        prompt=prompt,
+                        output_path=output_path,
+                        duration_seconds=duration,
+                        resolution=resolution,
+                        visual_style=visual_style,
                     )
                 elif previous_video and use_prev_video:
                     # WAN 2.6 V2V mode
@@ -6103,6 +6776,12 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
                         duration_seconds=duration,
                         resolution=resolution,
                         source_video=previous_video,
+                        visual_style=visual_style,
+                        guidance_scale=state.config.wan_guidance_scale if state.config else None,
+                        flow_shift=state.config.wan_flow_shift if state.config else None,
+                        inference_steps=state.config.wan_inference_steps if state.config else None,
+                        shot_type=state.config.wan_shot_type if state.config else None,
+                        seed=state.config.wan_seed if state.config else 0,
                     )
                 else:
                     # WAN 2.6 I2V mode
@@ -6113,6 +6792,12 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
                         output_path=output_path,
                         duration_seconds=duration,
                         resolution=resolution,
+                        visual_style=visual_style,
+                        guidance_scale=state.config.wan_guidance_scale if state.config else None,
+                        flow_shift=state.config.wan_flow_shift if state.config else None,
+                        inference_steps=state.config.wan_inference_steps if state.config else None,
+                        shot_type=state.config.wan_shot_type if state.config else None,
+                        seed=state.config.wan_seed if state.config else 0,
                     )
 
             if result:
@@ -6180,7 +6865,7 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
         prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
 
         # Use timestamp suffix to create variants instead of overwriting
-        timestamp = int(time_module.time())
+        timestamp = get_readable_timestamp()
         output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
 
         # Get previous video for continuity (from last generated or previous scene)
@@ -6224,11 +6909,17 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
                     output_path=output_path,
                     duration_seconds=duration,
                     resolution=resolution,
+                    visual_style=config.visual_style if config else None,
+                    guidance_scale=config.wan_guidance_scale if config else None,
+                    flow_shift=config.wan_flow_shift if config else None,
+                    inference_steps=config.wan_inference_steps if config else None,
+                    shot_type=config.wan_shot_type if config else None,
+                    seed=config.wan_seed if config else 0,
                 )
             elif scene_model == "seedance15":
                 if seedance_animator is None:
                     seedance_animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
-                # Get audio for lip sync if available
+                # Check if lip sync is enabled
                 audio_path = None
                 lip_sync = getattr(scene, 'enable_lip_sync', None)
                 if lip_sync is None:
@@ -6238,14 +6929,61 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
                         if d.audio_path and Path(d.audio_path).exists():
                             audio_path = Path(d.audio_path)
                             break
+                # Generate video first (without lip sync)
                 result = seedance_animator.animate_scene(
                     image_path=Path(scene.image_path),
                     prompt=prompt,
                     output_path=output_path,
                     duration_seconds=duration,
                     resolution=resolution,
-                    audio_path=audio_path,
                 )
+                # Apply lip sync as post-processing if audio available
+                if result and audio_path:
+                    lipsync_output = output_path.parent / f"lipsync_{output_path.name}"
+                    lipsync_result = seedance_animator.apply_lipsync(
+                        video_path=Path(result),
+                        audio_path=audio_path,
+                        output_path=lipsync_output,
+                    )
+                    if lipsync_result:
+                        # Replace original with lip-synced version
+                        import shutil
+                        shutil.move(str(lipsync_result), str(output_path))
+                        result = output_path
+            elif scene_model in ("seedance_fast", "seedance_fast_i2v"):
+                # Seedance Fast (quicker, lower quality)
+                seedance_fast_animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO_FAST)
+                # Check if lip sync is enabled
+                audio_path = None
+                lip_sync = getattr(scene, 'enable_lip_sync', None)
+                if lip_sync is None:
+                    lip_sync = config.seedance_lip_sync if config else True
+                if lip_sync and scene.dialogue:
+                    for d in scene.dialogue:
+                        if d.audio_path and Path(d.audio_path).exists():
+                            audio_path = Path(d.audio_path)
+                            break
+                # Generate video first (without lip sync)
+                result = seedance_fast_animator.animate_scene(
+                    image_path=Path(scene.image_path),
+                    prompt=prompt,
+                    output_path=output_path,
+                    duration_seconds=duration,
+                    resolution=resolution,
+                )
+                # Apply lip sync as post-processing if audio available
+                if result and audio_path:
+                    lipsync_output = output_path.parent / f"lipsync_{output_path.name}"
+                    lipsync_result = seedance_fast_animator.apply_lipsync(
+                        video_path=Path(result),
+                        audio_path=audio_path,
+                        output_path=lipsync_output,
+                    )
+                    if lipsync_result:
+                        # Replace original with lip-synced version
+                        import shutil
+                        shutil.move(str(lipsync_result), str(output_path))
+                        result = output_path
 
             if result:
                 scene.video_path = result
@@ -6313,7 +7051,7 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
             resolution = scene.resolution
 
             # Use timestamp suffix to create variants instead of overwriting
-            timestamp = int(time_module.time())
+            timestamp = get_readable_timestamp()
             output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
 
             try:
@@ -6356,6 +7094,12 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
                         resolution=res,
                         source_video=source_video,
                         first_frame=Path(scene.image_path) if use_scene_continuity else None,
+                        visual_style=config.visual_style if config else None,
+                        guidance_scale=config.wan_guidance_scale if config else None,
+                        flow_shift=config.wan_flow_shift if config else None,
+                        inference_steps=config.wan_inference_steps if config else None,
+                        shot_type=config.wan_shot_type if config else None,
+                        seed=config.wan_seed if config else 0,
                     )
 
                 elif scene_model == "seedance15":
@@ -6366,7 +7110,7 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
                     res = resolution or (config.seedance_resolution if config else "720p")
                     prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
 
-                    # Get audio for lip sync
+                    # Check if lip sync is enabled
                     audio_path = None
                     lip_sync = scene.enable_lip_sync if scene.enable_lip_sync is not None else (config.seedance_lip_sync if config else True)
                     if lip_sync and scene.dialogue:
@@ -6377,6 +7121,7 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
 
                     source_video = previous_video if use_v2v and previous_video and previous_video.exists() else None
 
+                    # Generate video first (without lip sync)
                     result = seedance_animator.animate_scene(
                         image_path=Path(scene.image_path),
                         prompt=prompt,
@@ -6384,9 +7129,61 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
                         duration_seconds=duration,
                         resolution=res,
                         source_video=source_video,
-                        audio_path=audio_path,
                         first_frame=Path(scene.image_path) if use_scene_continuity else None,
                     )
+                    # Apply lip sync as post-processing if audio available
+                    if result and audio_path:
+                        lipsync_output = output_path.parent / f"lipsync_{output_path.name}"
+                        lipsync_result = seedance_animator.apply_lipsync(
+                            video_path=Path(result),
+                            audio_path=audio_path,
+                            output_path=lipsync_output,
+                        )
+                        if lipsync_result:
+                            import shutil
+                            shutil.move(str(lipsync_result), str(output_path))
+                            result = output_path
+
+                elif scene_model in ("seedance_fast", "seedance_fast_i2v"):
+                    # Use Seedance Fast (quicker, lower quality)
+                    seedance_fast_animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO_FAST)
+
+                    res = resolution or (config.seedance_resolution if config else "720p")
+                    prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
+
+                    # Check if lip sync is enabled
+                    audio_path = None
+                    lip_sync = scene.enable_lip_sync if scene.enable_lip_sync is not None else (config.seedance_lip_sync if config else True)
+                    if lip_sync and scene.dialogue:
+                        for d in scene.dialogue:
+                            if d.audio_path and Path(d.audio_path).exists():
+                                audio_path = Path(d.audio_path)
+                                break
+
+                    source_video = previous_video if use_v2v and previous_video and previous_video.exists() else None
+
+                    # Generate video first (without lip sync)
+                    result = seedance_fast_animator.animate_scene(
+                        image_path=Path(scene.image_path),
+                        prompt=prompt,
+                        output_path=output_path,
+                        duration_seconds=duration,
+                        resolution=res,
+                        source_video=source_video,
+                        first_frame=Path(scene.image_path) if use_scene_continuity else None,
+                    )
+                    # Apply lip sync as post-processing if audio available
+                    if result and audio_path:
+                        lipsync_output = output_path.parent / f"lipsync_{output_path.name}"
+                        lipsync_result = seedance_fast_animator.apply_lipsync(
+                            video_path=Path(result),
+                            audio_path=audio_path,
+                            output_path=lipsync_output,
+                        )
+                        if lipsync_result:
+                            import shutil
+                            shutil.move(str(lipsync_result), str(output_path))
+                            result = output_path
                 else:
                     result = None
 
@@ -6438,7 +7235,7 @@ def _render_veo3_generation(state, config, use_char_refs: bool, use_scene_contin
             videos = generator.generate_all_scenes(
                 script=state.script,
                 output_dir=output_dir,
-                style=state.script.visual_style,
+                style=state.config.visual_style if state.config else state.script.visual_style,
                 use_character_references=use_char_refs,
                 use_scene_continuity=use_scene_continuity,
                 progress_callback=progress_callback,
@@ -6493,7 +7290,7 @@ def _render_wan26_generation(state, config, use_char_refs: bool, use_scene_conti
             prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
 
             # Use timestamp suffix to create variants instead of overwriting
-            timestamp = int(time_module.time())
+            timestamp = get_readable_timestamp()
             output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
 
             # Determine input for video-to-video continuity
@@ -6510,6 +7307,12 @@ def _render_wan26_generation(state, config, use_char_refs: bool, use_scene_conti
                     resolution=resolution,
                     source_video=source_video,
                     first_frame=Path(scene.image_path) if use_scene_continuity else None,
+                    visual_style=config.visual_style if config else None,
+                    guidance_scale=config.wan_guidance_scale if config else None,
+                    flow_shift=config.wan_flow_shift if config else None,
+                    inference_steps=config.wan_inference_steps if config else None,
+                    shot_type=config.wan_shot_type if config else None,
+                    seed=config.wan_seed if config else 0,
                 )
 
                 if result:
@@ -6569,7 +7372,7 @@ def _render_seedance_generation(state, config, use_char_refs: bool, use_scene_co
             prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
 
             # Use timestamp suffix to create variants instead of overwriting
-            timestamp = int(time_module.time())
+            timestamp = get_readable_timestamp()
             output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
 
             # Get audio for lip sync if enabled
@@ -6587,6 +7390,7 @@ def _render_seedance_generation(state, config, use_char_refs: bool, use_scene_co
                 source_video = previous_video
 
             try:
+                # Generate video first (without lip sync)
                 result = animator.animate_scene(
                     image_path=Path(scene.image_path),
                     prompt=prompt,
@@ -6594,9 +7398,21 @@ def _render_seedance_generation(state, config, use_char_refs: bool, use_scene_co
                     duration_seconds=duration,
                     resolution=resolution,
                     source_video=source_video,
-                    audio_path=audio_path,
                     first_frame=Path(scene.image_path) if use_scene_continuity else None,
                 )
+
+                # Apply lip sync as post-processing if audio available
+                if result and audio_path:
+                    lipsync_output = output_path.parent / f"lipsync_{output_path.name}"
+                    lipsync_result = animator.apply_lipsync(
+                        video_path=Path(result),
+                        audio_path=audio_path,
+                        output_path=lipsync_output,
+                    )
+                    if lipsync_result:
+                        import shutil
+                        shutil.move(str(lipsync_result), str(output_path))
+                        result = output_path
 
                 if result:
                     scene.video_path = result
@@ -6631,7 +7447,7 @@ def _render_traditional_generation(state) -> None:
     if st.button("🎨 Generate All Scene Images", type="primary", use_container_width=True):
         from src.services.movie_image_generator import MovieImageGenerator
 
-        generator = MovieImageGenerator(style=state.script.visual_style)
+        generator = MovieImageGenerator(style=state.config.visual_style if state.config else state.script.visual_style)
         output_dir = get_project_dir() / "images"
         output_dir.mkdir(parents=True, exist_ok=True)
 

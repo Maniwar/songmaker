@@ -33,12 +33,10 @@ class VeoAnimator:
     Note: This is a PAID API. Check Google AI pricing for costs.
     """
 
-    # Model options
+    # Model options - Veo 3.1 is the current standard
     MODELS = {
         "veo-3.1": "veo-3.1-generate-preview",
         "veo-3.1-fast": "veo-3.1-fast-generate-preview",
-        "veo-3.0": "veo-3.0-generate-001",
-        "veo-3.0-fast": "veo-3.0-fast-generate-001",
     }
 
     # Default to fast model (cheaper, faster)
@@ -135,6 +133,18 @@ class VeoAnimator:
             # Veo expects types.Image, not types.Part
             veo_image = types.Image(image_bytes=img_bytes, mime_type="image/jpeg")
 
+            # Enhance prompt with cinematic camera work and identity preservation
+            # Veo controls camera through prompt text (no shot_type API parameter)
+            enhanced_prompt = f"""{prompt}
+
+CINEMATIC CAMERA WORK:
+Use varied camera angles for cinematic storytelling - start with an establishing wide shot, smoothly transition to medium shots for character interaction, and push in for close-ups during emotional moments. Include subtle dolly movements, natural parallax, and professional cinematography.
+
+CRITICAL - CHARACTER IDENTITY PRESERVATION:
+The input image shows the EXACT person(s) that must appear in the video.
+You MUST maintain the EXACT SAME appearance - same face, same hair, same skin tone, same build, same clothing.
+DO NOT change or reinterpret the character's appearance. Animate the EXACT person shown in the image."""
+
             if progress_callback:
                 progress_callback(f"Generating video: {prompt[:50]}...", 0.3)
 
@@ -146,7 +156,7 @@ class VeoAnimator:
 
             operation = client.models.generate_videos(
                 model=model_id,
-                prompt=prompt,
+                prompt=enhanced_prompt,
                 image=veo_image,
                 config=types.GenerateVideosConfig(
                     aspect_ratio=aspect_ratio,

@@ -663,7 +663,15 @@ Respond in this exact JSON format:
 Create exactly {num_scenes} scenes. Only respond with the JSON."""
 
         try:
-            logger.info(f"Calling Claude API to generate {num_scenes} scene prompts...")
+            # Log the visual agent prompt
+            logger.info("=" * 60)
+            logger.info(f"VISUAL AGENT PROMPT (generating {num_scenes} scenes):")
+            logger.info("-" * 60)
+            logger.info(f"Visual World: {visual_world}")
+            logger.info(f"Genre: {concept.genre}, Mood: {concept.mood}")
+            logger.info(f"Visual Style: {concept.visual_style or 'cinematic'}")
+            logger.info("=" * 60)
+
             response = client.messages.create(
                 model=default_config.claude_model,  # Use global config for dynamic model selection
                 max_tokens=4096,

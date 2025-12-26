@@ -42,9 +42,171 @@ class WanModel(str, Enum):
 
 
 class SeedanceModel(str, Enum):
-    """Available Seedance 1.5 Pro models on AtlasCloud."""
+    """Available Seedance models on AtlasCloud."""
+    # Seedance 1.5 Pro (higher quality, slower)
     TEXT_TO_VIDEO = "bytedance/seedance-v1.5-pro/text-to-video"
     IMAGE_TO_VIDEO = "bytedance/seedance-v1.5-pro/image-to-video"
+    # Seedance 1 Pro Fast (faster, lower quality)
+    IMAGE_TO_VIDEO_FAST = "bytedance/seedance-v1-pro-fast/image-to-video"
+    # Lip Sync (post-processing: syncs lips in video to audio)
+    LIPSYNC = "bytedance/lipsync/audio-to-video"
+
+
+def format_wan_prompt(prompt: str, camera_hint: str = None, multi_shot: bool = True) -> str:
+    """Format a prompt for WAN 2.6's expected shot-breakdown format.
+
+    WAN 2.6 works best with prompts in this format:
+    Panoramic shot: description
+    Medium shot: description
+    Close-up: description
+
+    For multi-shot mode, provide multiple camera angles for cinematic variety.
+
+    Args:
+        prompt: The original prompt text
+        camera_hint: Optional camera/shot type hint from scene direction
+        multi_shot: If True, format for multi-shot mode with varied angles
+
+    Returns:
+        Formatted prompt for WAN 2.6
+    """
+    # If prompt already has shot breakdown format, return as-is
+    shot_keywords = ["shot:", "close-up:", "closeup:", "wide:", "medium:", "panoramic:", "tracking:"]
+    prompt_lower = prompt.lower()
+    if any(kw in prompt_lower for kw in shot_keywords):
+        return prompt
+
+    # Clean up the prompt - remove any "CRITICAL" instructions meant for other models
+    lines = prompt.split('\n')
+    clean_lines = []
+    skip_section = False
+    for line in lines:
+        line_stripped = line.strip()
+        # Skip Veo-specific instructions
+        if line_stripped.startswith("CRITICAL -") or line_stripped.startswith("IMPORTANT:"):
+            skip_section = True
+            continue
+        if skip_section and (not line_stripped or line_stripped.startswith("You MUST") or line_stripped.startswith("DO NOT") or line_stripped.startswith("Treat the")):
+            continue
+        skip_section = False
+        if line_stripped:
+            clean_lines.append(line_stripped)
+
+    clean_prompt = " ".join(clean_lines)
+
+    # Identity preservation instruction
+    identity_instruction = "Maintain the EXACT same person from the input image - same face, same features, same hair, same skin tone."
+
+    if multi_shot:
+        # Multi-shot format: provide multiple camera angles for cinematic variety
+        # WAN 2.6's AI will choose and blend between these angles
+        shot_breakdown = f"""Wide establishing shot: {clean_prompt}
+Medium shot: Character interaction and dialogue, natural body language
+Close-up: Emotional expressions and reactions, subtle facial movements
+{identity_instruction}"""
+        return shot_breakdown
+    else:
+        # Single shot mode - use camera hint or default
+        shot_type = "Medium shot"
+        if camera_hint:
+            hint_lower = camera_hint.lower()
+            if "close" in hint_lower or "closeup" in hint_lower:
+                shot_type = "Close-up"
+            elif "wide" in hint_lower or "panoramic" in hint_lower or "establishing" in hint_lower:
+                shot_type = "Wide shot"
+            elif "tracking" in hint_lower or "dolly" in hint_lower:
+                shot_type = "Tracking shot"
+            elif "over the shoulder" in hint_lower or "ots" in hint_lower:
+                shot_type = "Over-the-shoulder shot"
+            elif "pov" in hint_lower or "point of view" in hint_lower:
+                shot_type = "POV shot"
+
+        return f"{shot_type}: {clean_prompt}. {identity_instruction}"
+
+
+def format_seedance_prompt(prompt: str, camera_hint: str = None, visual_style: str = None, multi_shot: bool = True) -> str:
+    """Format a prompt for Seedance 1.5 Pro's cinematic style.
+
+    Seedance works best with prompts that include:
+    - Scene/shot description
+    - Subtle motion descriptions
+    - Camera behavior
+    - Style guidance
+    - Negative guidance embedded in prompt
+
+    For multi-shot mode, provide varied camera angles for cinematic variety.
+
+    Args:
+        prompt: The original prompt text
+        camera_hint: Optional camera/shot type hint from scene direction
+        visual_style: Visual style for style guidance
+        multi_shot: If True, format for multi-shot mode with varied angles
+
+    Returns:
+        Formatted prompt for Seedance 1.5 Pro
+    """
+    # Clean up the prompt - remove any WAN/Veo-specific instructions
+    lines = prompt.split('\n')
+    clean_lines = []
+    skip_section = False
+    for line in lines:
+        line_stripped = line.strip()
+        if line_stripped.startswith("CRITICAL -") or line_stripped.startswith("IMPORTANT:"):
+            skip_section = True
+            continue
+        if skip_section and (not line_stripped or line_stripped.startswith("You MUST") or line_stripped.startswith("DO NOT") or line_stripped.startswith("Treat the") or line_stripped.startswith("Maintain the EXACT")):
+            continue
+        skip_section = False
+        if line_stripped:
+            clean_lines.append(line_stripped)
+
+    clean_prompt = " ".join(clean_lines)
+
+    # Build style guidance
+    style_guidance = ""
+    if visual_style:
+        style_lower = visual_style.lower()
+        if "photorealistic" in style_lower or "realistic" in style_lower:
+            style_guidance = "Look/style: photorealistic, natural lighting, cinematic film grain, lifelike textures."
+        elif "anime" in style_lower:
+            style_guidance = "Look/style: high-quality anime illustration, clean linework, vibrant colors."
+        elif "3d" in style_lower or "pixar" in style_lower:
+            style_guidance = "Look/style: 3D rendered animation, smooth surfaces, dynamic lighting."
+
+    # Identity and quality guidance (embedded as negative guidance)
+    quality_guidance = "Avoid identity drift, warping, morphing faces, extra limbs, text artifacts, or sudden camera jumps."
+    identity_instruction = "Maintain the EXACT same person from the input image - same face, same features, same hair, same skin tone."
+
+    if multi_shot:
+        # Multi-shot format: provide cinematic variety with multiple camera descriptions
+        camera_description = """Camera work: Start with an establishing wide shot, smoothly transition to medium shot for character interaction, then push in to close-up for emotional moments. Use natural parallax and subtle dolly movements."""
+
+        parts = [clean_prompt, camera_description]
+        if style_guidance:
+            parts.append(style_guidance)
+        parts.append(identity_instruction)
+        parts.append(quality_guidance)
+        return " ".join(parts)
+    else:
+        # Single shot mode - use camera hint
+        camera_behavior = "Camera: subtle movement with natural parallax."
+        if camera_hint:
+            hint_lower = camera_hint.lower()
+            if "close" in hint_lower:
+                camera_behavior = "Camera: slow, subtle push-in on the subject, shallow depth of field."
+            elif "wide" in hint_lower or "establishing" in hint_lower:
+                camera_behavior = "Camera: slow pan across the scene with gentle parallax on foreground elements."
+            elif "tracking" in hint_lower or "dolly" in hint_lower:
+                camera_behavior = "Camera: smooth dolly movement following the action."
+            elif "static" in hint_lower or "fixed" in hint_lower:
+                camera_behavior = "Camera: locked off, minimal movement, stable framing."
+
+        parts = [clean_prompt, camera_behavior]
+        if style_guidance:
+            parts.append(style_guidance)
+        parts.append(identity_instruction)
+        parts.append(quality_guidance)
+        return " ".join(parts)
 
 
 class AtlasCloudAnimator:
@@ -141,6 +303,12 @@ class AtlasCloudAnimator:
         source_video: Optional[Path] = None,
         source_video_urls: Optional[list[str]] = None,
         audio_path: Optional[Path] = None,
+        visual_style: Optional[str] = None,
+        # WAN 2.6 advanced parameters (from config)
+        guidance_scale: Optional[float] = None,
+        flow_shift: Optional[float] = None,
+        inference_steps: Optional[int] = None,
+        shot_type: Optional[str] = None,
         progress_callback: Optional[Callable[[str, float], None]] = None,
         poll_interval: float = 5.0,
         max_wait_time: float = 300.0,
@@ -282,13 +450,36 @@ class AtlasCloudAnimator:
                 if seed >= 0:
                     payload["seed"] = seed
                 else:
-                    payload["seed"] = -1
+                    payload["seed"] = 0  # WAN 2.6 seed: 0 for reproducible results
 
             else:
+                # Extract camera hint from prompt if available
+                camera_hint = None
+                prompt_lower = prompt.lower()
+                if "close-up" in prompt_lower or "closeup" in prompt_lower:
+                    camera_hint = "close-up"
+                elif "wide shot" in prompt_lower or "wide angle" in prompt_lower:
+                    camera_hint = "wide"
+                elif "tracking" in prompt_lower or "dolly" in prompt_lower:
+                    camera_hint = "tracking"
+                elif "static" in prompt_lower or "locked" in prompt_lower:
+                    camera_hint = "static"
+
+                # Determine shot_type first so we can pass it to format functions
+                # Default to "multi" for cinematic feel with varied camera angles
+                actual_shot_type = shot_type if shot_type else "multi"
+                is_multi_shot = actual_shot_type == "multi"
+
+                # Format prompt based on model with multi-shot support
+                if is_seedance:
+                    formatted_prompt = format_seedance_prompt(prompt, camera_hint, visual_style, multi_shot=is_multi_shot)
+                else:
+                    formatted_prompt = format_wan_prompt(prompt, camera_hint, multi_shot=is_multi_shot)
+
                 # Standard I2V/T2V payload format
                 payload = {
                     "model": str(actual_model.value if hasattr(actual_model, 'value') else actual_model),
-                    "prompt": prompt,
+                    "prompt": formatted_prompt,
                     "resolution": resolution,
                     "duration": duration,
                 }
@@ -306,24 +497,77 @@ class AtlasCloudAnimator:
                     payload["aspect_ratio"] = "16:9"  # Default to 16:9 for video
                     payload["camera_fixed"] = False   # Allow camera movement
                     payload["generate_audio"] = True  # Generate audio with video
+                    # Use actual_shot_type determined earlier (defaults to "multi" for cinematic feel)
+                    payload["shot_type"] = actual_shot_type
+                    # Seedance uses -1 for random seed (per API docs)
+                    if seed >= 0:
+                        payload["seed"] = seed
+                    else:
+                        payload["seed"] = -1
                 else:
                     # WAN 2.6 specific parameters
-                    payload["enable_prompt_expansion"] = False  # Disable prompt expansion for precise control
-                    payload["shot_type"] = "single"  # Single camera angle for consistency
+                    # shot_type only works when enable_prompt_expansion=true
+                    # - "multi": Generate video with multiple camera angles (AI picks angles) - RECOMMENDED
+                    # - "single": Single camera angle (more consistent but less cinematic)
+                    payload["enable_prompt_expansion"] = True  # Required for shot_type to work
+                    payload["enable_prompt_optimizer"] = False  # Don't modify our prompt content
+                    # Use actual_shot_type determined earlier (defaults to "multi" for cinematic feel)
+                    payload["shot_type"] = actual_shot_type
                     payload["generate_audio"] = True  # Auto-generate audio
 
-                # Add audio for Seedance lip sync (if provided separately)
+                    # Parameters for photorealistic I2V (from config or defaults)
+                    # guidance_scale: 5-7 = realistic, 8+ = "AI look", <5 = may lose detail
+                    # flow_shift: Lower = better identity preservation, Higher = more dynamic motion
+                    actual_guidance = guidance_scale if guidance_scale is not None else 6.5
+                    actual_flow = flow_shift if flow_shift is not None else 2.5
+                    actual_steps = inference_steps if inference_steps is not None else 40
+                    payload["guidance_scale"] = actual_guidance
+                    payload["flow_shift"] = actual_flow
+                    payload["num_inference_steps"] = actual_steps
+
+                    # Conditional negative prompt based on visual style
+                    style_lower = (visual_style or "").lower()
+                    if "photorealistic" in style_lower or "realistic" in style_lower or "photo" in style_lower:
+                        # Photorealistic style - avoid CGI look and face changes
+                        payload["negative_prompt"] = "CGI, cartoon, animated, 3D render, digital art, stylized, artificial, plastic skin, video game, unrealistic, smooth skin, airbrushed, different person, face change, morphing face, wrong face"
+                    elif "anime" in style_lower or "cartoon" in style_lower:
+                        # Anime/cartoon style - avoid photorealistic
+                        payload["negative_prompt"] = "photorealistic, real photo, live action, realistic skin texture"
+                    elif "3d" in style_lower or "pixar" in style_lower or "animated" in style_lower:
+                        # 3D animated style
+                        payload["negative_prompt"] = "photorealistic, real photo, live action, 2D, flat"
+                    # else: no negative prompt for other styles
+
+                # Note: audio parameter for Seedance lip sync is not in official API docs
+                # It may be an undocumented feature - keeping for experimental use
                 if audio_path and audio_path.exists() and is_seedance:
                     payload["audio"] = self._encode_file(audio_path)
-                    logger.info("Added audio for lip sync")
+                    logger.warning("Using undocumented 'audio' param for Seedance - may not work")
 
-                if seed >= 0:
-                    payload["seed"] = seed
-                elif not is_seedance:
-                    # WAN 2.6 defaults to seed=0, use -1 for random
-                    payload["seed"] = -1
+                # Seed handling for WAN (Seedance seed already set above)
+                if not is_seedance:
+                    if seed >= 0:
+                        payload["seed"] = seed
+                    else:
+                        payload["seed"] = 0  # WAN 2.6 seed: 0 for reproducible results
 
             logger.info(f"Using model: {payload['model']}, duration: {duration}s")
+            logger.info("=" * 60)
+            logger.info("ATLASCLOUD PROMPT:")
+            logger.info("-" * 60)
+            # Log the actual prompt being sent (may be formatted for WAN)
+            actual_prompt = payload.get("prompt", prompt)
+            for line in actual_prompt.split('\n'):
+                logger.info(line)
+            if payload.get("negative_prompt"):
+                logger.info("-" * 60)
+                logger.info(f"NEGATIVE PROMPT: {payload['negative_prompt']}")
+            # Log parameters based on model type
+            if is_seedance:
+                logger.info(f"SEEDANCE PARAMS: seed={payload.get('seed')}, shot_type={payload.get('shot_type')}, aspect_ratio={payload.get('aspect_ratio')}, camera_fixed={payload.get('camera_fixed')}, generate_audio={payload.get('generate_audio')}")
+            else:
+                logger.info(f"WAN PARAMS: guidance_scale={payload.get('guidance_scale')}, flow_shift={payload.get('flow_shift')}, steps={payload.get('num_inference_steps')}, seed={payload.get('seed')}, shot_type={payload.get('shot_type')}")
+            logger.info("=" * 60)
 
             # Submit generation request
             response = requests.post(
@@ -612,6 +856,133 @@ class AtlasCloudAnimator:
             progress_callback=progress_callback,
         )
 
+    def apply_lipsync(
+        self,
+        video_path: Path,
+        audio_path: Path,
+        output_path: Path,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+        poll_interval: float = 5.0,
+        max_wait_time: float = 300.0,
+    ) -> Optional[Path]:
+        """Apply lip sync to an existing video using bytedance/lipsync model.
+
+        This is a POST-PROCESSING step that takes a video and audio,
+        and outputs a video with synchronized lip movements.
+
+        Args:
+            video_path: Path to the input video
+            audio_path: Path to the audio file (speech)
+            output_path: Path to save the lip-synced video
+            progress_callback: Optional progress callback
+            poll_interval: Seconds between status polls
+            max_wait_time: Maximum wait time in seconds
+
+        Returns:
+            Path to the lip-synced video, or None if failed
+        """
+        if progress_callback:
+            progress_callback("Preparing lip sync...", 0.1)
+
+        try:
+            # Encode video and audio as base64
+            video_data = self._encode_file(video_path)
+            audio_data = self._encode_file(audio_path)
+
+            payload = {
+                "model": SeedanceModel.LIPSYNC.value,
+                "video": video_data,
+                "audio": audio_data,
+            }
+
+            if progress_callback:
+                progress_callback("Submitting lip sync request...", 0.2)
+
+            # Submit generation request
+            response = requests.post(
+                f"{self.BASE_URL}/generateVideo",
+                headers=self._get_headers(),
+                json=payload,
+                timeout=180,
+            )
+
+            if response.status_code != 200:
+                logger.error(f"Lip sync request failed: {response.status_code} - {response.text}")
+                return None
+
+            result = response.json()
+            if result.get("code") != 200:
+                logger.error(f"Lip sync API error: {result}")
+                return None
+
+            request_id = result.get("data", {}).get("id")
+            if not request_id:
+                logger.error("No request ID in lip sync response")
+                return None
+
+            if progress_callback:
+                progress_callback("Processing lip sync...", 0.3)
+
+            # Poll for completion
+            start_time = time.time()
+            while time.time() - start_time < max_wait_time:
+                status_response = requests.get(
+                    f"{self.BASE_URL}/result/{request_id}",
+                    headers=self._get_headers(),
+                    timeout=30,
+                )
+
+                if status_response.status_code != 200:
+                    time.sleep(poll_interval)
+                    continue
+
+                status_result = status_response.json()
+                data = status_result.get("data", {})
+                status = data.get("status", "").lower()
+
+                if status in ("completed", "succeeded"):
+                    outputs = data.get("outputs", [])
+                    if outputs:
+                        video_url = outputs[0]
+                        if progress_callback:
+                            progress_callback("Downloading lip-synced video...", 0.9)
+
+                        # Download the video
+                        video_response = requests.get(video_url, timeout=120)
+                        if video_response.status_code == 200:
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+                            with open(output_path, "wb") as f:
+                                f.write(video_response.content)
+
+                            if progress_callback:
+                                progress_callback("Lip sync complete!", 1.0)
+
+                            logger.info(f"Lip-synced video saved to: {output_path}")
+                            return output_path
+
+                    logger.error("No outputs in lip sync response")
+                    return None
+
+                elif status == "failed":
+                    error = data.get("error", "Unknown error")
+                    logger.error(f"Lip sync failed: {error}")
+                    return None
+
+                # Update progress
+                elapsed = time.time() - start_time
+                progress = 0.3 + (0.6 * min(elapsed / max_wait_time, 1.0))
+                if progress_callback:
+                    progress_callback(f"Processing lip sync... ({int(elapsed)}s)", progress)
+
+                time.sleep(poll_interval)
+
+            logger.error("Lip sync timed out")
+            return None
+
+        except Exception as e:
+            logger.error(f"Lip sync error: {e}", exc_info=True)
+            return None
+
     def lip_sync_video(
         self,
         image_path: Path,
@@ -621,10 +992,11 @@ class AtlasCloudAnimator:
         resolution: str = "720p",
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> Optional[Path]:
-        """Generate video with lip-synced audio using Seedance 1.5 Pro.
+        """Generate lip-synced video from image + audio (2-step process).
 
-        Creates a video from an image with lip movements synchronized
-        to the provided audio. Great for talking head videos.
+        This method:
+        1. Generates a video from the image using Seedance
+        2. Applies lip sync using the bytedance/lipsync model
 
         Args:
             image_path: Path to the character/face image
@@ -651,16 +1023,48 @@ class AtlasCloudAnimator:
         except Exception:
             duration = 8  # Default if we can't determine
 
-        return self.animate_scene(
+        def step1_progress(msg: str, prog: float):
+            if progress_callback:
+                # Step 1 is 0-50%
+                progress_callback(f"Step 1: {msg}", prog * 0.5)
+
+        # Step 1: Generate video from image
+        temp_video = output_path.parent / f"temp_prelipsync_{output_path.stem}.mp4"
+        video_result = self.animate_scene(
             image_path=image_path,
             prompt=prompt,
-            output_path=output_path,
+            output_path=temp_video,
             duration_seconds=duration,
             resolution=resolution,
             model=SeedanceModel.IMAGE_TO_VIDEO,
-            audio_path=audio_path,
-            progress_callback=progress_callback,
+            progress_callback=step1_progress,
         )
+
+        if not video_result or not temp_video.exists():
+            logger.error("Step 1 (video generation) failed")
+            return None
+
+        def step2_progress(msg: str, prog: float):
+            if progress_callback:
+                # Step 2 is 50-100%
+                progress_callback(f"Step 2: {msg}", 0.5 + prog * 0.5)
+
+        # Step 2: Apply lip sync
+        result = self.apply_lipsync(
+            video_path=temp_video,
+            audio_path=audio_path,
+            output_path=output_path,
+            progress_callback=step2_progress,
+        )
+
+        # Clean up temp video
+        try:
+            if temp_video.exists():
+                temp_video.unlink()
+        except Exception:
+            pass
+
+        return result
 
 
 def check_atlascloud_available() -> bool:

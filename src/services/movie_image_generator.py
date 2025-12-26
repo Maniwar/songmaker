@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class MovieImageGenerator:
     """Generates images for movie scenes with character consistency."""
 
-    def __init__(self, style: str = "cinematic digital art, 4K quality, photorealistic"):
+    def __init__(self, style: str = "photorealistic, cinematic lighting, 8K quality"):
         """Initialize the movie image generator.
 
         Args:
@@ -46,11 +46,24 @@ class MovieImageGenerator:
         """
         parts = []
         direction = scene.direction
-        visual_style = script.visual_style or self.style
+        visual_style = self.style  # Use config style passed at init, not script's AI-generated style
+
+        # Detect if photorealistic style
+        style_lower = visual_style.lower()
+        is_photorealistic = any(kw in style_lower for kw in ["photorealistic", "realistic", "photo", "cinematic"])
+
+        # Photorealistic quality keywords for Gemini Native Image Generation
+        if is_photorealistic:
+            photo_quality = "RAW photograph, natural skin texture with visible pores, subsurface scattering, shot on Sony A7IV with 85mm f/1.4 lens, shallow depth of field, 8K resolution, film grain, hyperrealistic, photojournalistic"
+        else:
+            photo_quality = "highly detailed, professional quality"
 
         if has_reference_image:
             # MINIMAL PROMPT - preserve environment from reference image
-            parts.append(f"VISUAL STYLE: {visual_style}")
+            if is_photorealistic:
+                parts.append(f"RAW photograph, {visual_style}")
+            else:
+                parts.append(f"VISUAL STYLE: {visual_style}")
             parts.append(f"{direction.camera}")  # Just camera angle, no setting description
 
             # Only describe character positions/actions, not their full appearance
@@ -64,10 +77,15 @@ class MovieImageGenerator:
                     parts.append("Characters: " + ", ".join(char_positions))
 
             parts.append(f"Mood: {direction.mood}")
-            parts.append("PRESERVE the room, furniture, lighting, and environment exactly from reference image. Only adjust character positions.")
+            if is_photorealistic:
+                parts.append("natural skin texture, subsurface scattering, soft diffused lighting, 8K resolution, film grain")
+            parts.append("REFERENCE USAGE: Match character FACES from portraits. Use scene reference for STYLE/LIGHTING consistency. Character POSITIONS and CAMERA ANGLE come from this prompt, not the reference images.")
         else:
             # FULL PROMPT - no reference, describe everything
-            parts.append(f"VISUAL STYLE: {visual_style}")
+            if is_photorealistic:
+                parts.append(f"RAW photograph, unedited photo, {visual_style}")
+            else:
+                parts.append(f"VISUAL STYLE: {visual_style}")
             parts.append(f"{direction.camera} of {direction.setting}")
 
             if include_characters and direction.visible_characters:
@@ -80,14 +98,29 @@ class MovieImageGenerator:
                     parts.append("Characters present: " + "; ".join(char_descriptions))
 
             if direction.lighting:
-                parts.append(f"Lighting: {direction.lighting}")
+                if is_photorealistic:
+                    parts.append(f"Lighting: {direction.lighting}, soft diffused natural light, volumetric lighting")
+                else:
+                    parts.append(f"Lighting: {direction.lighting}")
 
             parts.append(f"Mood: {direction.mood}")
 
             if script.world_description:
                 parts.append(f"Setting style: {script.world_description}")
 
-            parts.append("highly detailed, professional cinematography")
+            # Add quality keywords based on style
+            if is_photorealistic:
+                parts.append("natural skin texture with visible pores, subsurface scattering on skin, shot on Sony A7IV with 85mm f/1.4 lens, shallow depth of field, creamy bokeh, 8K resolution, film grain, hyperrealistic, photojournalistic, candid moment aesthetic")
+            else:
+                parts.append("highly detailed, professional cinematography")
+
+        # Add negative prompt / avoid keywords (Gemini embeds these in prompt)
+        image_negative_prompt = getattr(scene, 'image_negative_prompt', None)
+        if image_negative_prompt:
+            parts.append(f"AVOID: {image_negative_prompt}")
+        elif is_photorealistic:
+            # Default anti-CGI keywords for photorealistic
+            parts.append("AVOID: CGI, cartoon, anime, 3D render, digital art, stylized, artificial, plastic skin, video game, smooth skin, airbrushed")
 
         return ". ".join(parts)
 
@@ -127,9 +160,10 @@ class MovieImageGenerator:
         # Use custom visual prompt if provided, otherwise build from scene data
         if scene.visual_prompt and scene.visual_prompt.strip():
             prompt = scene.visual_prompt
-            # If we have references, add preservation instruction
+            # For custom prompts, respect the user's camera angle and composition
+            # Only use reference images for face/appearance matching, NOT for composition
             if has_refs:
-                prompt = prompt + ". PRESERVE room, furniture, and environment from reference image."
+                prompt = prompt + ". Match character FACES and APPEARANCE from reference portraits, but use THIS PROMPT's camera angle and character positions."
             logger.info(f"Using custom visual prompt for scene {scene.index}")
         else:
             prompt = self.build_scene_prompt(scene, script, has_reference_image=has_refs)
@@ -137,12 +171,19 @@ class MovieImageGenerator:
         if progress_callback:
             progress_callback(f"Generating image for scene {scene.index + 1}...", 0.0)
 
-        logger.info(f"Generating scene {scene.index} (refs={has_refs}): {prompt[:100]}...")
+        logger.info("=" * 60)
+        logger.info(f"IMAGE PROMPT (Scene {scene.index}, refs={has_refs}):")
+        logger.info("-" * 60)
+        for line in prompt.split('\n'):
+            logger.info(line)
+        logger.info("=" * 60)
 
-        # Generate the image with timestamp to create variants instead of overwriting
-        import time
-        timestamp = int(time.time())
-        output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.png"
+        # Generate the image in per-scene images subdirectory for variant management
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        scene_images_dir = output_dir / f"scene_{scene.index:03d}" / "images"
+        scene_images_dir.mkdir(parents=True, exist_ok=True)
+        output_path = scene_images_dir / f"take_{timestamp}.png"
 
         try:
             from PIL import Image as PILImage
@@ -165,7 +206,7 @@ class MovieImageGenerator:
 
             result = self.image_generator.generate_scene_image(
                 prompt=prompt,
-                style_prefix=script.visual_style or self.style,
+                style_prefix=self.style,  # Use config style passed at init, not script's AI-generated style
                 visual_world=script.world_description,
                 reference_image=ref_img,
                 reference_images=ref_images if ref_images else None,
@@ -443,7 +484,7 @@ def build_character_consistency_prompt(
     visible_char_ids: list[str],
     camera_angle: str = "medium shot",
     mood: str = "neutral",
-    style: str = "cinematic digital art",
+    style: str = "photorealistic, cinematic lighting",
 ) -> str:
     """Build a prompt that ensures character consistency.
 

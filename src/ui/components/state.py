@@ -719,7 +719,8 @@ def ensure_movie_directories(project_name: Optional[str] = None) -> Path:
             project_name = state.script.title
 
     if not project_name:
-        project_name = f"movie_{int(time.time())}"
+        # Use "untitled" instead of timestamp to avoid creating random folders
+        project_name = "untitled"
 
     # Sanitize project name for filesystem
     safe_name = "".join(c if c.isalnum() or c in "_- " else "_" for c in project_name)
@@ -1171,6 +1172,25 @@ def render_movie_project_sidebar() -> None:
                             st.rerun()
                     else:
                         st.success("All audio files are linked to saved projects")
+
+        # New project button
+        st.divider()
+        if st.button("🆕 New Project", key="movie_new_project_btn", use_container_width=True):
+            # Clear all movie state
+            if "movie_state" in st.session_state:
+                del st.session_state["movie_state"]
+            # Clear related session state keys
+            keys_to_clear = [k for k in st.session_state.keys() if k.startswith(("movie_", "script_", "scene_", "dialogue_", "voice_", "visual_", "char_"))]
+            for k in keys_to_clear:
+                del st.session_state[k]
+            st.success("Started new project!")
+            st.rerun()
+
+        # Exit to song mode
+        if st.button("🎵 Exit to Song Mode", key="movie_exit_to_song_btn", use_container_width=True):
+            st.session_state.movie_mode = False
+            st.session_state.upscale_only_mode = False
+            st.rerun()
 
         # Settings
         with st.expander("Settings", expanded=False):

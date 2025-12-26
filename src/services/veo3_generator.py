@@ -155,7 +155,7 @@ class Veo3Generator:
         parts = []
 
         # Visual style
-        visual_style = style or script.visual_style or "cinematic film"
+        visual_style = style or script.visual_style or "photorealistic, cinematic lighting"
         parts.append(f"Style: {visual_style}")
 
         # Scene setting
@@ -256,15 +256,60 @@ class Veo3Generator:
         # Use custom prompt if provided, otherwise build from scene
         if custom_prompt and custom_prompt.strip():
             # Use custom prompt but prepend style for consistency
-            visual_style = style or script.visual_style or "cinematic film"
+            visual_style = style or script.visual_style or "photorealistic, cinematic lighting"
             prompt = f"VISUAL STYLE (CRITICAL - maintain throughout): {visual_style}\n\n{custom_prompt}"
         else:
             prompt = self.build_scene_prompt(scene, script, style)
 
         # Add style enforcement at the end for consistency
-        visual_style = style or script.visual_style or "cinematic film"
+        visual_style = style or script.visual_style or "photorealistic, cinematic lighting"
         if "photorealistic" in visual_style.lower() or "realistic" in visual_style.lower():
-            prompt += f"\n\nIMPORTANT: Maintain {visual_style} style throughout. Characters must look photorealistic and consistent with their reference images."
+            prompt += f"\n\nIMPORTANT: Maintain {visual_style} style throughout. This must look like real footage, NOT CGI or animation."
+
+        # Add cinematic camera work instructions (Veo controls camera through prompt text)
+        prompt += """
+
+CINEMATIC CAMERA WORK:
+Use varied camera angles for cinematic storytelling - start with an establishing wide shot, smoothly transition to medium shots for character interaction, and push in for close-ups during emotional moments. Include subtle dolly movements, natural parallax, and professional cinematography."""
+
+        # Add strong character identity preservation when first_frame is provided
+        if first_frame and first_frame.exists():
+            # Build identity anchors from character descriptions
+            identity_anchors = []
+            for char_id in scene.direction.visible_characters:
+                char = script.get_character(char_id)
+                if char and char.description:
+                    # Extract key physical features from description
+                    identity_anchors.append(f"- {char.name}: {char.description}")
+
+            identity_text = "\n".join(identity_anchors) if identity_anchors else ""
+
+            prompt += f"""
+
+CRITICAL - CHARACTER IDENTITY PRESERVATION:
+The first frame shows the EXACT character(s) that must appear in the video.
+You MUST maintain the EXACT SAME person(s) - same face, same hair, same skin tone, same build, same clothing.
+DO NOT change or reinterpret the character's appearance. The person in the first frame IS the character.
+{identity_text}
+
+Treat the first frame as a photograph of a real person - animate THAT specific person, not a similar-looking person."""
+
+        # Add reference image identity preservation when character portraits are provided
+        elif reference_images:
+            identity_anchors = []
+            for char_id in scene.direction.visible_characters:
+                char = script.get_character(char_id)
+                if char and char.description:
+                    identity_anchors.append(f"- {char.name}: {char.description}")
+
+            identity_text = "\n".join(identity_anchors) if identity_anchors else ""
+
+            prompt += f"""
+
+CRITICAL - CHARACTER IDENTITY:
+Reference images show the EXACT character(s) that must appear in the video.
+Maintain the EXACT SAME appearance - same face, hair, skin tone, build, and clothing as shown in the reference images.
+{identity_text}"""
 
         # Add continuity information from previous video if available
         if previous_video and use_video_continuity and previous_video.exists():
@@ -282,7 +327,12 @@ CURRENT SCENE (continue seamlessly from above):
 IMPORTANT: Maintain visual continuity with the previous scene - match character positions, lighting, and style."""
 
         logger.info("Generating scene %d with Veo 3.1", scene.index)
-        logger.debug("Prompt: %s", prompt)
+        logger.info("=" * 60)
+        logger.info("VEO 3.1 PROMPT:")
+        logger.info("-" * 60)
+        for line in prompt.split('\n'):
+            logger.info(line)
+        logger.info("=" * 60)
 
         if progress_callback:
             progress_callback(f"Generating scene {scene.index}...", 0.1)
@@ -300,14 +350,14 @@ IMPORTANT: Maintain visual continuity with the previous scene - match character 
 
             # Add reference images for character consistency (Veo 3.1 only)
             if reference_images:
+                from PIL import Image as PILImage
                 ref_images = []
                 for ref_path in reference_images[:3]:  # Max 3 reference images
                     if ref_path.exists():
-                        # Load image and create reference
-                        with open(ref_path, "rb") as f:
-                            image_data = f.read()
+                        # Load image as PIL Image object (required by google-genai SDK)
+                        pil_image = PILImage.open(ref_path)
                         ref_image = types.VideoGenerationReferenceImage(
-                            image=types.Image(data=image_data),
+                            image=pil_image,
                             reference_type="asset",
                         )
                         ref_images.append(ref_image)
@@ -321,11 +371,11 @@ IMPORTANT: Maintain visual continuity with the previous scene - match character 
                 "config": config,
             }
 
-            # Add first frame image if provided
+            # Add first frame image if provided (must be PIL Image, not types.Image)
             if first_frame and first_frame.exists():
-                with open(first_frame, "rb") as f:
-                    image_data = f.read()
-                gen_kwargs["image"] = types.Image(data=image_data)
+                from PIL import Image as PILImage
+                pil_image = PILImage.open(first_frame)
+                gen_kwargs["image"] = pil_image
 
             # Start video generation
             operation = client.models.generate_videos(**gen_kwargs)

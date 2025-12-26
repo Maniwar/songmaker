@@ -93,11 +93,11 @@ class ImageConfig:
     # - imagen-4.0-ultra-generate-001: Highest quality
     # - imagen-4.0-fast-generate-001: Fast generation
     model: str = field(
-        default_factory=lambda: os.getenv("IMAGE_MODEL", "gemini-2.5-flash-image")
+        default_factory=lambda: os.getenv("IMAGE_MODEL", "gemini-3-pro-image-preview")
     )
     aspect_ratio: str = "16:9"
     image_size: str = field(
-        default_factory=lambda: os.getenv("IMAGE_SIZE", "2K")
+        default_factory=lambda: os.getenv("IMAGE_SIZE", "4K")  # Nano Banana Pro supports up to 4K
     )
 
 

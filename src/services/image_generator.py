@@ -137,7 +137,13 @@ class ImageGenerator:
 
         # Add reference matching instructions if we have reference images
         if reference_images or reference_image:
-            full_prompt_parts.append("CRITICAL: Match reference images EXACTLY - same characters, same faces, same clothing, same room, same furniture, same lighting. Only change character positions/actions as described.")
+            # Distinguish between scene reference (environment) and character portraits (faces)
+            if reference_image and reference_images:
+                full_prompt_parts.append("REFERENCE USAGE: Match character FACES and APPEARANCES exactly from the portraits. Use the scene reference for STYLE and LIGHTING consistency. IMPORTANT: Character POSITIONS and CAMERA ANGLE come from the prompt above, NOT the reference images.")
+            elif reference_image:
+                full_prompt_parts.append("REFERENCE USAGE: Use scene reference for STYLE and LIGHTING consistency. IMPORTANT: Character POSITIONS and CAMERA ANGLE come from the prompt above, NOT the reference image.")
+            else:
+                full_prompt_parts.append("REFERENCE USAGE: Match character FACES and APPEARANCES exactly from the portraits. Character positions come from the prompt above.")
 
         full_prompt = ". ".join(full_prompt_parts)
 
@@ -221,7 +227,14 @@ class ImageGenerator:
                     ),
                 )
 
-                logger.info(f"Generating image with {model_name}, {len(all_ref_images)} refs, size={effective_image_size}, ratio={aspect_ratio}")
+                # Log the image generation prompt
+                logger.info("=" * 60)
+                logger.info(f"GEMINI IMAGE PROMPT (model={model_name}):")
+                logger.info("-" * 60)
+                for line in full_prompt.split('\n'):
+                    logger.info(line)
+                logger.info(f"Refs: {len(all_ref_images)}, Size: {effective_image_size}, Ratio: {aspect_ratio}")
+                logger.info("=" * 60)
 
                 # Use generate_content (not streaming) for image generation
                 response = client.models.generate_content(
@@ -244,6 +257,13 @@ class ImageGenerator:
 
             else:
                 # Fallback to Imagen API for non-Gemini models
+                logger.info("=" * 60)
+                logger.info(f"IMAGEN PROMPT (model={model_name}):")
+                logger.info("-" * 60)
+                for line in full_prompt.split('\n'):
+                    logger.info(line)
+                logger.info("=" * 60)
+
                 response = client.models.generate_images(
                     model=model_name,
                     prompt=full_prompt,

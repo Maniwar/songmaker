@@ -1382,9 +1382,19 @@ def render_upscale_only_page(state) -> None:
 
     st.header("AI Video Upscaler (Real-ESRGAN 4x)")
 
-    # Exit button
-    col1, col2 = st.columns([6, 1])
+    # Header buttons
+    col1, col2, col3 = st.columns([5, 1, 1])
     with col2:
+        if st.button("🆕 New", type="secondary", help="Start a fresh upload session"):
+            # Clear upscale-related session state
+            keys_to_clear = [k for k in st.session_state.keys() if k.startswith(("upscale_", "assembly_", "selected_upscaled"))]
+            for k in keys_to_clear:
+                try:
+                    del st.session_state[k]
+                except KeyError:
+                    pass
+            st.rerun()
+    with col3:
         if st.button("Exit", type="secondary"):
             # Clear upscale mode from session state
             st.session_state.upscale_only_mode = False
