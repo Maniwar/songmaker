@@ -8159,6 +8159,167 @@ def _concatenate_with_transitions(
         return False
 
 
+def _apply_music_tail(
+    video_path: Path,
+    output_path: Path,
+    tail_duration: float,
+    swell_factor: float = 1.0,
+    fade_out_duration: float = 2.0,
+    video_fade_duration: float = 1.0,
+) -> Path:
+    """Apply music tail effect: fade video to black while music continues.
+
+    This creates a cinematic ending where:
+    1. Video fades to black over video_fade_duration
+    2. Music volume optionally increases (swell) during the fade
+    3. Black screen continues for tail_duration
+    4. Music fades out at the end
+
+    Args:
+        video_path: Path to the input video (with audio)
+        output_path: Path to save the output video
+        tail_duration: Duration of black screen after video (seconds)
+        swell_factor: Volume multiplier during fade (1.0 = no change, 2.0 = double)
+        fade_out_duration: Duration of final audio fade out (seconds)
+        video_fade_duration: Duration of video fade to black (seconds)
+
+    Returns:
+        Path to the output video with music tail
+    """
+    import subprocess
+
+    # Get video info (duration, dimensions, fps)
+    probe_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate",
+        "-show_entries", "format=duration",
+        "-of", "json",
+        str(video_path)
+    ]
+    result = subprocess.run(probe_cmd, capture_output=True, text=True)
+
+    try:
+        import json
+        probe_data = json.loads(result.stdout)
+        stream = probe_data.get("streams", [{}])[0]
+        width = stream.get("width", 1920)
+        height = stream.get("height", 1080)
+        fps_str = stream.get("r_frame_rate", "30/1")
+        # Parse fps (e.g., "30000/1001" or "30/1")
+        if "/" in fps_str:
+            num, den = fps_str.split("/")
+            fps = float(num) / float(den)
+        else:
+            fps = float(fps_str)
+        video_duration = float(probe_data.get("format", {}).get("duration", 0))
+    except (json.JSONDecodeError, ValueError, KeyError, ZeroDivisionError):
+        # Fallback
+        video_duration = 0
+        width, height, fps = 1920, 1080, 30
+
+    if video_duration <= 0:
+        import shutil
+        shutil.copy(video_path, output_path)
+        return output_path
+
+    # Check if video has audio stream
+    audio_check_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_type",
+        "-of", "csv=p=0",
+        str(video_path)
+    ]
+    audio_result = subprocess.run(audio_check_cmd, capture_output=True, text=True)
+    has_audio = bool(audio_result.stdout.strip())
+
+    if not has_audio:
+        logger.warning("Video has no audio - music tail requires audio")
+        import shutil
+        shutil.copy(video_path, output_path)
+        return output_path
+
+    # Calculate timing
+    fade_start = max(0, video_duration - video_fade_duration)
+    total_duration = video_duration + tail_duration
+    fade_out_start = total_duration - fade_out_duration
+
+    # Use filter_complex to handle both video and audio properly
+    # Strategy:
+    # 1. Video: fade to black, then add black frames using tpad
+    # 2. Audio: loop the audio to extend it, apply volume swell, then fade out
+
+    # Build the filter_complex
+    filter_parts = []
+
+    # Video chain: fade to black, then pad with black color (not clone)
+    # tpad with color=black creates actual black frames
+    filter_parts.append(
+        f"[0:v]fade=t=out:st={fade_start}:d={video_fade_duration}:color=black,"
+        f"tpad=stop_mode=color:color=black:stop_duration={tail_duration}[vout]"
+    )
+
+    # Audio chain: loop to extend, apply volume curve, then fade out
+    # aloop loops the audio - we need enough loops to cover tail_duration
+    # Then trim to exact length
+    loops_needed = int((tail_duration / video_duration) + 2)  # Extra for safety
+
+    if swell_factor > 1.0:
+        # Volume expression: ramp up during video fade, stay high, then fade out
+        # - Before fade_start: volume = 1.0
+        # - During fade (fade_start to video_duration): ramp from 1.0 to swell_factor
+        # - During tail (video_duration to fade_out_start): stay at swell_factor
+        # - During final fade (fade_out_start to end): ramp down to 0
+        vol_expr = (
+            f"if(lt(t,{fade_start}),1,"
+            f"if(lt(t,{video_duration}),1+({swell_factor}-1)*(t-{fade_start})/{video_fade_duration},"
+            f"if(lt(t,{fade_out_start}),{swell_factor},"
+            f"{swell_factor}*(1-(t-{fade_out_start})/{fade_out_duration}))))"
+        )
+        filter_parts.append(
+            f"[0:a]aloop=loop={loops_needed}:size=2147483647,"
+            f"atrim=0:{total_duration},"
+            f"volume='{vol_expr}':eval=frame[aout]"
+        )
+    else:
+        # No swell, just loop, trim, and fade out at end
+        filter_parts.append(
+            f"[0:a]aloop=loop={loops_needed}:size=2147483647,"
+            f"atrim=0:{total_duration},"
+            f"afade=t=out:st={fade_out_start}:d={fade_out_duration}[aout]"
+        )
+
+    filter_complex = ";".join(filter_parts)
+
+    # Run FFmpeg with filter_complex
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-t", str(total_duration),
+        str(output_path)
+    ]
+
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        logger.info(f"Music tail applied: fade at {fade_start:.1f}s, tail {tail_duration:.1f}s, total {total_duration:.1f}s")
+        return output_path
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Music tail FFmpeg error: {e.stderr}")
+        # Fallback - just copy the original
+        import shutil
+        shutil.copy(video_path, output_path)
+        return output_path
+
+
 def _mix_audio_tracks(
     base_audio_path: Optional[Path],
     tracks: list,
@@ -8910,6 +9071,74 @@ def render_render_page() -> None:
                         unsafe_allow_html=True
                     )
 
+        # Music tail options (fade to black with music continuing) - OUTSIDE the if/else
+        st.markdown("---")
+        st.markdown("#### Ending Options")
+        st.caption("Fade to black with music/audio continuing")
+
+        tail_col1, tail_col2, tail_col3 = st.columns(3)
+
+        with tail_col1:
+            new_tail_duration = st.number_input(
+                "Music Tail (s)",
+                min_value=0.0,
+                max_value=30.0,
+                value=float(state.music_tail_duration),
+                step=1.0,
+                key="music_tail_duration",
+                help="Duration music continues after video fades to black (0 = disabled)"
+            )
+            if new_tail_duration != state.music_tail_duration:
+                state.music_tail_duration = new_tail_duration
+                save_movie_state()
+
+        with tail_col2:
+            new_tail_swell = st.slider(
+                "Music Swell",
+                min_value=1.0,
+                max_value=2.0,
+                value=float(state.music_tail_swell),
+                step=0.1,
+                key="music_tail_swell",
+                help="Increase music volume during fade (1.0 = no change, 2.0 = double volume)"
+            )
+            if new_tail_swell != state.music_tail_swell:
+                state.music_tail_swell = new_tail_swell
+                save_movie_state()
+
+        with tail_col3:
+            new_fade_out = st.number_input(
+                "Final Fade Out (s)",
+                min_value=0.0,
+                max_value=10.0,
+                value=float(state.music_tail_fade_out),
+                step=0.5,
+                key="music_tail_fade_out",
+                help="Fade out duration at the very end"
+            )
+            if new_fade_out != state.music_tail_fade_out:
+                state.music_tail_fade_out = new_fade_out
+                save_movie_state()
+
+        if state.music_tail_duration > 0:
+            # Show preview of the ending timeline
+            fade_start = video_duration - 1.0  # 1 second video fade to black
+            music_end = video_duration + state.music_tail_duration
+            st.markdown(
+                f"""
+                <div style="margin-top: 8px; padding: 8px; background: #1a1a1a; border-radius: 4px;">
+                    <span style="font-size: 11px; color: #888;">Ending preview:</span>
+                    <div style="font-size: 12px; color: #aaa; margin-top: 4px;">
+                        📹 Video fades to black at {fade_start:.1f}s<br/>
+                        {'🔊 Music swells during fade<br/>' if state.music_tail_swell > 1 else ''}
+                        ⬛ Black screen: {video_duration:.1f}s - {music_end:.1f}s<br/>
+                        🎵 Music fades out: {music_end - state.music_tail_fade_out:.1f}s - {music_end:.1f}s
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
     # Asset check
     st.markdown("### Asset Check")
 
@@ -9351,6 +9580,34 @@ def render_render_page() -> None:
                     # No audio at all - just use video
                     import shutil
                     shutil.copy(video_only_path, final_output)
+
+            # Step 4.5: Apply music tail if enabled (fade to black with music continuing)
+            if state.music_tail_duration > 0 and final_output.exists():
+                status_text.text("Applying music tail effect...")
+                progress_bar.progress(0.75, text="Creating fade to black with music tail...")
+
+                # Create output with music tail
+                tail_output = output_dir / f"{state.script.title.replace(' ', '_')}_tail_{timestamp}.mp4"
+
+                try:
+                    _apply_music_tail(
+                        video_path=final_output,
+                        output_path=tail_output,
+                        tail_duration=state.music_tail_duration,
+                        swell_factor=state.music_tail_swell,
+                        fade_out_duration=state.music_tail_fade_out,
+                        video_fade_duration=1.0,  # 1 second fade to black
+                    )
+
+                    # Replace final_output with the tail version
+                    if tail_output.exists():
+                        final_output.unlink()
+                        tail_output.rename(final_output)
+                        status_text.text("Music tail applied successfully!")
+                        progress_bar.progress(0.8, text="Music tail complete")
+                except Exception as e:
+                    logger.warning(f"Music tail failed: {e}")
+                    st.warning(f"Music tail effect failed: {e}")
 
             # Step 5: Generate subtitles if enabled
             if show_subtitles and audio_clips:
