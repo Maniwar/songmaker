@@ -424,11 +424,12 @@ class AtlasCloudAnimator:
                     payload["generate_audio"] = True  # Generate audio with video
                     # Use actual_shot_type determined earlier (defaults to "multi" for cinematic feel)
                     payload["shot_type"] = actual_shot_type
-                    # AtlasCloud API: -1 means random seed, >=0 means specific seed
+                    # Seed for reproducibility: use provided seed, or default to 42 for consistency
+                    # (not -1 which is random) - allows A/B testing and shot matching
                     if seed >= 0:
                         payload["seed"] = seed
                     else:
-                        payload["seed"] = -1  # Explicitly send -1 for random (per API docs)
+                        payload["seed"] = 42  # Default to reproducible seed (not random)
                 else:
                     # WAN 2.6 specific parameters
                     # shot_type only works when enable_prompt_expansion=true
@@ -476,39 +477,54 @@ class AtlasCloudAnimator:
                     else:
                         payload["seed"] = 0  # WAN 2.6 seed: 0 for reproducible results
 
-            logger.info(f"Using model: {payload['model']}, duration: {duration}s")
-            logger.info("=" * 60)
-            logger.info("ATLASCLOUD PROMPT:")
-            logger.info("-" * 60)
-            # Log the actual prompt being sent (may be formatted for WAN)
-            actual_prompt = payload.get("prompt", prompt)
-            for line in actual_prompt.split('\n'):
-                logger.info(line)
-            if payload.get("negative_prompt"):
-                logger.info("-" * 60)
-                logger.info(f"NEGATIVE PROMPT: {payload['negative_prompt']}")
-            # Log image inputs - CRITICAL DEBUG INFO
-            logger.info("-" * 60)
+            # === COMPREHENSIVE API CALL LOGGING ===
             has_start_img = "image" in payload
             has_target_img = "last_image" in payload
             start_size = len(payload['image']) if has_start_img else 0
             target_size = len(payload['last_image']) if has_target_img else 0
-            logger.info(f"IMAGE INPUTS:")
-            logger.info(f"  start_image (image): {'YES - ' + str(start_size) + ' bytes' if has_start_img else 'NO - NOT SENT'}")
-            logger.info(f"  target_image (last_image): {'YES - ' + str(target_size) + ' bytes' if has_target_img else 'NO - NOT SENT'}")
-            logger.info(f"  Function params: image_path={image_path}, last_frame={last_frame}")
-            # Also print to console for immediate visibility
-            print(f"\n{'='*60}")
-            print(f"ATLASCLOUD API CALL - IMAGE INPUTS:")
-            print(f"  start_image (image): {'✅ YES - ' + str(start_size) + ' bytes from ' + str(image_path) if has_start_img else '❌ NO - NOT SENT'}")
-            print(f"  target_image (last_image): {'✅ YES - ' + str(target_size) + ' bytes from ' + str(last_frame) if has_target_img else '❌ NO - NOT SENT'}")
-            print(f"{'='*60}\n")
-            # Log parameters based on model type
+
+            # Print comprehensive console output
+            print(f"\n{'='*70}")
+            print(f"🎬 ATLASCLOUD API REQUEST")
+            print(f"{'='*70}")
+            print(f"MODEL: {payload['model']}")
+            print(f"{'─'*70}")
+            print(f"📸 IMAGES:")
+            print(f"   start_image (image):      {'✅ ' + str(start_size) + ' bytes' if has_start_img else '❌ NOT SENT'}")
+            if has_start_img and image_path:
+                print(f"                             └─ {image_path.name if hasattr(image_path, 'name') else image_path}")
+            print(f"   target_image (last_image): {'✅ ' + str(target_size) + ' bytes' if has_target_img else '❌ NOT SENT'}")
+            if has_target_img and last_frame:
+                print(f"                             └─ {last_frame.name if hasattr(last_frame, 'name') else last_frame}")
+            print(f"{'─'*70}")
+            print(f"⚙️  PARAMETERS:")
+            print(f"   duration:      {payload.get('duration', 'N/A')}s")
+            print(f"   resolution:    {payload.get('resolution', 'N/A')}")
+            print(f"   seed:          {payload.get('seed', 'N/A')}")
+            print(f"   aspect_ratio:  {payload.get('aspect_ratio', 'N/A')}")
             if is_seedance:
-                logger.info(f"SEEDANCE PARAMS: seed={payload.get('seed')}, shot_type={payload.get('shot_type')}, aspect_ratio={payload.get('aspect_ratio')}, camera_fixed={payload.get('camera_fixed')}, generate_audio={payload.get('generate_audio')}")
+                print(f"   camera_fixed:  {payload.get('camera_fixed', 'N/A')}")
+                print(f"   generate_audio:{payload.get('generate_audio', 'N/A')}")
             else:
-                logger.info(f"WAN PARAMS: guidance_scale={payload.get('guidance_scale')}, flow_shift={payload.get('flow_shift')}, steps={payload.get('num_inference_steps')}, seed={payload.get('seed')}, shot_type={payload.get('shot_type')}")
-            logger.info("=" * 60)
+                print(f"   guidance_scale:{payload.get('guidance_scale', 'N/A')}")
+                print(f"   flow_shift:    {payload.get('flow_shift', 'N/A')}")
+                print(f"   shot_type:     {payload.get('shot_type', 'N/A')}")
+            print(f"{'─'*70}")
+            print(f"📝 PROMPT:")
+            actual_prompt = payload.get("prompt", prompt)
+            for line in actual_prompt.split('\n')[:5]:  # First 5 lines
+                print(f"   {line[:80]}{'...' if len(line) > 80 else ''}")
+            if len(actual_prompt.split('\n')) > 5:
+                print(f"   ... ({len(actual_prompt.split(chr(10)))} lines total)")
+            if payload.get("negative_prompt"):
+                print(f"{'─'*70}")
+                print(f"🚫 NEGATIVE PROMPT: {payload['negative_prompt'][:60]}...")
+            print(f"{'='*70}\n")
+
+            # Also log to file
+            logger.info(f"Using model: {payload['model']}, duration: {duration}s")
+            logger.info(f"Images: start={'YES' if has_start_img else 'NO'}, target={'YES' if has_target_img else 'NO'}")
+            logger.info(f"Params: seed={payload.get('seed')}, resolution={payload.get('resolution')}")
 
             # Submit generation request
             response = requests.post(

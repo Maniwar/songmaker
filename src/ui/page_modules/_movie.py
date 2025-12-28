@@ -3524,9 +3524,8 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                             all_img_variants.add(str(Path(scene.image_path).resolve()))
                         num_img_var = len(all_img_variants)
 
-                        # Count video variants
-                        video_dir = get_project_dir() / "videos"
-                        video_variants = list(video_dir.glob(f"scene_{scene.index:03d}*.mp4")) if video_dir.exists() else []
+                        # Count video variants (from both new per-scene folder and legacy location)
+                        video_variants = get_scene_video_variants(scene.index)
                         num_vid_var = len(video_variants)
 
                         # Always show variant pickers row (image and video)
@@ -3979,7 +3978,6 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                     # This allows picking any image from any scene as start/target
                                     all_project_images = {}  # path -> (scene_idx, variant_name)
                                     scenes_dir = get_project_dir() / "scenes"
-                                    print(f"\n[DEBUG] Collecting images from all {len(script.scenes)} scenes. scenes_dir={scenes_dir}")
 
                                     for s in script.scenes:
                                         s_idx = s.index
@@ -3988,16 +3986,12 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                             p = str(Path(s.image_path).resolve())
                                             if p not in all_project_images:
                                                 all_project_images[p] = (s_idx, "main")
-                                                print(f"[DEBUG] Scene {s_idx}: Added image_path: {p}")
-                                            else:
-                                                print(f"[DEBUG] Scene {s_idx}: SKIPPED (already S{all_project_images[p][0]}): {Path(p).name}")
                                         # From scene's variants list
                                         for var_path in getattr(s, 'image_variants', []) or []:
                                             if Path(var_path).exists():
                                                 p = str(Path(var_path).resolve())
                                                 if p not in all_project_images:
                                                     all_project_images[p] = (s_idx, Path(var_path).stem[-8:])
-                                                    print(f"[DEBUG] Scene {s_idx}: Added variant: {p}")
                                         # From scene's images directory
                                         s_img_dir = scenes_dir / f"scene_{s_idx:03d}" / "images"
                                         if s_img_dir.exists():
@@ -4005,7 +3999,6 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                                 p = str(img.resolve())
                                                 if p not in all_project_images:
                                                     all_project_images[p] = (s_idx, img.stem[-8:])
-                                                    print(f"[DEBUG] Scene {s_idx}: Added from dir: {p}")
 
                                     # Also collect extracted frames from continuity directories
                                     for s in script.scenes:
@@ -4024,22 +4017,12 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                         s_idx, name = all_project_images.get(path, (0, Path(path).stem[-12:]))
                                         return f"S{s_idx}: {name}"
 
-                                    # Debug: show how many images found
+                                    # Show how many images found
                                     if sorted_images:
                                         unique_scenes = len(set(v[0] for v in all_project_images.values()))
                                         st.caption(f"📷 {len(sorted_images)} images available from {unique_scenes} scene{'s' if unique_scenes != 1 else ''}")
-                                        # Detailed debug output
-                                        print(f"\n[DEBUG] === IMAGE COLLECTION SUMMARY ===")
-                                        print(f"[DEBUG] Total images found: {len(sorted_images)}")
-                                        print(f"[DEBUG] From scenes: {sorted(set(v[0] for v in all_project_images.values()))}")
-                                        for img_path, (s_idx, label) in sorted(all_project_images.items(), key=lambda x: x[1][0]):
-                                            print(f"[DEBUG]   S{s_idx}: {label} -> {Path(img_path).name}")
-                                        print(f"[DEBUG] ================================\n")
                                     else:
                                         st.warning("⚠️ No images found in project - generate scene images first")
-                                        print(f"\n[DEBUG] ⚠️ NO IMAGES FOUND!")
-                                        print(f"[DEBUG] scenes_dir exists: {scenes_dir.exists()}")
-                                        print(f"[DEBUG] script.scenes count: {len(script.scenes)}")
 
                                     # === INPUT BADGES (what will be passed to video gen) ===
                                     # Get custom image paths
@@ -4128,14 +4111,19 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                                 custom_start_path = new_start_img
 
                                         # Show preview (use newly selected value if available)
+                                        preview_start = None
                                         if use_prev_frame and extracted_frame_path:
-                                            st.image(str(extracted_frame_path), width="stretch")
-                                        elif not use_prev_frame and sorted_images and new_start_img and Path(new_start_img).exists():
-                                            st.image(new_start_img, width="stretch")
+                                            preview_start = str(extracted_frame_path)
+                                        elif not use_prev_frame and sorted_images:
+                                            # Use the value from dropdown
+                                            preview_start = new_start_img
                                         elif custom_start_path and Path(custom_start_path).exists():
-                                            st.image(custom_start_path, width="stretch")
+                                            preview_start = custom_start_path
                                         elif has_scene_image:
-                                            st.image(str(scene.image_path), width="stretch")
+                                            preview_start = str(scene.image_path)
+
+                                        if preview_start and Path(preview_start).exists():
+                                            st.image(preview_start, width="stretch")
                                         else:
                                             st.warning("No start frame")
 
@@ -9368,9 +9356,6 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
 
                     # Check for custom start image (user-selected from UI)
                     custom_start = getattr(scene, 'custom_start_image', None)
-                    print(f"\n[DEBUG GEN] Scene {scene.index}: custom_start_image = {custom_start}")
-                    print(f"[DEBUG GEN] Scene {scene.index}: first_frame_override = {first_frame_override}")
-                    print(f"[DEBUG GEN] Scene {scene.index}: input_image = {input_image}")
                     if custom_start and Path(custom_start).exists():
                         start_image = Path(custom_start)
                         logger.info(f"Scene {scene.index}: Using custom start image: {start_image.name}")
@@ -9381,12 +9366,9 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
 
                     # Check for custom target image (user-selected from UI)
                     custom_target = getattr(scene, 'custom_target_image', None)
-                    print(f"[DEBUG GEN] Scene {scene.index}: custom_target_image = {custom_target}")
-                    print(f"[DEBUG GEN] Scene {scene.index}: scene.image_path = {scene.image_path}")
                     if custom_target and Path(custom_target).exists():
                         target_image = Path(custom_target)
                         logger.info(f"Scene {scene.index}: Using custom target image: {target_image.name}")
-                        print(f"[DEBUG GEN] Scene {scene.index}: -> Using CUSTOM target: {target_image.name}")
                     elif scene.image_path and Path(scene.image_path).exists():
                         # Default: use scene's own image as target (for smooth transition)
                         target_image = Path(scene.image_path)
