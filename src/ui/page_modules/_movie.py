@@ -3376,13 +3376,11 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
 
                         # Auto-detect video from project videos directory if not set
                         if not has_video:
-                            video_dir = get_project_dir() / "videos"
-                            if video_dir.exists():
-                                video_matches = list(video_dir.glob(f"scene_{scene.index:03d}*.mp4"))
-                                if video_matches:
-                                    # Use the first match and update scene (don't save during render)
-                                    scene.video_path = str(sorted(video_matches)[0])
-                                    has_video = True
+                            video_matches = get_scene_video_variants(scene.index)
+                            if video_matches:
+                                # Use the most recent video and update scene (don't save during render)
+                                scene.video_path = str(video_matches[0])  # Already sorted by mtime, newest first
+                                has_video = True
 
                         # Show video if available, otherwise show image
                         # Determine display image: use scene image OR last frame preview
@@ -3406,11 +3404,10 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                     st.caption("No image")
                             with vid_tab:
                                 st.video(str(scene.video_path))
-                                # Video variants
-                                video_dir = get_project_dir() / "videos"
-                                video_variants = list(video_dir.glob(f"scene_{scene.index:03d}*.mp4"))
-                                if len(video_variants) > 1:
-                                    st.caption(f"📹 {len(video_variants)} variants")
+                                # Video variants (from both per-scene and legacy folders)
+                                vid_variants = get_scene_video_variants(scene.index)
+                                if len(vid_variants) > 1:
+                                    st.caption(f"📹 {len(vid_variants)} variants")
                         elif display_image:
                             st.image(display_image, width="stretch")
                             if display_is_last_frame:
@@ -3555,8 +3552,15 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                         with var_col2:
                             # Video variant picker
                             if num_vid_var >= 1:
-                                vid_names = {str(v.resolve()): v.stem.replace(f"scene_{scene.index:03d}", "").lstrip("_") or "v1"
-                                             for v in sorted(video_variants)}
+                                # Create friendly names - handle both legacy (scene_XXX_timestamp.mp4) and new (video_timestamp.mp4) formats
+                                def get_vid_label(v):
+                                    name = v.stem
+                                    # New format: video_YYYYMMDD_HHMMSS.mp4 -> extract timestamp
+                                    if name.startswith("video_"):
+                                        return name[6:]  # Remove "video_" prefix
+                                    # Legacy format: scene_XXX_timestamp.mp4 -> extract timestamp
+                                    return name.replace(f"scene_{scene.index:03d}", "").lstrip("_") or "v1"
+                                vid_names = {str(v.resolve()): get_vid_label(v) for v in video_variants}
                                 cur_vid = str(Path(scene.video_path).resolve()) if scene.video_path and Path(scene.video_path).exists() else ""
                                 vid_opts = list(vid_names.keys())
                                 vid_idx = vid_opts.index(cur_vid) if cur_vid in vid_opts else 0
@@ -3633,12 +3637,14 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                     else:
                                         chars_without_portraits.append(char.name)
 
-                            # Get style reference (previous scene)
-                            style_ref_path = None
+                            # Get style reference - check custom first, then auto (previous scene)
+                            custom_style_ref = getattr(scene, 'custom_style_ref', None)
+                            auto_style_ref_path = None
                             if scene.index > 1:
                                 prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
                                 if prev_scene and prev_scene.image_path and Path(prev_scene.image_path).exists():
-                                    style_ref_path = prev_scene.image_path
+                                    auto_style_ref_path = prev_scene.image_path
+                            style_ref_path = custom_style_ref if (custom_style_ref and Path(custom_style_ref).exists()) else auto_style_ref_path
 
                             # === IMAGE GENERATION SECTION ===
                             st.markdown("### 🖼️ Image Generation")
@@ -3653,19 +3659,99 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                             if chars_without_portraits:
                                 st.warning(f"⚠️ Missing portraits: {', '.join(chars_without_portraits)} - generate portraits in Characters tab")
 
-                            st.markdown("**Input Images:**")
+                            # Collect all project images for selection
+                            all_img_options = ["(auto)"]
+                            project_scenes_dir = get_project_dir() / "scenes"
+                            for s in script.scenes:
+                                # Add scene's main image
+                                if s.image_path and Path(s.image_path).exists():
+                                    all_img_options.append(str(Path(s.image_path).resolve()))
+                                # Add scene's variants
+                                for var in getattr(s, 'image_variants', []) or []:
+                                    if Path(var).exists():
+                                        resolved = str(Path(var).resolve())
+                                        if resolved not in all_img_options:
+                                            all_img_options.append(resolved)
+                                # Add from scene images directory
+                                s_img_dir = project_scenes_dir / f"scene_{s.index:03d}" / "images"
+                                if s_img_dir.exists():
+                                    for img in list(s_img_dir.glob("*.png")) + list(s_img_dir.glob("*.jpg")):
+                                        resolved = str(img.resolve())
+                                        if resolved not in all_img_options:
+                                            all_img_options.append(resolved)
+                            # Also add character portraits
+                            char_portrait_paths = {}
+                            for char in script.characters:
+                                if char.reference_image_path and Path(char.reference_image_path).exists():
+                                    resolved = str(Path(char.reference_image_path).resolve())
+                                    char_portrait_paths[char.id] = resolved
+                                    if resolved not in all_img_options:
+                                        all_img_options.append(resolved)
+
+                            def get_img_opt_label(path):
+                                if path == "(auto)":
+                                    return "(auto)"
+                                p = Path(path)
+                                # Check if it's a character portrait
+                                for char_id, char_path in char_portrait_paths.items():
+                                    if char_path == path:
+                                        char = script.get_character(char_id)
+                                        return f"👤 {char.name if char else char_id}"
+                                # Check which scene it belongs to
+                                for s in script.scenes:
+                                    if s.image_path and str(Path(s.image_path).resolve()) == path:
+                                        return f"S{s.index}: main"
+                                    s_img_dir = project_scenes_dir / f"scene_{s.index:03d}" / "images"
+                                    if str(s_img_dir.resolve()) in path:
+                                        return f"S{s.index}: {p.stem[-12:]}"
+                                return p.stem[-15:]
+
+                            st.markdown("**Input Images:** _(click to change)_")
                             if chars_with_portraits or style_ref_path:
-                                img_cols = st.columns(min(len(chars_with_portraits) + (1 if style_ref_path else 0), 5))
+                                num_inputs = len(chars_with_portraits) + (1 if True else 0)  # Always show style ref column
+                                img_cols = st.columns(min(num_inputs, 5))
                                 col_idx = 0
+
+                                # Character portraits (currently read-only - from character definition)
                                 for name, path in chars_with_portraits[:4]:
                                     with img_cols[col_idx]:
                                         st.image(path, width=70)
                                         st.caption(f"📷 {name}")
                                     col_idx += 1
-                                if style_ref_path and col_idx < len(img_cols):
+
+                                # Style reference - SELECTABLE
+                                if col_idx < len(img_cols):
                                     with img_cols[col_idx]:
-                                        st.image(style_ref_path, width=70)
-                                        st.caption("🎨 Style ref")
+                                        if style_ref_path and Path(style_ref_path).exists():
+                                            st.image(str(style_ref_path), width=70)
+                                        else:
+                                            st.info("No ref", icon="🎨")
+
+                                        # Dropdown to change style ref
+                                        current_style_resolved = str(Path(style_ref_path).resolve()) if style_ref_path else "(auto)"
+                                        style_idx = all_img_options.index(current_style_resolved) if current_style_resolved in all_img_options else 0
+                                        new_style_ref = st.selectbox(
+                                            "Style ref",
+                                            options=all_img_options,
+                                            index=style_idx,
+                                            format_func=get_img_opt_label,
+                                            key=f"img_style_ref_{scene.index}",
+                                            label_visibility="collapsed"
+                                        )
+                                        if new_style_ref == "(auto)":
+                                            if custom_style_ref is not None:
+                                                try:
+                                                    scene.custom_style_ref = None
+                                                except Exception:
+                                                    object.__setattr__(scene, 'custom_style_ref', None)
+                                                save_movie_state()
+                                        elif new_style_ref != custom_style_ref:
+                                            try:
+                                                scene.custom_style_ref = new_style_ref
+                                            except Exception:
+                                                object.__setattr__(scene, 'custom_style_ref', new_style_ref)
+                                            save_movie_state()
+                                            st.rerun()
                             else:
                                 st.caption("No reference images (text-only generation)")
 
@@ -3744,6 +3830,14 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                         st.session_state[f"visual_prompt_version_{scene.index}"] = widget_version + 1
                                         st.success("Image prompt regenerated!")
                                         st.rerun()
+
+                            # Generate Image button - actually creates the image using the prompt above
+                            gen_img_label = "🎨 Generate Image" if not (scene.image_path and Path(scene.image_path).exists()) else "🔄 Regenerate Image"
+                            if st.button(gen_img_label, key=f"gen_scene_img_{scene.index}",
+                                        use_container_width=True, type="primary"):
+                                print(f"\n🎯 Generate Image button clicked for Scene {scene.index}")
+                                _generate_single_scene_image(scene, script, state)
+                                st.rerun()
 
                             # === VIDEO GENERATION SECTION ===
                             st.markdown("---")
@@ -4164,9 +4258,32 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                             else:
                                                 st.warning("No target frame")
 
+                                            # Style reference selector for generation
+                                            st.caption("Style Reference:")
+                                            style_ref_key = f"style_ref_{scene.index}"
+                                            current_style_ref = st.session_state.get(style_ref_key, "auto")
+                                            style_ref_options = ["auto"] + sorted_images
+                                            style_ref_idx = 0
+                                            if current_style_ref != "auto" and current_style_ref in sorted_images:
+                                                style_ref_idx = sorted_images.index(current_style_ref) + 1
+                                            new_style_ref = st.selectbox(
+                                                "Style ref",
+                                                options=style_ref_options,
+                                                index=style_ref_idx,
+                                                format_func=lambda x: "Auto (prev scene)" if x == "auto" else get_img_label(x),
+                                                key=f"style_ref_select_{scene.index}",
+                                                label_visibility="collapsed"
+                                            )
+                                            if new_style_ref != current_style_ref:
+                                                st.session_state[style_ref_key] = new_style_ref
+
                                             # Generate new target button
                                             if st.button("🎨 Generate New", key=f"gen_target_{scene.index}", width="stretch"):
-                                                _generate_single_scene_image(scene, script, state)
+                                                # Pass custom style ref if selected
+                                                custom_style_ref = None
+                                                if new_style_ref != "auto" and Path(new_style_ref).exists():
+                                                    custom_style_ref = Path(new_style_ref)
+                                                _generate_single_scene_image(scene, script, state, custom_style_ref=custom_style_ref)
                                                 st.rerun()
                                         else:
                                             st.markdown("**ℹ️ WAN: Single Input**")
@@ -5898,8 +6015,15 @@ def _generate_all_scene_images(script: Script, state: MovieModeState) -> None:
     st.success(f"Generated {len(scenes_to_generate)} scene images!")
 
 
-def _generate_single_scene_image(scene, script: Script, state: MovieModeState) -> None:
-    """Generate image for a single scene, storing as variant."""
+def _generate_single_scene_image(scene, script: Script, state: MovieModeState, custom_style_ref: Optional[Path] = None) -> None:
+    """Generate image for a single scene, storing as variant.
+
+    Args:
+        scene: The scene to generate image for
+        script: Full script for character lookup
+        state: MovieModeState
+        custom_style_ref: Optional custom style reference image path (overrides auto prev-scene)
+    """
     from src.services.movie_image_generator import MovieImageGenerator
     import time
 
@@ -5928,15 +6052,25 @@ def _generate_single_scene_image(scene, script: Script, state: MovieModeState) -
     timestamp = get_readable_timestamp()
     output_path = scene_dir / f"take_{variant_num:03d}_{timestamp}.png"
 
-    # Find style reference image (previous scene for continuity) - only if enabled
+    # Find style reference image - priority: param > scene.custom_style_ref > auto (prev scene)
     reference_image = None
-    if use_prev_image and scene.index > 1:
+    style_ref_source = "none"
+    if custom_style_ref and custom_style_ref.exists():
+        # Parameter passed directly (e.g., from target frame Generate New button)
+        reference_image = custom_style_ref
+        style_ref_source = f"custom (param): {custom_style_ref.name}"
+    elif getattr(scene, 'custom_style_ref', None) and Path(scene.custom_style_ref).exists():
+        # Scene-level custom style ref (set in Image Generation UI)
+        reference_image = Path(scene.custom_style_ref)
+        style_ref_source = f"custom (scene): {reference_image.name}"
+    elif use_prev_image and scene.index > 1:
+        # Auto: use previous scene's image
         prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
         if prev_scene:
             prev_img = prev_scene.get_selected_image()
             if prev_img and prev_img.exists():
                 reference_image = prev_img
-                logger.info(f"Using previous scene image as reference: {prev_img.name}")
+                style_ref_source = f"auto (prev scene {scene.index - 1}): {prev_img.name}"
 
     # Collect ALL character portraits for visible characters
     character_portraits = []
@@ -5945,6 +6079,34 @@ def _generate_single_scene_image(scene, script: Script, state: MovieModeState) -
             char = script.get_character(char_id)
             if char and char.reference_image_path and Path(char.reference_image_path).exists():
                 character_portraits.append(Path(char.reference_image_path))
+
+    # Console logging - show everything being sent
+    print(f"\n{'='*70}")
+    print(f"🎨 IMAGE GENERATION REQUEST - Scene {scene.index}")
+    print(f"{'='*70}")
+    print(f"MODEL: {image_model}")
+    print(f"SIZE: {image_size}")
+    print(f"ASPECT RATIO: {aspect_ratio}")
+    print(f"{'─'*70}")
+    print(f"📸 INPUTS:")
+    print(f"   Style Reference:    {style_ref_source}")
+    print(f"   Character Portraits: {len(character_portraits)} portraits")
+    for i, p in enumerate(character_portraits):
+        print(f"      [{i+1}] {p.name}")
+    print(f"{'─'*70}")
+    print(f"📝 PROMPT SOURCE:")
+    custom_prompt = scene.visual_prompt if scene.visual_prompt and scene.visual_prompt.strip() else None
+    if custom_prompt:
+        print(f"   Using CUSTOM visual_prompt ({len(custom_prompt)} chars)")
+        print(f"   Preview: {custom_prompt[:100]}...")
+    else:
+        print(f"   Using AUTO-GENERATED from scene direction")
+        print(f"   Setting: {scene.direction.setting[:80] if scene.direction.setting else 'N/A'}...")
+        print(f"   Camera: {scene.direction.camera}")
+        print(f"   Visible chars: {scene.direction.visible_characters}")
+    print(f"{'─'*70}")
+    print(f"📁 OUTPUT: {output_path}")
+    print(f"{'='*70}")
 
     with st.spinner(f"Generating image variant {variant_num} for Scene {scene.index} ({image_model}, {image_size}, {aspect_ratio})..."):
         try:
@@ -5961,13 +6123,27 @@ def _generate_single_scene_image(scene, script: Script, state: MovieModeState) -
                 aspect_ratio=aspect_ratio,
             )
             if result:
+                # Use resolved path for consistency with image collection
+                result_path = str(Path(result).resolve())
+                print(f"✅ Generated: {result_path}")
                 # Add to variants and select it
-                idx = scene.add_image_variant(str(result))
+                idx = scene.add_image_variant(result_path)
                 scene.select_image_variant(idx)
+                # Also update custom_target_image to the newly generated image (resolved path)
+                try:
+                    scene.custom_target_image = result_path
+                except Exception:
+                    object.__setattr__(scene, 'custom_target_image', result_path)
                 save_movie_state()
+                print(f"✅ Added as variant #{idx + 1}, set as custom_target_image: {result_path}")
                 st.toast(f"Generated image variant {variant_num} for Scene {scene.index}")
+            else:
+                print(f"❌ Generation returned None - check console for error details")
+                st.error(f"❌ Image generation failed for Scene {scene.index}. Check console/terminal for error details.")
         except Exception as e:
-            st.error(f"Failed: {e}")
+            error_msg = str(e)
+            print(f"❌ Generation failed: {error_msg}")
+            st.error(f"❌ Image generation failed: {error_msg}")
 
 
 def _render_scene_image_manager(scene, script: Script, state: MovieModeState, compact: bool = False) -> None:
@@ -6321,8 +6497,7 @@ def _render_scene_video_manager(scene: "MovieScene", state: "MovieModeState", co
     """
     has_video = scene.video_path and Path(scene.video_path).exists()
 
-    # Collect all video variants
-    video_dir = get_project_dir() / "videos"
+    # Collect all video variants from both per-scene and legacy folders
     existing_variants = []
     seen_paths = set()
 
@@ -6339,10 +6514,9 @@ def _render_scene_video_manager(scene: "MovieScene", state: "MovieModeState", co
     if has_video:
         add_variant(Path(scene.video_path))
 
-    # Add videos from video directory matching this scene
-    if video_dir.exists():
-        for vid_file in video_dir.glob(f"scene_{scene.index:03d}*.mp4"):
-            add_variant(vid_file)
+    # Add videos from both per-scene and legacy directories
+    for vid_file in get_scene_video_variants(scene.index):
+        add_variant(vid_file)
 
     num_variants = len(existing_variants)
 
@@ -8000,19 +8174,17 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
             # Seedance uses embedded quality guidance in prompt, not a separate negative_prompt
             st.caption("ℹ️ **Seedance:** Quality guidance embedded in prompt (camera behavior, style, anti-drift)")
 
-        # Collect video variants (same logic as video manager)
-        video_dir = get_project_dir() / "videos"
+        # Collect video variants from both per-scene and legacy folders
         video_variants = []
         video_seen = set()
         if has_video:
             video_variants.append(Path(scene.video_path))
             video_seen.add(str(Path(scene.video_path).resolve()))
-        if video_dir.exists():
-            for vid_file in video_dir.glob(f"scene_{scene.index:03d}*.mp4"):
-                resolved = str(vid_file.resolve())
-                if resolved not in video_seen:
-                    video_variants.append(vid_file)
-                    video_seen.add(resolved)
+        for vid_file in get_scene_video_variants(scene.index):
+            resolved = str(vid_file.resolve())
+            if resolved not in video_seen:
+                video_variants.append(vid_file)
+                video_seen.add(resolved)
         num_video_variants = len(video_variants)
 
         vid_col1, vid_col2 = st.columns([1, 2])
@@ -8959,9 +9131,8 @@ def _render_movie_scene_card(state, scene, generation_method: str, model_info: d
     # Count image variants (cached)
     num_img_variants = _count_scene_variants(scene.index, len(scene.image_variants))
 
-    # Count video variants
-    video_dir = get_project_dir() / "videos"
-    video_variants = list(video_dir.glob(f"scene_{scene.index:03d}*.mp4")) if video_dir.exists() else []
+    # Count video variants (use helper that checks both new and legacy folders)
+    video_variants = get_scene_video_variants(scene.index)
     num_vid_variants = len(video_variants)
 
     # Status icons

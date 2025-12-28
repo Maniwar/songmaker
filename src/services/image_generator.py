@@ -276,7 +276,8 @@ class ImageGenerator:
                 logger.info("-" * 60)
                 for line in full_prompt.split('\n'):
                     logger.info(line)
-                logger.info(f"Refs: {len(all_ref_images)}, Size: {effective_image_size or 'default'}, Ratio: {aspect_ratio}")
+                num_refs = (len(reference_images) if reference_images else 0) + (1 if reference_image else 0)
+                logger.info(f"Refs: {num_refs}, Size: {effective_image_size or 'default'}, Ratio: {aspect_ratio}")
                 logger.info("=" * 60)
 
                 # Use generate_content (not streaming) for image generation
@@ -330,9 +331,16 @@ class ImageGenerator:
             return image
 
         except Exception as e:
-            print(f"Image generation failed: {e}")
-            # Try fallback to placeholder image
-            return self._create_placeholder_image(prompt, output_path)
+            error_msg = str(e)
+            print(f"\n{'='*70}")
+            print(f"❌ IMAGE GENERATION FAILED")
+            print(f"{'='*70}")
+            print(f"Error: {error_msg}")
+            print(f"Model: {model_name}")
+            print(f"Prompt preview: {full_prompt[:200]}...")
+            print(f"{'='*70}\n")
+            # Re-raise the exception so caller can handle/display it
+            raise RuntimeError(f"Image generation failed: {error_msg}") from e
 
     def generate_motion_prompt_from_image(
         self,
