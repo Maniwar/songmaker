@@ -17,11 +17,11 @@ logger = logging.getLogger(__name__)
 class MovieImageGenerator:
     """Generates images for movie scenes with character consistency."""
 
-    def __init__(self, style: str = "photorealistic, cinematic lighting, 8K quality"):
+    def __init__(self, style: str = ""):
         """Initialize the movie image generator.
 
         Args:
-            style: Base visual style for all images
+            style: Base visual style for all images (from project config)
         """
         self.style = style
         self.image_generator = ImageGenerator()
@@ -59,27 +59,32 @@ class MovieImageGenerator:
             photo_quality = "highly detailed, professional quality"
 
         if has_reference_image:
-            # MINIMAL PROMPT - preserve environment from reference image
+            # REFERENCE MODE - preserve environment from reference image but include setting details
             if is_photorealistic:
                 parts.append(f"RAW photograph, {visual_style}")
             else:
                 parts.append(f"VISUAL STYLE: {visual_style}")
-            parts.append(f"{direction.camera}")  # Just camera angle, no setting description
 
-            # Only describe character positions/actions, not their full appearance
+            # Include setting description to ensure environment consistency
+            parts.append(f"{direction.camera} of {direction.setting}")
+
+            # Include character descriptions for consistency
             if include_characters and direction.visible_characters:
-                char_positions = []
+                char_descriptions = []
                 for char_id in direction.visible_characters:
                     character = script.get_character(char_id)
                     if character:
-                        char_positions.append(f"{character.name} visible")
-                if char_positions:
-                    parts.append("Characters: " + ", ".join(char_positions))
+                        char_descriptions.append(f"{character.name}: {character.description}")
+                if char_descriptions:
+                    parts.append("Characters: " + "; ".join(char_descriptions))
 
             parts.append(f"Mood: {direction.mood}")
             if is_photorealistic:
                 parts.append("natural skin texture, subsurface scattering, soft diffused lighting, 8K resolution, film grain")
-            parts.append("REFERENCE USAGE: Match character FACES from portraits. Use scene reference for STYLE/LIGHTING consistency. Character POSITIONS and CAMERA ANGLE come from this prompt, not the reference images.")
+
+            # Explicit environment preservation instructions
+            parts.append("CRITICAL ENVIRONMENT PRESERVATION: The reference image shows the EXACT room/location. You MUST keep ALL furniture, props, decorations, and environmental details EXACTLY as shown in the reference. Do NOT add, remove, or change any furniture or objects in the room.")
+            parts.append("REFERENCE USAGE: Match character FACES from portraits. Preserve ENVIRONMENT/FURNITURE exactly from scene reference. Character POSITIONS and CAMERA ANGLE come from this prompt.")
         else:
             # FULL PROMPT - no reference, describe everything
             if is_photorealistic:
@@ -154,8 +159,18 @@ class MovieImageGenerator:
         """
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Check for location reference image in scene direction
+        location_ref_path = getattr(scene.direction, 'location_reference_path', None)
+        if location_ref_path and Path(location_ref_path).exists():
+            # Use location reference as the primary reference image (environment/location)
+            location_ref = Path(location_ref_path)
+            logger.info(f"Using scene location reference: {location_ref.name}")
+            # If we also have a previous scene reference, we'll prioritize location ref
+            reference_image = location_ref
+
         # Determine if we have reference images (affects prompt building)
         has_refs = bool(reference_image) or bool(character_portraits)
+        has_location_ref = location_ref_path and Path(location_ref_path).exists()
 
         # Use custom visual prompt if provided, otherwise build from scene data
         if scene.visual_prompt and scene.visual_prompt.strip():
@@ -163,7 +178,10 @@ class MovieImageGenerator:
             # For custom prompts, respect the user's camera angle and composition
             # Only use reference images for face/appearance matching, NOT for composition
             if has_refs:
-                prompt = prompt + ". Match character FACES and APPEARANCE from reference portraits, but use THIS PROMPT's camera angle and character positions."
+                if has_location_ref:
+                    prompt = prompt + ". CRITICAL: Use the location reference image for the ENVIRONMENT/ROOM/SETTING. Match character FACES from portraits. Character POSITIONS and CAMERA ANGLE come from this prompt."
+                else:
+                    prompt = prompt + ". Match character FACES and APPEARANCE from reference portraits, but use THIS PROMPT's camera angle and character positions."
             logger.info(f"Using custom visual prompt for scene {scene.index}")
         else:
             prompt = self.build_scene_prompt(scene, script, has_reference_image=has_refs)
@@ -317,6 +335,7 @@ class MovieImageGenerator:
         model: Optional[str] = None,
         source_image: Optional["Image.Image"] = None,
         progress_callback: Optional[Callable[[str, float], None]] = None,
+        transform_prompt: Optional[str] = None,
     ) -> Optional[Path]:
         """Generate a reference image for a character.
 
@@ -329,6 +348,7 @@ class MovieImageGenerator:
             model: Optional model override (e.g., "gemini-2.0-flash-exp")
             source_image: Optional source photo to transform into character
             progress_callback: Optional progress callback
+            transform_prompt: Optional custom prompt for photo transformation
 
         Returns:
             Path to generated reference image
@@ -353,15 +373,50 @@ class MovieImageGenerator:
                 image_size=image_size,
                 aspect_ratio=aspect_ratio,
                 model=model,
+                custom_prompt=transform_prompt,
             )
         else:
-            # Generate from scratch
-            prompt = (
-                f"{effective_style} style portrait. "
-                f"A {effective_style} character portrait of {character.description}. "
-                f"Centered composition, neutral expression, professional lighting. "
-                f"Highly detailed, {effective_style}."
-            )
+            # Generate from scratch - use custom prompt if provided
+            if transform_prompt:
+                prompt = transform_prompt
+            else:
+                # Build detailed prompt based on style
+                style_lower = effective_style.lower()
+                is_photorealistic = any(kw in style_lower for kw in ["photorealistic", "realistic", "photo", "cinematic"])
+                is_anime = any(kw in style_lower for kw in ["anime", "manga", "cartoon"])
+
+                if is_photorealistic:
+                    # Photorealistic portrait prompt
+                    prompt = f"""RAW photograph portrait of {character.description}.
+
+Shot on Sony A7IV with 85mm f/1.4 lens, shallow depth of field, creamy bokeh.
+Natural skin texture with visible pores, subsurface scattering.
+Professional studio lighting, soft diffused light, natural shadows.
+8K resolution, film grain, hyperrealistic, photojournalistic.
+Centered composition, neutral background, professional headshot.
+
+AVOID: CGI, cartoon, anime, 3D render, digital art, stylized, artificial, plastic skin, airbrushed, smooth skin."""
+                elif is_anime:
+                    # Anime/manga portrait prompt
+                    prompt = f"""High-quality anime illustration of {character.description}.
+
+{effective_style} style, clean linework, vibrant colors.
+Professional anime character portrait, centered composition.
+Detailed eyes, expressive face, polished illustration.
+Neutral background, studio lighting style.
+
+AVOID: photorealistic, real photo, live action, western cartoon style."""
+                else:
+                    # General artistic style
+                    prompt = f"""{effective_style} style character portrait of {character.description}.
+
+Professional {effective_style} illustration, highly detailed.
+Centered composition, neutral expression, professional lighting.
+Consistent art style throughout, clean execution.
+
+Art style: {effective_style}."""
+
+            logger.info(f"Generating character portrait with prompt: {prompt[:200]}...")
 
             try:
                 result_image = self.image_generator.generate_scene_image(
@@ -393,11 +448,16 @@ class MovieImageGenerator:
         image_size: str = "2K",
         aspect_ratio: str = "1:1",
         model: Optional[str] = None,
+        custom_prompt: Optional[str] = None,
     ) -> Optional[Path]:
         """Transform a source photo into a character portrait using Gemini.
 
         Uses gemini-2.5-flash-image or gemini-3-pro-image-preview for image editing.
         Imagen models don't support image input.
+
+        Args:
+            custom_prompt: Optional custom transformation prompt. If not provided,
+                          a default prompt will be generated.
         """
         from io import BytesIO
         from PIL import Image as PILImage
@@ -413,7 +473,7 @@ class MovieImageGenerator:
         client = genai.Client(api_key=config.google_api_key)
 
         # Use Gemini models for image editing - Imagen doesn't support image input
-        # gemini-2.5-flash-image is optimized for image editing
+        # gemini-2.5-flash-image is optimized for image editing (max 2K)
         # gemini-3-pro-image-preview is best for complex edits up to 4K
         if model and "imagen" in model.lower():
             logger.warning("Imagen doesn't support image editing, using gemini-2.5-flash-image")
@@ -424,27 +484,51 @@ class MovieImageGenerator:
             # Default to gemini-2.5-flash-image for fast image editing
             model_name = "gemini-2.5-flash-image"
 
-        # Build transformation prompt following Google's best practices
-        transform_prompt = f"""Transform this photograph into a {style} style character portrait.
+        # gemini-2.5-flash-image doesn't support image_size parameter - omit it
+        # gemini-3-pro-image-preview supports 2K, 4K
+        is_flash_model = "flash" in model_name.lower() or "2.5" in model_name
+        if is_flash_model:
+            effective_size = None  # Let the API use its default
+            logger.info(f"{model_name} doesn't support image_size parameter, using default")
+        else:
+            effective_size = image_size
+
+        # Use custom prompt if provided, otherwise build default
+        if custom_prompt:
+            transform_prompt = custom_prompt
+        else:
+            # Build transformation prompt following Google's best practices
+            transform_prompt = f"""Transform this photograph into a {style} style character portrait.
 
 KEEP the person's face shape, eye shape, and basic facial features recognizable.
 APPLY this character description: {character.description}
 CHANGE the art style to: {style}
 Make it a professional quality portrait with good composition and lighting."""
 
-        logger.info(f"Transforming photo with {model_name}, size={image_size}")
+        logger.info(f"Transforming photo with {model_name}, size={effective_size}")
+        logger.info(f"Character: {character.name}")
+        logger.info(f"Style: {style}")
+        logger.info(f"Transform prompt: {transform_prompt}")
 
         try:
             # Use the simpler format: contents=[prompt, image]
+            # Build image_config - only include image_size if supported
+            if effective_size:
+                image_config = types.ImageConfig(
+                    aspect_ratio=aspect_ratio,
+                    image_size=effective_size,
+                )
+            else:
+                image_config = types.ImageConfig(
+                    aspect_ratio=aspect_ratio,
+                )
+
             response = client.models.generate_content(
                 model=model_name,
                 contents=[transform_prompt, source_image],
                 config=types.GenerateContentConfig(
                     response_modalities=['IMAGE', 'TEXT'],
-                    image_config=types.ImageConfig(
-                        aspect_ratio=aspect_ratio,
-                        image_size=image_size,
-                    ),
+                    image_config=image_config,
                 ),
             )
 
@@ -452,15 +536,46 @@ Make it a professional quality portrait with good composition and lighting."""
             result_image = None
             error_text = None
 
-            for part in response.parts:
-                if part.inline_data and part.inline_data.data:
-                    result_image = PILImage.open(BytesIO(part.inline_data.data))
-                    break
-                elif hasattr(part, 'as_image') and callable(part.as_image):
-                    result_image = part.as_image()
-                    break
+            # Log response structure for debugging
+            try:
+                parts = response.parts if response.parts else []
+                logger.info(f"Response has {len(parts)} parts")
+            except Exception as e:
+                logger.error(f"Error accessing response.parts: {e}")
+                # Try to access response in different ways
+                logger.info(f"Response type: {type(response)}")
+                logger.info(f"Response dir: {[a for a in dir(response) if not a.startswith('_')]}")
+                if hasattr(response, 'candidates') and response.candidates:
+                    logger.info(f"Candidates: {len(response.candidates)}")
+                    if response.candidates[0].content and response.candidates[0].content.parts:
+                        parts = response.candidates[0].content.parts
+                        logger.info(f"Got {len(parts)} parts from candidates")
+                    else:
+                        parts = []
+                else:
+                    parts = []
+
+            for i, part in enumerate(parts):
+                logger.debug(f"Part {i}: inline_data={part.inline_data is not None}, text={part.text is not None if hasattr(part, 'text') else 'N/A'}")
+                if part.inline_data is not None:
+                    # Use inline_data.data to get PIL Image (more reliable)
+                    if part.inline_data.data:
+                        result_image = PILImage.open(BytesIO(part.inline_data.data))
+                        logger.info(f"Got image via inline_data.data from part {i}")
+                        break
+                    # Fallback to as_image() - returns google genai Image, not PIL
+                    elif hasattr(part, 'as_image') and callable(part.as_image):
+                        try:
+                            genai_image = part.as_image()
+                            # Google's Image.save() doesn't take format param, just filename
+                            genai_image.save(str(output_path))
+                            logger.info(f"Saved image via as_image() from part {i}")
+                            return output_path  # Already saved, return directly
+                        except Exception as e:
+                            logger.warning(f"as_image() failed: {e}")
                 elif part.text:
                     error_text = part.text
+                    logger.info(f"Part {i} has text: {part.text[:100]}...")
 
             if result_image:
                 result_image.save(output_path, format="PNG")
@@ -468,9 +583,12 @@ Make it a professional quality portrait with good composition and lighting."""
                 return output_path
             else:
                 if error_text:
-                    logger.error(f"Model returned text instead of image: {error_text[:200]}")
+                    logger.error(f"Model returned text instead of image: {error_text[:500]}")
                 else:
-                    logger.error("No image returned from transformation")
+                    # Log more details about why no image was found
+                    logger.error(f"No image returned from transformation. Response candidates: {len(response.candidates) if hasattr(response, 'candidates') and response.candidates else 0}")
+                    if hasattr(response, 'prompt_feedback'):
+                        logger.error(f"Prompt feedback: {response.prompt_feedback}")
                 return None
 
         except Exception as e:
@@ -484,7 +602,7 @@ def build_character_consistency_prompt(
     visible_char_ids: list[str],
     camera_angle: str = "medium shot",
     mood: str = "neutral",
-    style: str = "photorealistic, cinematic lighting",
+    style: str = "",
 ) -> str:
     """Build a prompt that ensures character consistency.
 
@@ -497,7 +615,7 @@ def build_character_consistency_prompt(
         visible_char_ids: IDs of characters visible in this scene
         camera_angle: Camera angle/shot type
         mood: Scene mood
-        style: Visual style
+        style: Visual style (from project config)
 
     Returns:
         Complete prompt string
@@ -511,10 +629,9 @@ def build_character_consistency_prompt(
     for char in visible_chars:
         parts.append(f"{char.name} ({char.description})")
 
-    parts.extend([
-        f"Mood: {mood}",
-        f"Style: {style}",
-        "highly detailed, consistent character appearance, professional cinematography",
-    ])
+    parts.append(f"Mood: {mood}")
+    if style:
+        parts.append(f"Style: {style}")
+    parts.append("highly detailed, consistent character appearance, professional cinematography")
 
     return ". ".join(parts)

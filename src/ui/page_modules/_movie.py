@@ -16,6 +16,7 @@ from src.models.schemas import (
     MovieModeState,
     MovieTone,
     MovieWorkflowStep,
+    SceneType,
     Script,
     VoiceSettings,
 )
@@ -90,6 +91,55 @@ def get_video_negative_prompt(visual_style: str, model: str = "wan26") -> str:
         return "low quality, blurry, distorted, deformed, ugly"
 
 
+def save_to_variations_if_unique(source_path: Path, char_id: str, var_dir: Path) -> Optional[Path]:
+    """Save a file to variations only if its content is unique.
+
+    Prevents duplicate variations by checking file content hash before saving.
+
+    Args:
+        source_path: Path to the source file to save
+        char_id: Character ID for naming
+        var_dir: Directory to save variations
+
+    Returns:
+        Path to the saved variation, or None if it was a duplicate
+    """
+    import hashlib
+    import shutil
+
+    var_dir.mkdir(parents=True, exist_ok=True)
+
+    # Calculate hash of source file
+    try:
+        source_hash = hashlib.md5(source_path.read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+    # Check existing variations for duplicates
+    existing_hashes = {}
+    existing_nums = []
+    for vp in var_dir.glob(f"character_{char_id}_var_*.png"):
+        try:
+            file_hash = hashlib.md5(vp.read_bytes()).hexdigest()
+            existing_hashes[file_hash] = vp
+            num = int(vp.stem.split("_")[-1])
+            existing_nums.append(num)
+        except (ValueError, Exception):
+            pass
+
+    # If this exact content already exists, return None (duplicate)
+    if source_hash in existing_hashes:
+        logger.debug(f"Skipping duplicate variation for character {char_id}")
+        return None
+
+    # Save with next available index
+    next_idx = max(existing_nums) + 1 if existing_nums else 0
+    var_path = var_dir / f"character_{char_id}_var_{next_idx}.png"
+    shutil.copy(source_path, var_path)
+    logger.debug(f"Saved unique variation: {var_path}")
+    return var_path
+
+
 def get_movie_state() -> MovieModeState:
     """Get or initialize movie mode state."""
     if "movie_state" not in st.session_state:
@@ -130,6 +180,84 @@ def get_project_dir(create_if_missing: bool = True) -> Path:
     return project_dir
 
 
+def extract_last_frame_from_video(video_path: Path, output_dir: Path = None, force: bool = False) -> Optional[Path]:
+    """Extract the last frame from a video file for continuity.
+
+    Args:
+        video_path: Path to the video file
+        output_dir: Directory to save the extracted frame (defaults to video's parent)
+        force: If True, re-extract even if cached frame exists and is newer than video
+
+    Returns:
+        Path to the extracted frame image, or None if extraction failed
+    """
+    import subprocess
+    import tempfile
+
+    if not video_path.exists():
+        logger.warning(f"Video not found for frame extraction: {video_path}")
+        return None
+
+    # Determine output path
+    if output_dir is None:
+        output_dir = video_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{video_path.stem}_last_frame.jpg"
+
+    # Check if we can use cached version (extracted frame exists and is newer than video)
+    if not force and output_path.exists():
+        video_mtime = video_path.stat().st_mtime
+        frame_mtime = output_path.stat().st_mtime
+        if frame_mtime >= video_mtime:
+            # Cached frame is up-to-date
+            return output_path
+
+    try:
+        # Get video duration first
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path)
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            logger.error(f"Failed to probe video: {result.stderr}")
+            return None
+
+        duration = float(result.stdout.strip())
+        # Get frame from 0.1s before the end to avoid potential black frames
+        seek_time = max(0, duration - 0.1)
+
+        # Extract the last frame
+        extract_cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(seek_time),
+            "-i", str(video_path),
+            "-vframes", "1",
+            "-q:v", "2",  # High quality JPEG
+            str(output_path)
+        ]
+        result = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            logger.error(f"Failed to extract frame: {result.stderr}")
+            return None
+
+        if output_path.exists():
+            logger.info(f"Extracted last frame from {video_path.name} -> {output_path.name}")
+            return output_path
+        else:
+            logger.error("Frame extraction produced no output")
+            return None
+
+    except subprocess.TimeoutExpired:
+        logger.error("Frame extraction timed out")
+        return None
+    except Exception as e:
+        logger.error(f"Frame extraction error: {e}")
+        return None
+
+
 def update_movie_state(**kwargs) -> None:
     """Update movie mode state."""
     state = get_movie_state()
@@ -146,7 +274,7 @@ def advance_movie_step() -> None:
 
     # Check if we should skip VOICES step (video modes generate audio natively)
     gen_method = state.config.generation_method if state.config else "tts_images"
-    is_video_mode = gen_method in ("veo3", "wan26", "seedance15")
+    is_video_mode = gen_method in ("veo3", "wan26", "seedance15", "seedance_fast")
 
     if current_idx < len(steps) - 1:
         next_step = steps[current_idx + 1]
@@ -234,7 +362,7 @@ def render_movie_progress(current_step: MovieWorkflowStep) -> None:
 
     # Check generation method - video modes (veo3, wan26, seedance15) generate their own audio
     gen_method = state.config.generation_method if state.config else "tts_images"
-    is_video_mode = gen_method in ("veo3", "wan26", "seedance15")
+    is_video_mode = gen_method in ("veo3", "wan26", "seedance15", "seedance_fast")
 
     # Build steps list - VISUALS is now integrated into SCENES
     all_steps = [
@@ -881,14 +1009,14 @@ def render_setup_page() -> None:
 
             sd_col1, sd_col2 = st.columns(2)
             with sd_col1:
-                # Seedance supports 3-15 seconds
+                # Seedance 1.5 Pro supports 3-12 seconds
                 selected_seedance_duration = st.slider(
                     "Clip Duration (seconds)",
                     min_value=3,
-                    max_value=15,
-                    value=cfg_sd_duration,
+                    max_value=12,
+                    value=min(cfg_sd_duration, 12),  # Clamp to max 12
                     key="setup_seedance_duration",
-                    help="Seedance supports flexible 3-15 second clips"
+                    help="Seedance 1.5 Pro supports 3-12 second clips"
                 )
             with sd_col2:
                 selected_seedance_lip_sync = st.checkbox(
@@ -1356,11 +1484,11 @@ def render_characters_page() -> None:
             st.markdown("---")
             st.markdown("**Character Portrait**")
 
-            # Get visual style from config (set in Setup) or script
+            # Get visual style from config (set in Setup) or script - no hardcoded default
             visual_style = (
                 (state.config.visual_style if state.config else None)
                 or (state.script.visual_style if state.script else None)
-                or "photorealistic, cinematic lighting"
+                or ""
             )
 
             # Create two-column layout for portrait section
@@ -1387,12 +1515,30 @@ def render_characters_page() -> None:
 
                     port_col1, port_col2 = st.columns(2)
                     with port_col1:
+                        # Nano Banana Fast (gemini-2.5-flash-image) max is 1024px (1K)
+                        # Nano Banana Pro (gemini-3-pro-image-preview) supports up to 4K
+                        # Imagen models support 2K
+                        is_flash_model = "flash" in portrait_model.lower()
+                        is_pro_model = "pro" in portrait_model.lower()
+                        if is_flash_model:
+                            size_options = ["1K"]  # Flash model max is 1024px
+                            size_help = "Nano Banana Fast max is 1K (1024px)"
+                            default_idx = 0
+                        elif is_pro_model:
+                            size_options = ["2K", "4K"]
+                            size_help = "Nano Banana Pro supports up to 4K"
+                            default_idx = 1  # Default to 4K
+                        else:
+                            # Imagen models
+                            size_options = ["2K"]
+                            size_help = "Imagen models support 2K"
+                            default_idx = 0
                         portrait_size = st.selectbox(
                             "Size",
-                            options=["2K", "4K"],
-                            index=1,  # Default to 4K
+                            options=size_options,
+                            index=default_idx,
                             key=f"portrait_size_{i}",
-                            help="4K produces higher quality portraits"
+                            help=size_help
                         )
                     with port_col2:
                         portrait_aspect = st.selectbox(
@@ -1415,6 +1561,26 @@ def render_characters_page() -> None:
                 )
                 if source_photo:
                     st.image(source_photo, width=100, caption="Source photo")
+
+                    # Show the transformation prompt that will be used
+                    default_transform_prompt = f"""Transform this photograph into a {visual_style} style character portrait.
+
+KEEP the person's face shape, eye shape, and basic facial features recognizable.
+APPLY this character description: {char.description}
+CHANGE the art style to: {visual_style}
+Make it a professional quality portrait with good composition and lighting."""
+
+                    with st.expander("📝 Transformation Prompt", expanded=False):
+                        transform_prompt = st.text_area(
+                            "Edit prompt if needed",
+                            value=default_transform_prompt,
+                            height=150,
+                            key=f"transform_prompt_{i}",
+                            help="This prompt tells the AI how to transform your photo"
+                        )
+                        # Store custom prompt in session state for use during transform
+                        st.session_state[f"custom_transform_prompt_{char.id}"] = transform_prompt
+
                     if st.button("🔄 Transform into Character", key=f"transform_{i}"):
                         from src.services.movie_image_generator import MovieImageGenerator
                         from PIL import Image
@@ -1449,6 +1615,8 @@ def render_characters_page() -> None:
 
                         generator = MovieImageGenerator(style=visual_style)
                         output_dir = get_project_dir() / "characters"
+                        # Get custom transform prompt from session state
+                        custom_prompt = st.session_state.get(f"custom_transform_prompt_{char.id}")
                         with st.spinner(f"Transforming photo into {char.name}..."):
                             result = generator.generate_character_reference(
                                 character=char,
@@ -1458,30 +1626,22 @@ def render_characters_page() -> None:
                                 aspect_ratio=portrait_aspect,
                                 model=portrait_model,
                                 source_image=source_img,
+                                transform_prompt=custom_prompt,
                             )
                             if result:
                                 char.reference_image_path = str(result)
 
-                                # Also save the new portrait to variations for browsing
+                                # Save to variations (only if unique content)
                                 var_dir = get_project_dir() / "characters" / "variations"
-                                var_dir.mkdir(parents=True, exist_ok=True)
-                                existing_nums = []
-                                for vp in var_dir.glob(f"character_{char.id}_var_*.png"):
-                                    try:
-                                        num = int(vp.stem.split("_")[-1])
-                                        existing_nums.append(num)
-                                    except ValueError:
-                                        pass
-                                next_idx = max(existing_nums) + 1 if existing_nums else 0
-                                var_path = var_dir / f"character_{char.id}_var_{next_idx}.png"
-                                shutil.copy(result, var_path)
+                                save_to_variations_if_unique(result, char.id, var_dir)
 
                                 # Auto-save project with source path
                                 try:
                                     save_movie_state()
-                                except Exception:
-                                    pass
-                                st.success("Photo transformed and saved to variations!")
+                                    logger.info(f"Saved state after portrait generation: {char.reference_image_path}")
+                                except Exception as e:
+                                    logger.error(f"Failed to save state after portrait: {e}")
+                                st.success("Photo transformed!")
                                 st.rerun()
                             else:
                                 st.error("Failed to transform photo")
@@ -1513,12 +1673,31 @@ def render_characters_page() -> None:
                     var_dir.mkdir(parents=True, exist_ok=True)
                     existing_variations = list(var_dir.glob(f"character_{char.id}_var_*.png"))
 
+                    # Deduplicate variations by file hash (remove identical copies)
+                    if len(existing_variations) > 1:
+                        import hashlib
+                        seen_hashes = {}
+                        for var_path in sorted(existing_variations):
+                            try:
+                                file_hash = hashlib.md5(var_path.read_bytes()).hexdigest()
+                                if file_hash in seen_hashes:
+                                    # Duplicate - remove it
+                                    var_path.unlink()
+                                else:
+                                    seen_hashes[file_hash] = var_path
+                            except Exception:
+                                pass
+                        # Refresh list after deduplication
+                        existing_variations = list(var_dir.glob(f"character_{char.id}_var_*.png"))
+
                     # Auto-add current portrait if no variations exist (legacy support)
                     if not existing_variations:
                         import shutil
                         var_path = var_dir / f"character_{char.id}_var_0.png"
-                        shutil.copy(portrait_path, var_path)
-                        existing_variations.append(var_path)
+                        # Only copy if source and dest are different files
+                        if Path(portrait_path).resolve() != var_path.resolve():
+                            shutil.copy(portrait_path, var_path)
+                            existing_variations.append(var_path)
 
                     # Action buttons for existing portrait
                     btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
@@ -1541,62 +1720,119 @@ def render_characters_page() -> None:
                                 key=f"download_portrait_{i}",
                             )
                     with btn_col3:
-                        if st.button("🔄 Regenerate", key=f"regen_portrait_{i}"):
-                            # First, save current portrait as a variation
-                            import shutil
-                            var_dir = get_project_dir() / "characters" / "variations"
-                            var_dir.mkdir(parents=True, exist_ok=True)
+                        # Regenerate options
+                        has_source_photo = bool(getattr(char, 'source_image_path', None) and Path(getattr(char, 'source_image_path', '')).exists())
+                        regen_mode = "text"  # Default to text-only
+                        if has_source_photo:
+                            regen_mode = st.radio(
+                                "Regenerate from:",
+                                options=["text", "photo"],
+                                format_func=lambda x: "Text description" if x == "text" else "Source photo",
+                                key=f"regen_mode_{i}",
+                                horizontal=True,
+                            )
+                            # Show source photo if selected
+                            if regen_mode == "photo":
+                                st.image(char.source_image_path, width=80, caption="Source")
 
-                            # Find next available variation index
-                            existing_nums = []
-                            for vp in var_dir.glob(f"character_{char.id}_var_*.png"):
+                    # Regenerate prompt editor (show appropriate prompt based on mode)
+                    style_lower = visual_style.lower()
+                    is_photorealistic = any(kw in style_lower for kw in ["photorealistic", "realistic", "photo", "cinematic"])
+                    is_anime = any(kw in style_lower for kw in ["anime", "manga", "cartoon"])
+
+                    if regen_mode == "photo":
+                        # Transform prompt for photo mode
+                        default_regen_prompt = f"""Transform this photograph into a {visual_style} style character portrait.
+
+KEEP the person's face shape, eye shape, and basic facial features recognizable.
+APPLY this character description: {char.description}
+CHANGE the art style to: {visual_style}
+Make it a professional quality portrait with good composition and lighting."""
+                    else:
+                        # Text generation prompt
+                        if is_photorealistic:
+                            default_regen_prompt = f"""RAW photograph portrait of {char.description}.
+
+Shot on Sony A7IV with 85mm f/1.4 lens, shallow depth of field, creamy bokeh.
+Natural skin texture with visible pores, subsurface scattering.
+Professional studio lighting, soft diffused light, natural shadows.
+8K resolution, film grain, hyperrealistic, photojournalistic.
+Centered composition, neutral background, professional headshot.
+
+AVOID: CGI, cartoon, anime, 3D render, digital art, stylized, artificial, plastic skin, airbrushed, smooth skin."""
+                        elif is_anime:
+                            default_regen_prompt = f"""High-quality anime illustration of {char.description}.
+
+{visual_style} style, clean linework, vibrant colors.
+Professional anime character portrait, centered composition.
+Detailed eyes, expressive face, polished illustration.
+Neutral background, studio lighting style.
+
+AVOID: photorealistic, real photo, live action, western cartoon style."""
+                        else:
+                            default_regen_prompt = f"""{visual_style} style character portrait of {char.description}.
+
+Professional {visual_style} illustration, highly detailed.
+Centered composition, neutral expression, professional lighting.
+Consistent art style throughout, clean execution.
+
+Art style: {visual_style}."""
+
+                    with st.expander("📝 Regeneration Prompt", expanded=False):
+                        regen_prompt = st.text_area(
+                            "Edit prompt if needed",
+                            value=default_regen_prompt,
+                            height=180,
+                            key=f"regen_prompt_{i}",
+                            help="This prompt controls how the portrait is generated"
+                        )
+                        st.session_state[f"custom_regen_prompt_{char.id}"] = regen_prompt
+
+                    if st.button("🔄 Regenerate", key=f"regen_portrait_{i}"):
+                        # Save current portrait as a variation (if unique)
+                        var_dir = get_project_dir() / "characters" / "variations"
+                        save_to_variations_if_unique(Path(portrait_path), char.id, var_dir)
+
+                        # Only use source photo if user selected "photo" mode
+                        source_img = None
+                        if regen_mode == "photo" and has_source_photo:
+                            from PIL import Image as PILImage
+                            source_img = PILImage.open(char.source_image_path)
+
+                        # Get custom prompt from session state
+                        custom_prompt = st.session_state.get(f"custom_regen_prompt_{char.id}")
+
+                        # Regenerate portrait
+                        from src.services.movie_image_generator import MovieImageGenerator
+                        generator = MovieImageGenerator(style=visual_style)
+                        output_dir = get_project_dir() / "characters"
+                        with st.spinner(f"Generating portrait for {char.name}..."):
+                            result = generator.generate_character_reference(
+                                character=char,
+                                output_dir=output_dir,
+                                style=visual_style,
+                                image_size=portrait_size,
+                                aspect_ratio=portrait_aspect,
+                                model=portrait_model,
+                                source_image=source_img,
+                                transform_prompt=custom_prompt,
+                            )
+                            if result:
+                                char.reference_image_path = str(result)
+
+                                # Save new portrait to variations (if unique)
+                                save_to_variations_if_unique(result, char.id, var_dir)
+
+                                # Auto-save project
                                 try:
-                                    num = int(vp.stem.split("_")[-1])
-                                    existing_nums.append(num)
-                                except ValueError:
-                                    pass
-                            next_idx = max(existing_nums) + 1 if existing_nums else 0
-                            backup_path = var_dir / f"character_{char.id}_var_{next_idx}.png"
-                            shutil.copy(portrait_path, backup_path)
-
-                            # Check for source photo
-                            source_img = None
-                            source_path = getattr(char, 'source_image_path', None)
-                            if source_path and Path(source_path).exists():
-                                from PIL import Image as PILImage
-                                source_img = PILImage.open(source_path)
-
-                            # Regenerate portrait
-                            from src.services.movie_image_generator import MovieImageGenerator
-                            generator = MovieImageGenerator(style=visual_style)
-                            output_dir = get_project_dir() / "characters"
-                            with st.spinner(f"Generating portrait for {char.name}..."):
-                                result = generator.generate_character_reference(
-                                    character=char,
-                                    output_dir=output_dir,
-                                    style=visual_style,
-                                    image_size=portrait_size,
-                                    aspect_ratio=portrait_aspect,
-                                    model=portrait_model,
-                                    source_image=source_img,  # Use source photo if available
-                                )
-                                if result:
-                                    char.reference_image_path = str(result)
-
-                                    # Also save the new portrait to variations for browsing
-                                    next_idx_new = max(existing_nums) + 2 if existing_nums else 1  # +2 because we already saved old as +1
-                                    var_path_new = var_dir / f"character_{char.id}_var_{next_idx_new}.png"
-                                    shutil.copy(result, var_path_new)
-
-                                    # Auto-save project
-                                    try:
-                                        save_movie_state()
-                                    except Exception:
-                                        pass
-                                    st.success("Portrait regenerated and saved to variations!")
-                                    st.rerun()
-                                else:
-                                    st.error("Failed to generate portrait")
+                                    save_movie_state()
+                                    logger.info(f"Saved state after regeneration: {char.reference_image_path}")
+                                except Exception as e:
+                                    logger.error(f"Failed to save state after regeneration: {e}")
+                                st.success("Portrait regenerated!")
+                                st.rerun()
+                            else:
+                                st.error("Failed to generate portrait")
                     with btn_col4:
                         if st.button("🎲 New Variations", key=f"gen_variations_{i}"):
                             st.session_state[f"generating_variations_{i}"] = True
@@ -1810,6 +2046,50 @@ def render_characters_page() -> None:
                                 st.session_state[f"new_var_idx_{i}"] = 0
                                 st.rerun()
                 else:
+                    # Build default generation prompt based on style
+                    style_lower = visual_style.lower()
+                    is_photorealistic = any(kw in style_lower for kw in ["photorealistic", "realistic", "photo", "cinematic"])
+                    is_anime = any(kw in style_lower for kw in ["anime", "manga", "cartoon"])
+
+                    if is_photorealistic:
+                        default_gen_prompt = f"""RAW photograph portrait of {char.description}.
+
+Shot on Sony A7IV with 85mm f/1.4 lens, shallow depth of field, creamy bokeh.
+Natural skin texture with visible pores, subsurface scattering.
+Professional studio lighting, soft diffused light, natural shadows.
+8K resolution, film grain, hyperrealistic, photojournalistic.
+Centered composition, neutral background, professional headshot.
+
+AVOID: CGI, cartoon, anime, 3D render, digital art, stylized, artificial, plastic skin, airbrushed, smooth skin."""
+                    elif is_anime:
+                        default_gen_prompt = f"""High-quality anime illustration of {char.description}.
+
+{visual_style} style, clean linework, vibrant colors.
+Professional anime character portrait, centered composition.
+Detailed eyes, expressive face, polished illustration.
+Neutral background, studio lighting style.
+
+AVOID: photorealistic, real photo, live action, western cartoon style."""
+                    else:
+                        default_gen_prompt = f"""{visual_style} style character portrait of {char.description}.
+
+Professional {visual_style} illustration, highly detailed.
+Centered composition, neutral expression, professional lighting.
+Consistent art style throughout, clean execution.
+
+Art style: {visual_style}."""
+
+                    # Show prompt editor
+                    with st.expander("📝 Generation Prompt", expanded=False):
+                        gen_prompt = st.text_area(
+                            "Edit prompt if needed",
+                            value=default_gen_prompt,
+                            height=200,
+                            key=f"gen_prompt_{i}",
+                            help="This prompt tells the AI how to generate the portrait"
+                        )
+                        st.session_state[f"custom_gen_prompt_{char.id}"] = gen_prompt
+
                     # Generate portrait buttons
                     gen_col1, gen_col2 = st.columns(2)
                     with gen_col1:
@@ -1818,6 +2098,8 @@ def render_characters_page() -> None:
                             import shutil
                             generator = MovieImageGenerator(style=visual_style)
                             output_dir = get_project_dir() / "characters"
+                            # Get custom prompt from session state
+                            custom_prompt = st.session_state.get(f"custom_gen_prompt_{char.id}")
                             with st.spinner(f"Generating portrait for {char.name}..."):
                                 result = generator.generate_character_reference(
                                     character=char,
@@ -1826,30 +2108,22 @@ def render_characters_page() -> None:
                                     image_size=portrait_size,
                                     aspect_ratio=portrait_aspect,
                                     model=portrait_model,
+                                    transform_prompt=custom_prompt,
                                 )
                                 if result:
                                     char.reference_image_path = str(result)
 
-                                    # Also save to variations for browsing
+                                    # Save to variations (only if unique)
                                     var_dir = get_project_dir() / "characters" / "variations"
-                                    var_dir.mkdir(parents=True, exist_ok=True)
-                                    existing_nums = []
-                                    for vp in var_dir.glob(f"character_{char.id}_var_*.png"):
-                                        try:
-                                            num = int(vp.stem.split("_")[-1])
-                                            existing_nums.append(num)
-                                        except ValueError:
-                                            pass
-                                    next_idx = max(existing_nums) + 1 if existing_nums else 0
-                                    var_path = var_dir / f"character_{char.id}_var_{next_idx}.png"
-                                    shutil.copy(result, var_path)
+                                    save_to_variations_if_unique(result, char.id, var_dir)
 
                                     # Auto-save project
                                     try:
                                         save_movie_state()
-                                    except Exception:
-                                        pass
-                                    st.success("Portrait generated and saved to variations!")
+                                        logger.info(f"Saved state after new portrait: {char.reference_image_path}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to save state after new portrait: {e}")
+                                    st.success("Portrait generated!")
                                     st.rerun()
                                 else:
                                     st.error("Failed to generate portrait")
@@ -1918,11 +2192,17 @@ def _generate_single_video_inline(state, scene, generation_method: str, config, 
     model_names = {
         "veo3": "Veo 3.1 (T2V)",
         "wan26": "WAN 2.6 I2V",
+        "wan26_i2v": "WAN 2.6 I2V",
         "wan26_fast": "WAN 2.5 Fast",
         "wan26_t2v": "WAN 2.6 T2V",
         "seedance15": "Seedance I2V",
+        "seedance15_i2v": "Seedance I2V",
         "seedance15_t2v": "Seedance T2V",
+        "seedance_fast": "Seedance Fast I2V",
+        "seedance_fast_i2v": "Seedance Fast I2V",
     }
+
+    logger.info(f"[SINGLE VIDEO] scene_model={scene_model}, generation_method={generation_method}")
 
     output_dir = get_project_dir() / "videos"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1932,12 +2212,13 @@ def _generate_single_video_inline(state, scene, generation_method: str, config, 
     output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
 
     # Get base model for duration calculation
-    base_model = scene_model.replace("_fast", "").replace("_t2v", "")
+    # For seedance_fast, base is seedance15 for duration lookup
+    base_model = scene_model.replace("_fast", "15" if "seedance" in scene_model else "").replace("_t2v", "")
     duration = scene.get_clip_duration(base_model)
     resolution = getattr(scene, 'resolution', None) or (
         config.veo_resolution if scene_model == "veo3" and config else
         config.wan_resolution if scene_model.startswith("wan26") and config else
-        config.seedance_resolution if scene_model.startswith("seedance15") and config else "720p"
+        config.seedance_resolution if scene_model.startswith("seedance") and config else "720p"
     )
     prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
 
@@ -2002,12 +2283,14 @@ def _generate_single_video_inline(state, scene, generation_method: str, config, 
                 # Get visual style for conditional negative prompts
                 visual_style = config.visual_style if config else state.script.visual_style
 
-                if scene_model == "seedance15":
+                if scene_model in ("seedance15", "seedance15_i2v"):
+                    logger.info(f"[SINGLE] Creating Seedance Pro animator for {scene_model}")
                     animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
                     result = animator.animate_scene(image_path=Path(scene.image_path), prompt=prompt,
                                                     output_path=output_path, duration_seconds=duration, resolution=resolution,
                                                     visual_style=visual_style)
                 elif scene_model in ("seedance_fast", "seedance_fast_i2v"):
+                    logger.info(f"[SINGLE] Creating Seedance FAST animator for {scene_model} -> {SeedanceModel.IMAGE_TO_VIDEO_FAST.value}")
                     animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO_FAST)
                     result = animator.animate_scene(image_path=Path(scene.image_path), prompt=prompt,
                                                     output_path=output_path, duration_seconds=duration, resolution=resolution,
@@ -2091,11 +2374,18 @@ def _generate_all_videos_inline(state, scenes, generation_method: str, config) -
     model_names = {
         "veo3": "Veo 3.1 (T2V)",
         "wan26": "WAN 2.6 I2V",
+        "wan26_i2v": "WAN 2.6 I2V",
         "wan26_fast": "WAN 2.5 Fast",
         "wan26_t2v": "WAN 2.6 T2V",
         "seedance15": "Seedance I2V",
+        "seedance15_i2v": "Seedance I2V",
         "seedance15_t2v": "Seedance T2V",
+        "seedance_fast": "Seedance Fast I2V",
+        "seedance_fast_i2v": "Seedance Fast I2V",
     }
+
+    logger.info(f"[BATCH VIDEO] generation_method={generation_method}")
+
     output_dir = get_project_dir() / "videos"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2112,7 +2402,8 @@ def _generate_all_videos_inline(state, scenes, generation_method: str, config) -
 
     for i, scene in enumerate(scenes):
         scene_model = getattr(scene, 'generation_model', None) or generation_method
-        base_model = scene_model.replace("_fast", "").replace("_t2v", "")
+        # For seedance_fast, base is seedance15 for duration lookup
+        base_model = scene_model.replace("_fast", "15" if "seedance" in scene_model else "").replace("_t2v", "")
 
         consistency_info = " (with video ref)" if use_prev_video and last_generated_video and scene_model == "veo3" else ""
         progress.progress((i / total), text=f"Scene {scene.index} ({model_names.get(scene_model, scene_model)}{consistency_info})...")
@@ -2121,7 +2412,7 @@ def _generate_all_videos_inline(state, scenes, generation_method: str, config) -
         resolution = getattr(scene, 'resolution', None) or (
             config.veo_resolution if scene_model == "veo3" and config else
             config.wan_resolution if scene_model.startswith("wan26") and config else
-            config.seedance_resolution if scene_model.startswith("seedance15") and config else "720p"
+            config.seedance_resolution if scene_model.startswith("seedance") and config else "720p"
         )
         prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
 
@@ -2169,9 +2460,11 @@ def _generate_all_videos_inline(state, scenes, generation_method: str, config) -
 
                 # Get or create animator for this model type
                 if scene_model not in animators:
-                    if scene_model == "seedance15":
+                    if scene_model in ("seedance15", "seedance15_i2v"):
+                        logger.info(f"[BATCH] Creating Seedance Pro animator for {scene_model}")
                         animators[scene_model] = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
                     elif scene_model in ("seedance_fast", "seedance_fast_i2v"):
+                        logger.info(f"[BATCH] Creating Seedance FAST animator for {scene_model} -> {SeedanceModel.IMAGE_TO_VIDEO_FAST.value}")
                         animators[scene_model] = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO_FAST)
                     elif scene_model == "seedance15_t2v":
                         animators[scene_model] = AtlasCloudAnimator(model=SeedanceModel.TEXT_TO_VIDEO)
@@ -2232,7 +2525,7 @@ def render_scenes_page() -> None:
     visual_style = (
         (state.config.visual_style if state.config else None)
         or (script.visual_style if script else None)
-        or "photorealistic, cinematic lighting"
+        or ""
     )
 
     # Track unsaved changes for batch saving
@@ -2242,7 +2535,7 @@ def render_scenes_page() -> None:
     st.subheader("🎬 Scene Editor")
 
     # Compact action bar with save indicator
-    col1, col2, col3, col4 = st.columns([2, 2, 1, 1])
+    col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 1, 1])
     with col1:
         if st.button("➕ Add Scene", type="secondary", use_container_width=True):
             new_idx = len(script.scenes) + 1
@@ -2255,17 +2548,26 @@ def render_scenes_page() -> None:
             st.session_state.scenes_dirty = True
             st.rerun()
     with col2:
+        # Prominent Prompts button - generates visual & video prompts for all scenes
+        scenes_missing = sum(1 for s in script.scenes if not s.visual_prompt or not s.video_prompt)
+        prompts_label = f"🤖 Prompts ({scenes_missing})" if scenes_missing > 0 else "🤖 Prompts ✓"
+        prompts_type = "primary" if scenes_missing > 0 else "secondary"
+        if st.button(prompts_label, type=prompts_type, use_container_width=True,
+                    help="AI generates visual & video prompts for all scenes"):
+            st.session_state.show_prompt_generator = True
+            st.rerun()
+    with col3:
         if st.button("🤖 AI Assistant", use_container_width=True):
             st.session_state["show_scene_assistant"] = not st.session_state.get("show_scene_assistant", False)
             st.rerun()
-    with col3:
+    with col4:
         save_label = "💾 Save*" if st.session_state.scenes_dirty else "💾 Saved"
         save_type = "primary" if st.session_state.scenes_dirty else "secondary"
         if st.button(save_label, type=save_type, use_container_width=True):
             save_movie_state()
             st.session_state.scenes_dirty = False
             st.toast("Saved!")
-    with col4:
+    with col5:
         # Quick stats
         total_words = sum(len(d.text.split()) for s in script.scenes for d in s.dialogue)
         est_duration = total_words / 2.5
@@ -2644,13 +2946,17 @@ Keep responses concise and actionable.""",
 
     # Check if in video mode
     gen_method = state.config.generation_method if state.config else "tts_images"
-    is_video_mode = gen_method in ("veo3", "wan26", "seedance15")
-    visual_style = state.config.visual_style if state.config else "photorealistic, cinematic lighting"
+    is_video_mode = gen_method in ("veo3", "wan26", "seedance15", "seedance_fast")
+    visual_style = (state.config.visual_style if state.config else None) or (script.visual_style if script else None) or ""
 
     # Get current scene for display
     current_scene_idx = st.session_state.selected_scene_idx
     current_scene = next((s for s in script.scenes if s.index == current_scene_idx), None)
     scene_title = current_scene.title if current_scene and current_scene.title else f"Scene {current_scene_idx}"
+
+    # Prompt generator modal (appears when clicking "🤖 Prompts" button)
+    if st.session_state.get("show_prompt_generator"):
+        _render_prompt_generator_modal(script, state)
 
     # Scene editor FIRST at the top in an expander for easy access
     with st.expander(f"✏️ Edit Scene {current_scene_idx}: {scene_title}", expanded=True):
@@ -2679,6 +2985,36 @@ Keep responses concise and actionable.""",
 def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode: bool = False, gen_method: str = "tts_images") -> None:
     """Render a visual storyboard grid with overlay titles and video generation."""
     import base64
+
+    # AUTO-GENERATE PROMPTS: Check if scenes need prompts and auto-run setup
+    # Track by project hash to avoid re-running on every refresh
+    project_hash = f"{state.project_name}_{len(script.scenes)}"
+    auto_gen_key = f"auto_prompt_gen_{project_hash}"
+
+    # Count scenes missing prompts
+    scenes_missing_visual = [s for s in script.scenes if not s.visual_prompt]
+    scenes_missing_video = [s for s in script.scenes if not s.video_prompt]
+
+    # Auto-generate if there are scenes without prompts and we haven't done it yet
+    if (scenes_missing_visual or scenes_missing_video) and not st.session_state.get(auto_gen_key):
+        missing_count = max(len(scenes_missing_visual), len(scenes_missing_video))
+        st.info(f"🤖 Auto-generating prompts for {missing_count} scene(s)...")
+
+        # Mark as auto-generating to prevent loop
+        st.session_state[auto_gen_key] = True
+
+        # Run auto-setup with defaults (all prompts enabled)
+        _run_ai_scene_setup(
+            script, state,
+            update_direction=True,
+            update_characters=True,
+            update_visual_prompt=True,
+            update_video_prompt=True,
+            gen_method=gen_method,
+            ai_pick_models=False,
+            veo_variant=None
+        )
+        st.rerun()
 
     # Quick duration metrics
     target_duration = state.config.target_duration if state.config else 180
@@ -2737,7 +3073,7 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                 # Determine which scenes can have videos generated
                 scenes_needing_video = [s for s in script.scenes if not (s.video_path and Path(s.video_path).exists())]
                 # For I2V modes, filter to scenes with images
-                if gen_method in ["wan26", "seedance15"]:
+                if gen_method in ["wan26", "seedance15", "seedance_fast"]:
                     scenes_needing_video = [s for s in scenes_needing_video if s.image_path and Path(s.image_path).exists()]
 
                 btn_label = f"🎬 Videos ({len(scenes_needing_video)})" if scenes_needing_video else "🎬 Done"
@@ -2750,15 +3086,13 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
     # Batch video generation
     if st.session_state.get("generate_all_videos") and is_video_mode:
         scenes_needing_video = [s for s in script.scenes if not (s.video_path and Path(s.video_path).exists())]
-        if gen_method in ["wan26", "seedance15"]:
+        if gen_method in ["wan26", "seedance15", "seedance_fast"]:
             scenes_needing_video = [s for s in scenes_needing_video if s.image_path and Path(s.image_path).exists()]
         if scenes_needing_video:
             _generate_all_videos_inline(state, scenes_needing_video, gen_method, state.config)
         st.session_state.generate_all_videos = False
 
-    # Prompt generator modal
-    if st.session_state.get("show_prompt_generator"):
-        _render_prompt_generator_modal(script, state)
+    # Note: Prompt generator modal is rendered in render_scenes_page() - don't render here
 
     # Batch image generation
     if st.session_state.get("generate_all_images"):
@@ -2892,6 +3226,18 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
     for scene in script.scenes:
         has_image = scene.image_path and Path(scene.image_path).exists()
         title_text = f"Scene {scene.index}: {scene.title or 'Untitled'}"
+
+        # Check for use_previous_last_frame - extract and cache the last frame for display
+        last_frame_preview = None
+        use_prev_frame = getattr(scene, 'use_previous_last_frame', False)
+        if use_prev_frame and scene.index > 1:
+            prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
+            if prev_scene and prev_scene.video_path and Path(prev_scene.video_path).exists():
+                # Extract and cache the last frame for preview
+                cache_dir = get_project_dir() / "scenes" / f"scene_{scene.index:03d}" / "continuity"
+                extracted = extract_last_frame_from_video(Path(prev_scene.video_path), cache_dir)
+                if extracted:
+                    last_frame_preview = str(extracted)
         clip_duration = scene.get_clip_duration(gen_method)
 
         # Pre-compute character info with portrait paths (not base64)
@@ -2905,6 +3251,12 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                 else:
                     chars_without.append(char.name)
 
+        # Calculate dialogue duration warning
+        word_count = scene.word_count
+        speaking_time = word_count / 2.5 if word_count > 0 else 0  # ~2.5 words/sec
+        dialogue_exceeds = speaking_time > clip_duration
+        dialogue_tight = not dialogue_exceeds and speaking_time > clip_duration * 0.9
+
         scene_data.append({
             "scene": scene,
             "has_image": has_image,
@@ -2912,6 +3264,12 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
             "clip_duration": clip_duration,
             "chars_with_portraits": chars_with_portraits,
             "chars_without": chars_without,
+            "word_count": word_count,
+            "speaking_time": speaking_time,
+            "dialogue_exceeds": dialogue_exceeds,
+            "dialogue_tight": dialogue_tight,
+            "last_frame_preview": last_frame_preview,
+            "use_prev_frame": use_prev_frame,
         })
 
     # Scene grid (3 per row like Song Mode)
@@ -2944,12 +3302,23 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                     has_video = True
 
                         # Show video if available, otherwise show image
+                        # Determine display image: use scene image OR last frame preview
+                        display_image = None
+                        display_is_last_frame = False
+                        if sd["has_image"]:
+                            display_image = scene.image_path
+                        elif sd["last_frame_preview"]:
+                            display_image = sd["last_frame_preview"]
+                            display_is_last_frame = True
+
                         if has_video:
                             # Tabs to switch between image and video
                             img_tab, vid_tab = st.tabs(["🖼️ Image", "🎬 Video"])
                             with img_tab:
-                                if sd["has_image"]:
-                                    st.image(scene.image_path, width="stretch")
+                                if display_image:
+                                    st.image(display_image, width="stretch")
+                                    if display_is_last_frame:
+                                        st.caption("🔗 Last frame from prev scene")
                                 else:
                                     st.caption("No image")
                             with vid_tab:
@@ -2959,8 +3328,10 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                 video_variants = list(video_dir.glob(f"scene_{scene.index:03d}*.mp4"))
                                 if len(video_variants) > 1:
                                     st.caption(f"📹 {len(video_variants)} variants")
-                        elif sd["has_image"]:
-                            st.image(scene.image_path, width="stretch")
+                        elif display_image:
+                            st.image(display_image, width="stretch")
+                            if display_is_last_frame:
+                                st.caption("🔗 Last frame from prev scene")
                         else:
                             # Placeholder
                             st.markdown('''
@@ -2970,9 +3341,36 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                 </div>
                             ''', unsafe_allow_html=True)
 
+                        # Scene type badge and location change indicator
+                        scene_type = getattr(scene.direction, 'scene_type', SceneType.DIALOGUE)
+                        if scene_type is None:
+                            scene_type = SceneType.DIALOGUE
+                        type_icons = {
+                            SceneType.ESTABLISHING: "🏔️",
+                            SceneType.DIALOGUE: "💬",
+                            SceneType.ACTION: "⚡",
+                            SceneType.MONTAGE: "🎞️",
+                            SceneType.CLIMAX: "🔥",
+                            SceneType.TRANSITION: "➡️",
+                            SceneType.REACTION: "😮",
+                        }
+                        type_icon = type_icons.get(scene_type, "💬")
+                        is_new_loc = getattr(scene.direction, 'is_new_location', False)
+                        loc_indicator = " 📍" if is_new_loc else ""
+                        st.caption(f"{type_icon} {scene_type.value.title()}{loc_indicator}")
+
                         # Scene metadata
                         st.caption(f"📍 {scene.direction.setting[:50]}..." if len(scene.direction.setting) > 50 else f"📍 {scene.direction.setting}")
-                        st.caption(f"🎥 {scene.direction.camera} | {scene.direction.mood} | ⏱️ ~{sd['clip_duration']}s")
+
+                        # Duration with dialogue warning indicator
+                        if sd["dialogue_exceeds"]:
+                            st.caption(f"🎥 {scene.direction.camera} | {scene.direction.mood} | ⏱️ ~{sd['clip_duration']}s ⚠️")
+                            st.caption(f"⚠️ {sd['word_count']} words ≈ {sd['speaking_time']:.1f}s (too long!)")
+                        elif sd["dialogue_tight"]:
+                            st.caption(f"🎥 {scene.direction.camera} | {scene.direction.mood} | ⏱️ ~{sd['clip_duration']}s")
+                            st.caption(f"ℹ️ {sd['word_count']} words ≈ {sd['speaking_time']:.1f}s (tight)")
+                        else:
+                            st.caption(f"🎥 {scene.direction.camera} | {scene.direction.mood} | ⏱️ ~{sd['clip_duration']}s")
 
                         # Character portraits (use st.image for reliability)
                         if sd["chars_with_portraits"] or sd["chars_without"]:
@@ -3361,11 +3759,11 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                     "veo31_fast": ("📝→🎬 Veo 3.1 Fast", "veo3", "veo-3.1-fast-generate-preview"),
                                     # I2V models (require scene image)
                                     "wan26_i2v": ("🖼️→🎬 WAN 2.6 I2V (image→video)", "wan26_i2v", None),
-                                    "seedance15_i2v": ("🖼️→🎬 Seedance 1.5 I2V (lip-sync)", "seedance15_i2v", None),
-                                    "seedance_fast_i2v": ("🖼️→🎬 Seedance Fast I2V", "seedance_fast_i2v", None),
+                                    "seedance15_i2v": ("🖼️→🎬 Seedance 1.5 Pro I2V (best quality)", "seedance15_i2v", None),
+                                    "seedance_fast_i2v": ("🖼️→🎬 Seedance Fast I2V (faster)", "seedance_fast_i2v", None),
                                     # T2V models (text prompt only)
                                     "wan26_t2v": ("📝→🎬 WAN 2.6 T2V (text→video)", "wan26_t2v", None),
-                                    "seedance15_t2v": ("📝→🎬 Seedance 1.5 T2V (text→video)", "seedance15_t2v", None),
+                                    "seedance15_t2v": ("📝→🎬 Seedance 1.5 Pro T2V (text→video)", "seedance15_t2v", None),
                                 }
 
                                 # Determine current selection key based on model + variant
@@ -3427,8 +3825,8 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                         dur_options = [4, 6, 8]
                                     elif "wan26" in str(eff_model):
                                         dur_options = [5, 10, 15]
-                                    else:  # seedance (Pro or Fast)
-                                        dur_options = [3, 5, 8, 10, 15]
+                                    else:  # seedance (Pro or Fast) - max 12s per API spec
+                                        dur_options = [3, 5, 8, 10, 12]
 
                                     auto_dur = scene.get_clip_duration(eff_model)
                                     current_dur = scene.clip_duration
@@ -3575,7 +3973,7 @@ def _render_prompt_generator_modal(script: Script, state: MovieModeState) -> Non
         - **Best video generation model per scene** (if enabled)
         """)
 
-        visual_style = state.config.visual_style if state.config else "photorealistic, cinematic lighting"
+        visual_style = (state.config.visual_style if state.config else None) or (script.visual_style if script else None) or ""
         project_method = state.config.generation_method if state.config else "tts_images"
 
         # Image model selector with clear Fast vs Pro distinction
@@ -3669,7 +4067,8 @@ def _render_prompt_generator_modal(script: Script, state: MovieModeState) -> Non
             "veo3_standard": ("📝→🎬 Veo 3.1 Standard (Best quality)", "veo-3.1-generate-preview"),
             "veo3_fast": ("📝→🎬 Veo 3.1 Fast", "veo-3.1-fast-generate-preview"),
             "wan26": ("🖼️→🎬 WAN 2.6 (image→video)", None),
-            "seedance15": ("🖼️→🎬 Seedance 1.5 Pro (image→video, lip-sync)", None),
+            "seedance15": ("🖼️→🎬 Seedance 1.5 Pro (image→video)", None),
+            "seedance_fast": ("🖼️→🎬 Seedance Fast (faster, lower quality)", None),
         }
 
         # Map project method to combined key
@@ -3710,8 +4109,27 @@ def _render_prompt_generator_modal(script: Script, state: MovieModeState) -> Non
                 help="Let AI choose between I2V and T2V models based on scene context"
             )
 
+        # Lipsync post-processing option (only for Seedance)
+        is_seedance_method = selected_method_key in ("seedance15", "seedance_fast")
+        if is_seedance_method:
+            lipsync_col1, lipsync_col2 = st.columns([1, 3])
+            with lipsync_col1:
+                enable_lipsync = st.checkbox(
+                    "🗣️ Lipsync",
+                    value=False,
+                    key="ai_setup_lipsync",
+                    help="Apply lipsync post-processing to sync character lips with TTS audio"
+                )
+            with lipsync_col2:
+                if enable_lipsync:
+                    st.caption("Lipsync will be applied after video generation using TTS audio")
+            st.session_state.enable_lipsync = enable_lipsync
+        else:
+            st.session_state.enable_lipsync = False
+
         video_method_name = gen_methods.get(selected_method_key, (selected_method_key, None))[0].split('(')[0].strip()
-        st.info(f"Style: **{visual_style}** | Image: **{image_models.get(selected_image_model, selected_image_model).split('(')[0].strip()}** | Video: **{video_method_name}**")
+        lipsync_indicator = " + 🗣️ Lipsync" if st.session_state.get("enable_lipsync") else ""
+        st.info(f"Style: **{visual_style}** | Image: **{image_models.get(selected_image_model, selected_image_model).split('(')[0].strip()}** | Video: **{video_method_name}{lipsync_indicator}**")
 
         # Options with unique keys
         setup_col1, setup_col2 = st.columns(2)
@@ -3725,6 +4143,20 @@ def _render_prompt_generator_modal(script: Script, state: MovieModeState) -> Non
                                               value=True, key="ai_setup_visual")
             update_video_prompt = st.checkbox("Generate video animation prompts",
                                              value=True, key="ai_setup_video")
+
+        # Count existing prompts
+        existing_visual = sum(1 for s in script.scenes if s.visual_prompt and s.visual_prompt.strip())
+        existing_video = sum(1 for s in script.scenes if s.video_prompt and s.video_prompt.strip())
+        total_scenes = len(script.scenes)
+
+        if existing_visual > 0 or existing_video > 0:
+            overwrite_existing = st.checkbox(
+                f"🔄 Overwrite existing prompts ({existing_visual} image, {existing_video} video)",
+                value=False, key="ai_setup_overwrite",
+                help="If unchecked, only scenes missing prompts will be updated. Check to regenerate ALL prompts."
+            )
+        else:
+            overwrite_existing = True  # No existing prompts, always overwrite
 
         col1, col2 = st.columns(2)
         with col1:
@@ -3740,15 +4172,22 @@ def _render_prompt_generator_modal(script: Script, state: MovieModeState) -> Non
         if run_setup:
             _run_ai_scene_setup(script, state, update_direction, update_characters,
                                update_visual_prompt, update_video_prompt,
-                               selected_method, ai_pick_models, selected_veo_variant)
+                               selected_method, ai_pick_models, selected_veo_variant,
+                               overwrite_existing=overwrite_existing)
 
 
 def _run_ai_scene_setup(script: Script, state: MovieModeState,
                         update_direction: bool, update_characters: bool,
                         update_visual_prompt: bool, update_video_prompt: bool,
                         gen_method: str = "veo3", ai_pick_models: bool = False,
-                        veo_variant: Optional[str] = None) -> None:
-    """Run AI scene setup for all scenes in parallel."""
+                        veo_variant: Optional[str] = None,
+                        overwrite_existing: bool = False) -> None:
+    """Run AI scene setup for all scenes in parallel.
+
+    Args:
+        overwrite_existing: If False (default), only fill in missing prompts.
+                           If True, regenerate all prompts even if they exist.
+    """
     import json
     import time as time_module
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -3757,7 +4196,22 @@ def _run_ai_scene_setup(script: Script, state: MovieModeState,
         st.warning("No scenes to set up.")
         return
 
-    visual_style = state.config.visual_style if state.config else "photorealistic, cinematic lighting"
+    # Get visual style from config, then script, then default
+    visual_style = None
+    if state.config and state.config.visual_style:
+        visual_style = state.config.visual_style
+    elif script.visual_style:
+        visual_style = script.visual_style
+    else:
+        # No style set - warn user
+        visual_style = ""
+        st.warning("⚠️ No visual style configured. Set your style in Settings → Visual Style.")
+
+    # Show what style we're using
+    if visual_style:
+        st.write(f"🎨 Using visual style: **{visual_style}**")
+    logger.info(f"AI Scene Setup - visual_style: {visual_style}")
+
     world_description = script.world_description or ""
 
     # Build character context with full details
@@ -3790,13 +4244,15 @@ def _run_ai_scene_setup(script: Script, state: MovieModeState,
 
             def process_scene(scene):
                 """Process a single scene - runs in thread."""
-                # Build dialogue context
+                # Build dialogue context with emotions for better video prompts
                 dialogue_lines = []
                 speaking_chars = set()
                 for d in scene.dialogue:
                     char = script.get_character(d.character_id)
                     char_name = char.name if char else d.character_id
-                    dialogue_lines.append(f"{char_name}: \"{d.text}\"")
+                    emotion = d.emotion.value if d.emotion else "neutral"
+                    # Use straight quotes and include emotion for video prompt generation
+                    dialogue_lines.append(f'{char_name} ({emotion}): "{d.text}"')
                     speaking_chars.add(d.character_id)
 
                 # Collect ALL visible characters (speaking + already marked visible)
@@ -3868,12 +4324,25 @@ DECISION LOGIC:
 - Include ambient audio cues if appropriate"""
                         video_prompt_example = "Sarah (curious) leans forward on the couch and says 'I never expected this to happen.' Her expression shifts from surprise to understanding."
                     elif "seedance" in gen_method.lower():
-                        video_prompt_guidance = """VIDEO PROMPT FORMAT (Seedance 1.5 - Lip-sync focus):
+                        # Determine style ending based on visual_style
+                        style_lower = (visual_style or "").lower()
+                        if any(kw in style_lower for kw in ["photorealistic", "realistic", "photo", "cinematic"]):
+                            style_ending = "Photorealistic. Preserve exact appearance."
+                        elif any(kw in style_lower for kw in ["anime", "manga", "cartoon"]):
+                            style_ending = f"{visual_style}. Preserve exact character appearance."
+                        elif any(kw in style_lower for kw in ["3d", "pixar", "animated"]):
+                            style_ending = f"{visual_style}. Preserve exact character appearance."
+                        else:
+                            style_ending = f"{visual_style}. Preserve exact appearance." if visual_style else "Preserve exact appearance."
+
+                        video_prompt_guidance = f"""VIDEO PROMPT FORMAT (Seedance 1.5 - Lip-sync focus):
+- CRITICAL: Each character's dialogue MUST be attributed with format: [Name] says [emotion]: "[exact dialogue]"
+- For multiple speakers, use transitions: "Then [Name2] replies [emotion]: "[dialogue]""
 - Camera: Specify camera movement (dolly in, pan, tracking shot, static)
 - Expression: Describe facial expressions and emotions
-- Include exact dialogue in quotes for lip-sync generation
-- Lighting and mood transitions if any"""
-                        video_prompt_example = "Camera: Medium shot with slow dolly in. Sarah sits on couch, expression shifting from curiosity to understanding. She says 'I never expected this to happen.' Warm ambient lighting."
+- End with: "{style_ending}"
+EXAMPLE: Marcus says calmly: "We need to talk." Then Sarah replies nervously: "I was hoping you wouldn't find out." Camera pushes in slowly. {style_ending}"""
+                        video_prompt_example = f'Sarah says curiously: "I never expected this to happen." Expression shifts from surprise to understanding. Camera: Medium shot with slow dolly in. Warm ambient lighting. {style_ending}'
                     elif "wan" in gen_method.lower():
                         video_prompt_guidance = """VIDEO PROMPT FORMAT (Wan 2.6 - Multi-shot):
 - Can include shot breakdowns: Shot 1 [time]: description
@@ -3893,6 +4362,7 @@ DECISION LOGIC:
                     json_schema = f"""{{
   "title": "The Meeting",
   "setting": "Modern tech startup office with glass walls and standing desks",
+  "scene_type": "dialogue",
   "camera": "medium shot",
   "lighting": "warm golden hour",
   "mood": "romantic",
@@ -3901,11 +4371,12 @@ DECISION LOGIC:
   "visual_prompt": "Medium shot of a cozy modern apartment living room with large windows and beige sofa. Sarah (young woman with auburn hair, green eyes, wearing casual blue sweater) sits on the couch looking thoughtful. John (tall man in his 30s, short dark hair, wearing a gray button-up shirt) stands nearby. Warm golden hour lighting through the windows, romantic atmosphere.",
   "video_prompt": "{video_prompt_example}"
 }}"""
-                    model_field_desc = "9. generation_model: One of 'veo3', 'wan26_i2v', 'wan26_t2v', 'seedance15_i2v', 'seedance15_t2v' - pick the BEST model for this scene"
+                    model_field_desc = "10. generation_model: One of 'veo3', 'wan26_i2v', 'wan26_t2v', 'seedance15_i2v', 'seedance15_t2v' - pick the BEST model for this scene"
                 else:
                     json_schema = f"""{{
   "title": "The Meeting",
   "setting": "Modern tech startup office with glass walls and standing desks",
+  "scene_type": "dialogue",
   "camera": "medium shot",
   "lighting": "warm golden hour",
   "mood": "romantic",
@@ -3942,12 +4413,13 @@ Default Video Generation Method: {gen_method}
 For each scene, provide ALL of the following:
 1. title: Short descriptive title (2-5 words)
 2. setting: Specific location with details (e.g., "Modern tech startup office with glass walls and standing desks")
-3. camera: Camera angle (wide shot, medium shot, close-up, extreme close-up, over-the-shoulder, POV, establishing shot, two-shot)
-4. lighting: Lighting style (warm, cool, dramatic, soft, harsh, natural, dim, bright, etc.)
-5. mood: Scene mood (neutral, tense, happy, sad, mysterious, romantic, action, comedic)
-6. visible_characters: List of character IDs who appear in the scene
-7. visual_prompt: MUST include camera, setting, lighting, mood, AND full character descriptions for EACH visible character (copy their descriptions from the character list above). NO dialogue/text. Example format: "Medium shot of [setting]. [Character1 name] ([full description]) [action]. [Character2 name] ([full description]) [action]. [Lighting] lighting, [mood] atmosphere."
-8. video_prompt: Animation prompt with action AND dialogue - MUST include all dialogue from the scene in quotes
+3. scene_type: One of 'establishing' (wide shot for new location), 'dialogue' (character conversation), 'action' (physical movement), 'montage' (quick cuts), 'climax' (high intensity), 'transition' (scene bridge), 'reaction' (character response close-up)
+4. camera: Camera angle (wide shot, medium shot, close-up, extreme close-up, over-the-shoulder, POV, establishing shot, two-shot)
+5. lighting: Lighting style (warm, cool, dramatic, soft, harsh, natural, dim, bright, etc.)
+6. mood: Scene mood (neutral, tense, happy, sad, mysterious, romantic, action, comedic)
+7. visible_characters: List of character IDs who appear in the scene
+8. visual_prompt: MUST include camera, setting, lighting, mood, AND full character descriptions for EACH visible character (copy their descriptions from the character list above). NO dialogue/text. Example format: "Medium shot of [setting]. [Character1 name] ([full description]) [action]. [Character2 name] ([full description]) [action]. [Lighting] lighting, [mood] atmosphere."
+9. video_prompt: Animation prompt with action AND dialogue - MUST include ALL dialogue with character attribution: "[Name] says [emotion]: \"[exact text]\""
 {model_field_desc}
 
 Respond ONLY with valid JSON in this exact format:
@@ -4067,6 +4539,19 @@ REQUIREMENTS:
                             scene.direction.lighting = setup_data["lighting"]
                         if "mood" in setup_data:
                             scene.direction.mood = setup_data["mood"]
+                        if "scene_type" in setup_data:
+                            # Map AI response to SceneType enum
+                            scene_type_map = {
+                                "establishing": SceneType.ESTABLISHING,
+                                "dialogue": SceneType.DIALOGUE,
+                                "action": SceneType.ACTION,
+                                "montage": SceneType.MONTAGE,
+                                "climax": SceneType.CLIMAX,
+                                "transition": SceneType.TRANSITION,
+                                "reaction": SceneType.REACTION,
+                            }
+                            scene_type_value = setup_data["scene_type"].lower()
+                            scene.direction.scene_type = scene_type_map.get(scene_type_value, SceneType.DIALOGUE)
 
                     if update_characters and "visible_characters" in setup_data:
                         valid_chars = [c for c in setup_data["visible_characters"]
@@ -4078,33 +4563,52 @@ REQUIREMENTS:
                         scene.direction.visible_characters = valid_chars
 
                     if update_visual_prompt:
-                        visual_prompt_value = setup_data.get("visual_prompt", "")
-                        if visual_prompt_value and visual_prompt_value.strip():
-                            try:
-                                scene.visual_prompt = visual_prompt_value
-                            except Exception:
-                                object.__setattr__(scene, 'visual_prompt', visual_prompt_value)
-                            logger.info(f"Scene {scene.index} visual_prompt set: {visual_prompt_value[:50]}...")
+                        # Only update visual_prompt if it doesn't already exist (unless overwrite_existing=True)
+                        existing_visual = getattr(scene, 'visual_prompt', None)
+                        if existing_visual and existing_visual.strip() and not overwrite_existing:
+                            logger.info(f"Scene {scene.index} visual_prompt already exists, keeping it")
                         else:
-                            logger.warning(f"Scene {scene.index}: No visual_prompt in AI response")
+                            visual_prompt_value = setup_data.get("visual_prompt", "")
+                            if visual_prompt_value and visual_prompt_value.strip():
+                                try:
+                                    scene.visual_prompt = visual_prompt_value
+                                except Exception:
+                                    object.__setattr__(scene, 'visual_prompt', visual_prompt_value)
+                                logger.info(f"Scene {scene.index} visual_prompt set: {visual_prompt_value[:50]}...")
+                                # Increment widget version to force Streamlit text_area refresh
+                                version_key = f"visual_prompt_version_{scene.index}"
+                                st.session_state[version_key] = st.session_state.get(version_key, 0) + 1
+                            else:
+                                logger.warning(f"Scene {scene.index}: No visual_prompt in AI response")
 
                     if update_video_prompt:
-                        video_prompt_value = setup_data.get("video_prompt", "")
-                        if video_prompt_value and video_prompt_value.strip():
-                            try:
-                                scene.video_prompt = video_prompt_value
-                                logger.info(f"Scene {scene.index} video_prompt set via property: {video_prompt_value[:50]}...")
-                            except Exception as e:
-                                logger.warning(f"Scene {scene.index} video_prompt property failed: {e}, trying __setattr__")
-                                object.__setattr__(scene, 'video_prompt', video_prompt_value)
-                            # Verify it was set
-                            actual_value = getattr(scene, 'video_prompt', None)
-                            if actual_value:
-                                logger.info(f"Scene {scene.index} video_prompt VERIFIED: {actual_value[:50]}...")
-                            else:
-                                logger.error(f"Scene {scene.index} video_prompt NOT SET despite no exception!")
+                        # Only update video_prompt if it doesn't already exist (unless overwrite_existing=True)
+                        existing_video = getattr(scene, 'video_prompt', None)
+                        if existing_video and existing_video.strip() and not overwrite_existing:
+                            logger.info(f"Scene {scene.index} video_prompt already exists, keeping it")
                         else:
-                            logger.warning(f"Scene {scene.index}: No video_prompt in AI response")
+                            video_prompt_value = setup_data.get("video_prompt", "")
+                            if video_prompt_value and video_prompt_value.strip():
+                                try:
+                                    scene.video_prompt = video_prompt_value
+                                    logger.info(f"Scene {scene.index} video_prompt set via property: {video_prompt_value[:50]}...")
+                                except Exception as e:
+                                    logger.warning(f"Scene {scene.index} video_prompt property failed: {e}, trying __setattr__")
+                                    object.__setattr__(scene, 'video_prompt', video_prompt_value)
+                                # Verify it was set
+                                actual_value = getattr(scene, 'video_prompt', None)
+                                if actual_value:
+                                    logger.info(f"Scene {scene.index} video_prompt VERIFIED: {actual_value[:50]}...")
+                                    # Increment widget versions to force Streamlit text_area refresh
+                                    # Both keys are used in different places
+                                    v1_key = f"video_prompt_version_{scene.index}"
+                                    v2_key = f"edit_video_prompt_version_{scene.index}"
+                                    st.session_state[v1_key] = st.session_state.get(v1_key, 0) + 1
+                                    st.session_state[v2_key] = st.session_state.get(v2_key, 0) + 1
+                                else:
+                                    logger.error(f"Scene {scene.index} video_prompt NOT SET despite no exception!")
+                            else:
+                                logger.warning(f"Scene {scene.index}: No video_prompt in AI response")
 
                     # Apply AI-selected generation model if provided
                     if "generation_model" in setup_data:
@@ -4151,6 +4655,108 @@ REQUIREMENTS:
     st.rerun()
 
 
+def _regenerate_scene_setting(
+    scene,
+    script: Script,
+    state: MovieModeState,
+) -> Optional[str]:
+    """Regenerate just the setting description for a scene using AI.
+
+    The setting describes WHERE the scene takes place and its atmosphere.
+    This is different from the visual/video prompts which describe HOW to render it.
+
+    Args:
+        scene: The scene to regenerate setting for
+        script: The full script
+        state: MovieModeState
+
+    Returns:
+        The generated setting description, or None if failed
+    """
+    from anthropic import Anthropic
+    from src.config import config
+
+    if not config.anthropic_api_key:
+        st.error("ANTHROPIC_API_KEY not set.")
+        return None
+
+    # Get visual style
+    visual_style = state.visual_style or ""
+
+    # Build dialogue context
+    dialogue_lines = []
+    speaking_chars = set()
+    for d in scene.dialogue:
+        char = script.get_character(d.character_id)
+        char_name = char.name if char else d.character_id
+        dialogue_lines.append(f'{char_name}: "{d.text}"')
+        speaking_chars.add(d.character_id)
+
+    dialogue_context = "\n".join(dialogue_lines) if dialogue_lines else "No dialogue in this scene"
+
+    # Get previous and next scene settings for continuity
+    prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
+    next_scene = next((s for s in script.scenes if s.index == scene.index + 1), None)
+
+    prev_setting = prev_scene.direction.setting if prev_scene else "N/A (first scene)"
+    next_setting = next_scene.direction.setting if next_scene else "N/A (last scene)"
+
+    # Build character descriptions
+    char_descs = []
+    for char_id in (scene.direction.visible_characters or speaking_chars):
+        char = script.get_character(char_id)
+        if char:
+            char_descs.append(f"- {char.name}: {char.description}")
+
+    prompt = f"""You are a screenwriter creating a scene setting description.
+
+SCENE CONTEXT:
+- Scene {scene.index}: "{scene.title or 'Untitled'}"
+- Visual style: {visual_style if visual_style else "Not specified"}
+- World/story: {script.world_description or "Not specified"}
+
+DIALOGUE IN THIS SCENE:
+{dialogue_context}
+
+CHARACTERS PRESENT:
+{chr(10).join(char_descs) if char_descs else "No specific characters listed"}
+
+SURROUNDING SCENES:
+- Previous scene setting: {prev_setting}
+- Next scene setting: {next_setting}
+
+CURRENT SETTING: {scene.direction.setting or "Not yet defined"}
+
+YOUR TASK:
+Generate a vivid, concise setting description (2-4 sentences) that:
+1. Describes WHERE this scene takes place (location, time of day, environment)
+2. Sets the MOOD and ATMOSPHERE appropriate for the dialogue
+3. Is consistent with the visual style and world description
+4. Flows naturally from the previous scene's setting
+5. Is specific enough for an AI to generate a matching image
+
+Output ONLY the setting description, nothing else. No quotes, no labels, just the description."""
+
+    try:
+        client = Anthropic(api_key=config.anthropic_api_key)
+
+        with st.spinner("Generating setting description..."):
+            response = client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=300,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+        setting_text = response.content[0].text.strip()
+        logger.info(f"Generated setting for scene {scene.index}: {setting_text[:100]}...")
+        return setting_text
+
+    except Exception as e:
+        logger.error(f"Failed to regenerate setting: {e}")
+        st.error(f"Failed to generate setting: {str(e)[:100]}")
+        return None
+
+
 def _regenerate_scene_prompt(
     scene,
     script: Script,
@@ -4172,7 +4778,12 @@ def _regenerate_scene_prompt(
     """
     import json
 
-    visual_style = state.config.visual_style if state.config else "photorealistic, cinematic lighting"
+    # Get visual style from config, then script (no hardcoded default)
+    visual_style = ""
+    if state.config and state.config.visual_style:
+        visual_style = state.config.visual_style
+    elif script.visual_style:
+        visual_style = script.visual_style
 
     # Use per-scene generation model if set, otherwise fall back to global config
     scene_gen_model = getattr(scene, 'generation_model', None)
@@ -4218,12 +4829,56 @@ def _regenerate_scene_prompt(
             model_display = gen_method if gen_method else "default"
         st.toast(f"🎬 Generating prompt for: {model_display} (project default)", icon="📁")
 
-    # Build dialogue context
+    # Build dialogue context with proper format for each video model
+    # Seedance format: "Character says warmly: 'line'" with transitions between speakers
+    # WAN/Veo format: "[Character] speaks: 'line'"
     dialogue_lines = []
-    for d in scene.dialogue:
+    dialogue_lines_seedance = []  # Seedance-specific format with better attribution
+    prev_speaker = None
+
+    # Emotion to adverb mapping for natural dialogue prompts
+    emotion_adverbs = {
+        "neutral": "calmly",
+        "happy": "cheerfully",
+        "sad": "sadly",
+        "angry": "angrily",
+        "fearful": "fearfully",
+        "surprised": "in surprise",
+        "disgusted": "with disgust",
+        "contemptuous": "contemptuously",
+        "excited": "excitedly",
+        "serious": "seriously",
+        "playful": "playfully",
+        "sarcastic": "sarcastically",
+        "hopeful": "hopefully",
+        "nervous": "nervously",
+        "confident": "confidently",
+        "pleading": "pleadingly",
+        "commanding": "commandingly",
+    }
+
+    for i, d in enumerate(scene.dialogue):
         char = script.get_character(d.character_id)
         char_name = char.name if char else d.character_id
+        emotion_val = d.emotion.value.lower() if d.emotion else "neutral"
+        emotion_adverb = emotion_adverbs.get(emotion_val, "calmly")
+
+        # Standard format for WAN/Veo (straight quotes for compatibility)
         dialogue_lines.append(f'{char_name} ({d.emotion.value}): "{d.text}"')
+
+        # Seedance format with natural transitions (straight quotes)
+        if i == 0:
+            # First line: "Character says warmly: 'line'"
+            seedance_line = f"{char_name} says {emotion_adverb}: \"{d.text}\""
+        elif char_name == prev_speaker:
+            # Same speaker continues
+            seedance_line = f"Then continues {emotion_adverb}: \"{d.text}\""
+        else:
+            # Different speaker: "Then Character2 replies excitedly: 'line'"
+            seedance_line = f"Then {char_name} replies {emotion_adverb}: \"{d.text}\""
+
+        dialogue_lines_seedance.append(seedance_line)
+        prev_speaker = char_name
 
     # Build character context
     char_descriptions = []
@@ -4422,20 +5077,41 @@ Generate an image prompt in {visual_style} style. Start with the style, then des
 - Example: 'Sarah (curious) leans forward and says "I never expected this." Her expression shifts to surprise.'"""
             elif "seedance" in gen_method:
                 seedance_model_name = "Seedance Fast" if is_seedance_fast else "Seedance 1.5 Pro"
+                # Determine style ending based on visual_style
+                style_lower = (visual_style or "").lower()
+                if any(kw in style_lower for kw in ["photorealistic", "realistic", "photo", "cinematic"]):
+                    style_ending = "Photorealistic. Preserve exact appearance."
+                    style_rule = "PHOTOREALISTIC - output must match source image exactly, NO CGI look"
+                elif any(kw in style_lower for kw in ["anime", "manga", "cartoon"]):
+                    style_ending = f"{visual_style}. Preserve exact character appearance."
+                    style_rule = f"STYLE: {visual_style} - maintain consistent art style throughout"
+                elif any(kw in style_lower for kw in ["3d", "pixar", "animated"]):
+                    style_ending = f"{visual_style}. Preserve exact character appearance."
+                    style_rule = f"STYLE: {visual_style} - maintain 3D animated look"
+                else:
+                    style_ending = f"{visual_style}. Preserve exact appearance." if visual_style else "Preserve exact appearance."
+                    style_rule = f"STYLE: {visual_style}" if visual_style else "Match the style of the input image"
+
                 format_guidance = f"""Format for {seedance_model_name} (image-to-video with lip-sync) - MULTI-SHOT CINEMATIC:
 
 CRITICAL I2V RULES:
-1. PHOTOREALISTIC - output must match source image exactly, NO CGI look
+1. {style_rule}
 2. NO STYLE DESCRIPTION - style is in the image
 3. MAX 50 WORDS total - shorter = more faithful
-4. Reference "the person in the image"
-5. Focus on: lip movements, subtle expressions, natural dialogue delivery
-6. Dialogue format: speaks: "line"
-7. MULTI-SHOT CAMERA: Include cinematic variety - "camera work transitions from wide to medium to close-up"
-8. ALWAYS END WITH: "Photorealistic. Preserve exact appearance."
+4. Focus on: lip movements, subtle expressions, natural dialogue delivery
+5. MULTI-SHOT CAMERA: Include cinematic variety - "camera work transitions from wide to medium to close-up"
+6. ALWAYS END WITH: "{style_ending}"
 
-GOOD EXAMPLE:
-"The person in the image speaks: 'I've been waiting for this moment.' Subtle expression shifts. Camera work: wide establishing shot, transitions to medium shot, pushes in to close-up on emotional beats. Photorealistic. Preserve exact appearance."
+DIALOGUE FORMAT (CRITICAL FOR LIP-SYNC):
+- Single speaker: "[Name] says [emotion]: '[dialogue]'"
+- Multi-speaker: "Then [Name2] replies [emotion]: '[dialogue]'"
+- Each character MUST be named explicitly with their emotion
+
+SINGLE SPEAKER EXAMPLE:
+"Karen says angrily: 'I can't believe you did this.' Expression shifts from shock to anger. Camera transitions from medium to close-up. {style_ending}"
+
+MULTI-SPEAKER EXAMPLE:
+"Marcus says calmly: 'We need to talk about what happened.' Then Sarah replies nervously: 'I was hoping you wouldn't find out.' Marcus continues seriously: 'It's too late for that now.' Camera work: wide establishing, medium for dialogue, close-ups for reactions. {style_ending}"
 """
             else:  # wan26 (I2V, T2V, or Fast)
                 # Determine WAN model variant name
@@ -4445,6 +5121,21 @@ GOOD EXAMPLE:
                     wan_model_name = "WAN 2.5 Fast"
                 else:
                     wan_model_name = "WAN 2.6 I2V (Image-to-Video)"
+
+                # Determine style-aware endings
+                style_lower = (visual_style or "").lower()
+                if any(kw in style_lower for kw in ["photorealistic", "realistic", "photo", "cinematic"]):
+                    wan_style_text = "Cinematic, photorealistic, natural skin texture"
+                    wan_style_ending = "Cinematic, photorealistic, natural skin texture. Preserve identity, maintain appearance."
+                elif any(kw in style_lower for kw in ["anime", "manga", "cartoon"]):
+                    wan_style_text = f"Cinematic, {visual_style}"
+                    wan_style_ending = f"Cinematic, {visual_style}. Preserve identity, maintain appearance."
+                elif any(kw in style_lower for kw in ["3d", "pixar", "animated"]):
+                    wan_style_text = f"Cinematic, {visual_style}"
+                    wan_style_ending = f"Cinematic, {visual_style}. Preserve identity, maintain appearance."
+                else:
+                    wan_style_text = f"Cinematic, {visual_style}" if visual_style else "Cinematic"
+                    wan_style_ending = f"{wan_style_text}. Preserve identity, maintain appearance."
 
                 # Different rules for T2V (no input image) vs I2V (has input image)
                 if is_wan_t2v:
@@ -4463,14 +5154,14 @@ RULES:
 2. DIALOGUE: Include ALL lines using: [Character] speaks: "line"
 3. MOTION: Use concrete verbs with speed adverbs (gently sways, slowly tilts)
 4. MULTI-SHOT: Provide descriptions for wide/medium/close-up angles
-5. STYLE: "Cinematic, photorealistic, natural skin texture"
+5. STYLE: "{wan_style_text}"
 6. Keep total under 120 words
 
 EXAMPLE PROMPT:
 "Wide shot: Marcus, a 30-year-old man with short dark hair and stubble, wearing a navy sweater, sits in a warm-lit living room.
 Medium shot: Marcus speaks: 'I've been waiting for this moment.' Natural body language, gentle eye movement.
 Close-up: His expression shifts from anticipation to understanding, subtle facial movements.
-Cinematic, photorealistic, natural skin texture."
+{wan_style_ending}"
 """
                 else:
                     format_guidance = f"""Format for {wan_model_name} - MULTI-SHOT CINEMATIC:
@@ -4487,7 +5178,7 @@ RULES:
 1. DIALOGUE: Include ALL lines using: [Character] speaks: "line"
 2. MOTION: Use concrete verbs with speed adverbs (gently sways, slowly tilts)
 3. MULTI-SHOT: Provide descriptions for wide/medium/close-up angles
-4. STYLE: "Cinematic, photorealistic, natural skin texture"
+4. STYLE: "{wan_style_text}"
 5. END WITH: "Preserve identity, maintain appearance"
 6. Keep total under 100 words
 
@@ -4495,7 +5186,7 @@ EXAMPLE PROMPT:
 "Wide shot: The person in the image in a warm-lit living room, soft key light.
 Medium shot: They speak: 'I've been waiting for this moment.' Natural body language, gentle eye movement.
 Close-up: Expression shifts from anticipation to understanding, subtle facial movements.
-Cinematic, photorealistic, natural skin texture. Preserve identity, maintain appearance."
+{wan_style_ending}"
 """
 
             # Different system prompts for different video models
@@ -4587,11 +5278,11 @@ Generate a video animation prompt that:
 4. Flows naturally from the scene image"""
             else:
                 # WAN 2.6 / Seedance - MULTI-SHOT cinematic prompts with all elements
-                # Include ALL dialogue lines for the scene
-                all_dialogue = dialogue_lines if dialogue_lines else []
-                dialogue_text = "\n".join(all_dialogue) if all_dialogue else None
+                # Use Seedance-specific dialogue format when applicable
                 if "seedance" in gen_method:
                     model_label = "Seedance Fast" if is_seedance_fast else "Seedance 1.5 Pro"
+                    # Use Seedance-optimized dialogue format with character attribution
+                    all_dialogue = dialogue_lines_seedance if dialogue_lines_seedance else []
                 else:
                     # WAN variant labels
                     if is_wan_t2v:
@@ -4600,10 +5291,56 @@ Generate a video animation prompt that:
                         model_label = "WAN 2.5 Fast"
                     else:
                         model_label = "WAN 2.6 I2V"
+                    # WAN uses standard format
+                    all_dialogue = dialogue_lines if dialogue_lines else []
+
+                dialogue_text = "\n".join(all_dialogue) if all_dialogue else None
+
+                # Determine style-aware ending based on visual_style
+                style_lower = (visual_style or "").lower()
+                if any(kw in style_lower for kw in ["photorealistic", "realistic", "photo", "cinematic"]):
+                    style_ending_seedance = "Photorealistic. Preserve exact appearance."
+                    style_ending_wan = "Cinematic, photorealistic. Preserve identity, maintain appearance."
+                elif any(kw in style_lower for kw in ["anime", "manga", "cartoon"]):
+                    style_ending_seedance = f"{visual_style}. Preserve exact character appearance."
+                    style_ending_wan = f"Cinematic, {visual_style}. Preserve identity, maintain appearance."
+                elif any(kw in style_lower for kw in ["3d", "pixar", "animated"]):
+                    style_ending_seedance = f"{visual_style}. Preserve exact character appearance."
+                    style_ending_wan = f"Cinematic, {visual_style}. Preserve identity, maintain appearance."
+                else:
+                    style_ending_seedance = f"{visual_style}. Preserve exact appearance." if visual_style else "Preserve exact appearance."
+                    style_ending_wan = f"Cinematic, {visual_style}. Preserve identity, maintain appearance." if visual_style else "Preserve identity, maintain appearance."
 
                 # Build user prompt with emphasis on dialogue and MULTI-SHOT format
                 if dialogue_text:
-                    user_prompt = f"""Create a MULTI-SHOT CINEMATIC I2V prompt for {model_label}. MAX 100 WORDS.
+                    if "seedance" in gen_method:
+                        # Seedance-specific prompt with proper dialogue attribution
+                        user_prompt = f"""Create a MULTI-SHOT CINEMATIC I2V prompt for {model_label}. MAX 100 WORDS.
+
+**DIALOGUE (CRITICAL - INCLUDE ALL LINES WITH CHARACTER NAMES AND EMOTIONS):**
+{dialogue_text}
+
+Scene mood: {scene.direction.mood}
+Setting: {scene.direction.setting}
+
+DIALOGUE FORMAT (USE EXACTLY AS PROVIDED):
+- Each line has character name + emotion + dialogue
+- Multi-character: use transitions like "Then [Name] replies..."
+- This enables proper lip-sync attribution
+
+USE MULTI-SHOT FORMAT:
+Wide shot: [establishing]
+Medium shot: [dialogue with character actions]
+Close-up: [emotional reactions]
+
+End with: "{style_ending_seedance}"
+
+CRITICAL: Use EXACT dialogue format provided above. Each character's name MUST appear with their line.
+
+Output ONLY the prompt text."""
+                    else:
+                        # WAN prompt format
+                        user_prompt = f"""Create a MULTI-SHOT CINEMATIC I2V prompt for {model_label}. MAX 100 WORDS.
 
 **DIALOGUE (MUST INCLUDE ALL LINES):**
 {dialogue_text}
@@ -4616,7 +5353,7 @@ Wide shot: [establishing - setting, character position, lighting]
 Medium shot: [dialogue, body language] - Include ALL dialogue here as: Character speaks: "line"
 Close-up: [emotional reactions, facial expressions]
 
-End with: "Cinematic, photorealistic. Preserve identity, maintain appearance."
+End with: "{style_ending_wan}"
 
 CRITICAL: Include ALL dialogue lines verbatim using format: [Character] speaks: "line"
 
@@ -4634,7 +5371,7 @@ Medium shot: [character action, body language]
 Close-up: [emotional expressions, subtle movements]
 
 Include motion verbs (sway, tilt, blink) with speed adverbs (gently, slowly).
-End with: "Cinematic, photorealistic. Preserve identity, maintain appearance."
+End with: "{style_ending_wan}"
 
 Output ONLY the prompt text."""
 
@@ -4673,7 +5410,7 @@ def _generate_all_scene_images(script: Script, state: MovieModeState) -> None:
     """Generate images for all scenes that don't have one."""
     from src.services.movie_image_generator import MovieImageGenerator
 
-    visual_style = state.config.visual_style if state.config else "photorealistic, cinematic lighting"
+    visual_style = (state.config.visual_style if state.config else None) or (script.visual_style if script else None) or ""
     generator = MovieImageGenerator(style=visual_style)
     output_dir = get_project_dir() / "scenes"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -4741,7 +5478,7 @@ def _generate_single_scene_image(scene, script: Script, state: MovieModeState) -
     from src.services.movie_image_generator import MovieImageGenerator
     import time
 
-    visual_style = state.config.visual_style if state.config else "photorealistic, cinematic lighting"
+    visual_style = (state.config.visual_style if state.config else None) or (script.visual_style if script else None) or ""
     generator = MovieImageGenerator(style=visual_style)
 
     # Get image model settings - per-scene overrides global session state
@@ -4821,6 +5558,18 @@ def _render_scene_image_manager(scene, script: Script, state: MovieModeState, co
 
     has_image = scene.image_path and Path(scene.image_path).exists()
 
+    # Check for last frame preview when use_previous_last_frame is enabled
+    last_frame_preview = None
+    use_prev_frame = getattr(scene, 'use_previous_last_frame', False)
+    if use_prev_frame and scene.index > 1:
+        prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
+        if prev_scene and prev_scene.video_path and Path(prev_scene.video_path).exists():
+            # Extract and cache the last frame for preview
+            cache_dir = get_project_dir() / "scenes" / f"scene_{scene.index:03d}" / "continuity"
+            extracted = extract_last_frame_from_video(Path(prev_scene.video_path), cache_dir)
+            if extracted:
+                last_frame_preview = str(extracted)
+
     # Collect all existing variants (from variants list + check directory)
     # Use resolved paths to avoid duplicates from different path formats
     existing_variants = []
@@ -4879,6 +5628,10 @@ def _render_scene_image_manager(scene, script: Script, state: MovieModeState, co
             # Show variant count if multiple
             if num_variants > 1:
                 st.caption(f"📷 {num_variants} variants")
+        elif last_frame_preview:
+            # Show last frame from previous video when use_previous_last_frame is enabled
+            st.image(last_frame_preview, width="stretch")
+            st.caption("🔗 Last frame from prev scene")
         else:
             st.info("No image", icon="📷")
 
@@ -5006,6 +5759,22 @@ def _render_scene_image_manager(scene, script: Script, state: MovieModeState, co
 
             # Thumbnail preview
             st.image(str(scene.image_path), width=300, caption=f"Current image ({num_variants} total)")
+        elif last_frame_preview:
+            # Show last frame from previous video when use_previous_last_frame is enabled
+            st.markdown("**🔗 Using Last Frame from Previous Scene**")
+            with st.expander("🔍 View Full Size", expanded=False):
+                st.image(last_frame_preview, width="stretch")
+                img = Path(last_frame_preview)
+                if img.exists():
+                    from PIL import Image as PILImage
+                    try:
+                        pil_img = PILImage.open(img)
+                        st.caption(f"**{pil_img.width}x{pil_img.height}** | {img.name}")
+                    except Exception:
+                        st.caption(f"{img.name}")
+
+            st.image(last_frame_preview, width=300, caption="Last frame from previous video")
+            st.caption("This scene will use the last frame from the previous scene's video as its starting point for video generation.")
         else:
             st.info("No image generated yet. Click 'Generate New Variant' below.")
 
@@ -5250,6 +6019,662 @@ def _render_scene_video_manager(scene: "MovieScene", state: "MovieModeState", co
         st.metric("Video Variants", num_variants)
 
 
+def _render_inline_character_creator(script: Script, state: MovieModeState, scene_index: int, scene) -> None:
+    """Render inline character creation form within storyboard.
+
+    This allows users to create new characters directly from the scene editor
+    without having to go back to the CHARACTERS step.
+    """
+    from src.models.schemas import Character, VoiceSettings
+
+    with st.container(border=True):
+        st.markdown("### ➕ Create New Character")
+
+        # Basic character info
+        char_name = st.text_input("Name", key=f"new_char_name_{scene_index}", placeholder="Character Name")
+
+        # Auto-generate ID from name
+        suggested_id = char_name.lower().replace(" ", "_").replace("-", "_") if char_name else ""
+        char_id = st.text_input("ID", value=suggested_id, key=f"new_char_id_{scene_index}",
+                                help="Unique identifier for this character (lowercase, no spaces)")
+
+        char_personality = st.text_input("Personality", key=f"new_char_personality_{scene_index}",
+                                         placeholder="e.g., cheerful, sarcastic, mysterious")
+
+        char_description = st.text_area("Visual Description", key=f"new_char_desc_{scene_index}", height=80,
+                                        placeholder="Physical appearance for image generation...")
+
+        # Voice settings
+        st.markdown("##### Voice Settings")
+        voice_col1, voice_col2 = st.columns(2)
+        with voice_col1:
+            voice_providers = ["edge", "openai", "elevenlabs"]
+            voice_provider = st.selectbox("Voice Provider", voice_providers, key=f"new_char_voice_provider_{scene_index}")
+
+        with voice_col2:
+            # Voice options based on provider
+            if voice_provider == "edge":
+                edge_voices = [
+                    "en-US-GuyNeural", "en-US-JennyNeural", "en-US-AriaNeural",
+                    "en-US-DavisNeural", "en-US-AmberNeural", "en-US-AnaNeural",
+                    "en-US-AshleyNeural", "en-US-BrandonNeural", "en-US-ChristopherNeural",
+                    "en-US-CoraNeural", "en-US-ElizabethNeural", "en-US-EricNeural",
+                    "en-US-JacobNeural", "en-US-MichelleNeural", "en-US-MonicaNeural",
+                    "en-US-SaraNeural", "en-US-TonyNeural"
+                ]
+                voice_id = st.selectbox("Voice", edge_voices, key=f"new_char_voice_id_{scene_index}")
+            elif voice_provider == "openai":
+                openai_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+                voice_id = st.selectbox("Voice", openai_voices, key=f"new_char_voice_id_{scene_index}")
+            else:
+                voice_id = st.text_input("ElevenLabs Voice ID", key=f"new_char_voice_id_{scene_index}",
+                                         placeholder="Enter voice ID from ElevenLabs")
+
+        # Portrait generation option
+        generate_portrait = st.checkbox("🎨 Generate portrait with AI", value=True,
+                                        key=f"new_char_gen_portrait_{scene_index}",
+                                        help="Use AI to generate a character portrait from the visual description")
+
+        # Action buttons
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            if st.button("✅ Create Character", key=f"create_char_{scene_index}",
+                         disabled=not char_name or not char_id, type="primary"):
+                # Check for duplicate ID
+                existing_ids = [c.id for c in script.characters]
+                if char_id in existing_ids:
+                    st.error(f"Character ID '{char_id}' already exists. Please use a different ID.")
+                elif generate_portrait and not char_description:
+                    st.error("Visual description is required to generate a portrait.")
+                else:
+                    # Create the character
+                    new_char = Character(
+                        id=char_id,
+                        name=char_name,
+                        personality=char_personality or "",
+                        description=char_description or "",
+                        voice=VoiceSettings(provider=voice_provider, voice_id=voice_id or ""),
+                    )
+                    script.characters.append(new_char)
+
+                    # Add to scene's visible characters
+                    if scene.direction.visible_characters is None:
+                        scene.direction.visible_characters = []
+                    scene.direction.visible_characters.append(char_id)
+
+                    # Generate portrait with AI if requested
+                    if generate_portrait and char_description:
+                        from src.services.movie_image_generator import MovieImageGenerator
+
+                        # Get visual style from script
+                        visual_style = state.visual_style or "cinematic digital art"
+
+                        generator = MovieImageGenerator(style=visual_style)
+                        output_dir = get_project_dir() / "characters"
+
+                        with st.spinner(f"🎨 Generating portrait for {char_name}..."):
+                            result = generator.generate_character_reference(
+                                character=new_char,
+                                output_dir=output_dir,
+                                style=visual_style,
+                                image_size="2K",
+                                aspect_ratio="1:1",
+                            )
+                            if result:
+                                new_char.reference_image_path = str(result)
+                                st.success(f"✅ Portrait generated for {char_name}!")
+                            else:
+                                st.warning(f"Portrait generation failed, but character '{char_name}' was created. You can generate a portrait later in the Characters tab.")
+
+                    # Save and close modal
+                    save_movie_state()
+                    st.session_state[f"new_char_modal_{scene_index}"] = False
+                    st.session_state.scenes_dirty = True
+
+                    st.success(f"Character '{char_name}' created!")
+                    st.rerun()
+
+        with btn_col2:
+            if st.button("❌ Cancel", key=f"cancel_char_{scene_index}"):
+                st.session_state[f"new_char_modal_{scene_index}"] = False
+                st.rerun()
+
+
+def _render_inline_location_creator(script: Script, state: MovieModeState, scene_index: int, scene) -> None:
+    """Render inline location creation form within storyboard.
+
+    This allows users to create location reference images using AI text-to-image
+    generation, similar to how character portraits are created.
+    """
+    from src.services.movie_image_generator import MovieImageGenerator
+    from src.services.image_generator import ImageGenerator
+
+    with st.container(border=True):
+        st.markdown("### 📍 Create Location with AI")
+
+        # Location description
+        loc_description = st.text_area(
+            "Location Description",
+            key=f"new_loc_desc_{scene_index}",
+            height=100,
+            placeholder="Describe the location/environment in detail...\ne.g., 'A cozy coffee shop interior with exposed brick walls, warm lighting from hanging Edison bulbs, wooden tables and leather chairs, plants by the window'"
+        )
+
+        # Style options
+        visual_style = state.visual_style or "cinematic digital art"
+        st.caption(f"Using project style: **{visual_style}**")
+
+        # Aspect ratio for location
+        aspect_options = ["16:9", "4:3", "1:1", "9:16"]
+        aspect_ratio = st.selectbox(
+            "Aspect Ratio",
+            aspect_options,
+            index=0,
+            key=f"new_loc_aspect_{scene_index}",
+            help="16:9 is recommended for scene backgrounds"
+        )
+
+        # Camera angle hint
+        camera_angles = ["wide shot establishing", "medium shot interior", "close-up detail", "overhead view", "low angle"]
+        camera_hint = st.selectbox(
+            "Camera Angle",
+            camera_angles,
+            index=0,
+            key=f"new_loc_camera_{scene_index}",
+            help="Helps frame the location appropriately"
+        )
+
+        # Time of day / lighting
+        lighting_options = ["natural daylight", "golden hour warm light", "night with artificial lights", "moody overcast", "dramatic shadows", "soft diffused light"]
+        lighting = st.selectbox(
+            "Lighting",
+            lighting_options,
+            index=0,
+            key=f"new_loc_lighting_{scene_index}"
+        )
+
+        # Action buttons
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            if st.button("🎨 Generate Location", key=f"create_loc_{scene_index}",
+                         disabled=not loc_description, type="primary"):
+                # Build prompt for location generation
+                style_lower = visual_style.lower()
+                is_photorealistic = any(kw in style_lower for kw in ["photorealistic", "realistic", "photo", "cinematic"])
+
+                if is_photorealistic:
+                    prompt = f"""RAW photograph, {camera_hint} of {loc_description}.
+
+{lighting}, natural textures, architectural photography style.
+Shot on Sony A7IV with 24mm f/2.8 lens, deep depth of field.
+8K resolution, hyperrealistic, professional interior/exterior photography.
+
+AVOID: CGI, cartoon, anime, 3D render, digital art, people, characters, figures."""
+                else:
+                    prompt = f"""{visual_style} style {camera_hint} of {loc_description}.
+
+{lighting}, highly detailed environment, professional quality.
+No people or characters, empty scene for background reference.
+
+Art style: {visual_style}."""
+
+                # Generate the location image - use per-scene directory
+                import time
+                generator = ImageGenerator()
+                loc_ref_dir = get_project_dir() / "location_refs" / f"scene_{scene_index:03d}"
+                loc_ref_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = int(time.time())
+                output_path = loc_ref_dir / f"loc_{timestamp}.png"
+
+                with st.spinner("🎨 Generating location with AI..."):
+                    try:
+                        result = generator.generate_scene_image(
+                            prompt=prompt,
+                            style_prefix=visual_style,
+                            aspect_ratio=aspect_ratio,
+                            image_size="2K",
+                            output_path=output_path,
+                        )
+                        if result and output_path.exists():
+                            scene.direction.location_reference_path = str(output_path)
+                            save_movie_state()
+                            st.session_state[f"new_loc_modal_{scene_index}"] = False
+                            st.success("✅ Location reference generated!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to generate location image. Please try again.")
+                    except Exception as e:
+                        logger.error(f"Location generation failed: {e}")
+                        st.error(f"Generation failed: {str(e)[:100]}")
+
+        with btn_col2:
+            if st.button("❌ Cancel", key=f"cancel_loc_{scene_index}"):
+                st.session_state[f"new_loc_modal_{scene_index}"] = False
+                st.rerun()
+
+
+def _render_connected_location_creator(script: Script, state: MovieModeState, scene_index: int, scene, prev_scene) -> None:
+    """Render connected location creation form.
+
+    This generates a new location that's visually connected to the previous scene's location,
+    useful for transitions (e.g., character walking from office to conference room).
+
+    Supports two modes:
+    1. Location-only: Generate empty establishing shot of new location
+    2. With characters: Generate new location WITH specific characters in frame
+    """
+    from src.services.image_generator import ImageGenerator
+    from PIL import Image as PILImage
+
+    prev_loc_path = getattr(prev_scene.direction, 'location_reference_path', None)
+
+    with st.container(border=True):
+        st.markdown("### 🔗 Generate Connected Location")
+
+        # Show previous location as reference
+        if prev_loc_path and Path(prev_loc_path).exists():
+            st.image(prev_loc_path, caption=f"Previous: {prev_scene.direction.setting[:50]}...", width=200)
+        st.caption("The new location will match the style/lighting of the previous location.")
+
+        # New location description
+        loc_description = st.text_area(
+            "New Location Description",
+            key=f"connected_loc_desc_{scene_index}",
+            height=100,
+            placeholder="Describe where the character goes next...\ne.g., 'Adjacent conference room with glass walls, modern furniture, city view'"
+        )
+
+        # Transition type
+        transition_types = [
+            ("adjacent", "Adjacent Room - Same building, similar style"),
+            ("nearby", "Nearby Location - Same general area"),
+            ("different", "Different Location - Maintain only lighting/time of day"),
+        ]
+        transition_type = st.selectbox(
+            "Connection Type",
+            options=[t[0] for t in transition_types],
+            format_func=lambda x: next(t[1] for t in transition_types if t[0] == x),
+            key=f"connected_loc_type_{scene_index}"
+        )
+
+        # Character inclusion option
+        st.markdown("---")
+        include_characters = st.checkbox(
+            "🎭 Include characters in the new location",
+            value=False,
+            key=f"connected_loc_include_chars_{scene_index}",
+            help="Generate the location WITH characters in frame (transition shot)"
+        )
+
+        selected_char_ids = []
+        char_portraits = []
+        char_descriptions = []
+
+        if include_characters:
+            # Get all characters with portraits
+            all_chars = [(c.id, c.name) for c in script.characters]
+            chars_with_portraits = [
+                c for c in script.characters
+                if c.reference_image_path and Path(c.reference_image_path).exists()
+            ]
+
+            if not chars_with_portraits:
+                st.warning("⚠️ No character portraits available. Generate portraits in the Characters step first.")
+            else:
+                # Multi-select for characters to include
+                selected_char_ids = st.multiselect(
+                    "Characters in new location",
+                    options=[c.id for c in chars_with_portraits],
+                    format_func=lambda x: next(c.name for c in script.characters if c.id == x),
+                    default=[c.id for c in chars_with_portraits[:1]],  # Default to first character
+                    key=f"connected_loc_chars_{scene_index}",
+                    help="Select which characters appear in the transition scene"
+                )
+
+                # Show selected character portraits
+                if selected_char_ids:
+                    st.caption("Selected characters:")
+                    cols = st.columns(min(len(selected_char_ids), 4))
+                    for i, char_id in enumerate(selected_char_ids):
+                        char = script.get_character(char_id)
+                        if char and char.reference_image_path:
+                            with cols[i % 4]:
+                                st.image(char.reference_image_path, caption=char.name, width=80)
+                                char_portraits.append(Path(char.reference_image_path))
+                                char_descriptions.append(f"{char.name}: {char.description}")
+
+                # Character action/pose in new location
+                char_action = st.text_input(
+                    "Character action/pose",
+                    key=f"connected_loc_char_action_{scene_index}",
+                    placeholder="e.g., 'entering the room', 'looking around curiously', 'standing in doorway'"
+                )
+
+        # Action buttons
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            can_generate = loc_description and (not include_characters or selected_char_ids)
+            if st.button("🎨 Generate", key=f"gen_connected_loc_{scene_index}",
+                         disabled=not can_generate, type="primary"):
+                visual_style = state.visual_style or "cinematic digital art"
+                style_lower = visual_style.lower()
+                is_photorealistic = any(kw in style_lower for kw in ["photorealistic", "realistic", "photo", "cinematic"])
+
+                # Build prompt based on connection type
+                if transition_type == "adjacent":
+                    connection_hint = "This is an adjacent room in the same building. Maintain EXACT same architectural style, wall colors, flooring type, lighting conditions, and time of day."
+                elif transition_type == "nearby":
+                    connection_hint = "This is a nearby location in the same general area. Maintain similar lighting conditions, time of day, and overall aesthetic."
+                else:
+                    connection_hint = "Maintain the same lighting conditions and time of day as the reference."
+
+                if include_characters and char_descriptions:
+                    # WITH CHARACTERS - transition shot
+                    char_action_text = char_action if char_action else "in the scene"
+                    char_section = "\n".join([f"- {desc}" for desc in char_descriptions])
+
+                    if is_photorealistic:
+                        prompt = f"""RAW photograph of {loc_description}.
+
+CHARACTERS (use reference images for EXACT appearance):
+{char_section}
+
+Characters are {char_action_text}.
+
+{connection_hint}
+
+CRITICAL: Match character FACES exactly from the reference portraits.
+Same lighting conditions as location reference. Match the photographic style exactly.
+8K resolution, hyperrealistic, professional photography, natural skin texture."""
+                    else:
+                        prompt = f"""{visual_style} style scene in {loc_description}.
+
+CHARACTERS (match appearance from reference images):
+{char_section}
+
+Characters are {char_action_text}.
+
+{connection_hint}
+
+Match the art style and lighting from the location reference image exactly.
+Highly detailed environment and characters, professional quality.
+
+Art style: {visual_style}."""
+                else:
+                    # LOCATION ONLY - establishing shot
+                    if is_photorealistic:
+                        prompt = f"""RAW photograph of {loc_description}.
+
+{connection_hint}
+
+Same lighting conditions as reference image. Match the photographic style exactly.
+8K resolution, hyperrealistic, professional photography.
+
+AVOID: CGI, cartoon, anime, 3D render, people, characters, figures."""
+                    else:
+                        prompt = f"""{visual_style} style establishing shot of {loc_description}.
+
+{connection_hint}
+
+Match the art style and lighting from the reference image exactly.
+Highly detailed environment, professional quality.
+No people or characters.
+
+Art style: {visual_style}."""
+
+                # Generate with reference images
+                import time
+                generator = ImageGenerator()
+                loc_ref_dir = get_project_dir() / "location_refs" / f"scene_{scene_index:03d}"
+                loc_ref_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = int(time.time())
+                output_path = loc_ref_dir / f"loc_connected_{timestamp}.png"
+
+                spinner_text = "🎨 Generating connected location with characters..." if include_characters else "🎨 Generating connected location..."
+                with st.spinner(spinner_text):
+                    try:
+                        # Collect all reference images
+                        reference_images = []
+
+                        # 1. Previous location as primary reference
+                        if prev_loc_path and Path(prev_loc_path).exists():
+                            try:
+                                reference_images.append(PILImage.open(prev_loc_path))
+                                logger.info(f"Added location reference: {prev_loc_path}")
+                            except Exception as e:
+                                logger.warning(f"Failed to load location reference: {e}")
+
+                        # 2. Character portraits if included
+                        if include_characters and char_portraits:
+                            for portrait_path in char_portraits:
+                                try:
+                                    reference_images.append(PILImage.open(portrait_path))
+                                    logger.info(f"Added character portrait: {portrait_path.name}")
+                                except Exception as e:
+                                    logger.warning(f"Failed to load portrait {portrait_path}: {e}")
+
+                        result = generator.generate_scene_image(
+                            prompt=prompt,
+                            style_prefix=visual_style,
+                            aspect_ratio="16:9",
+                            image_size="2K",
+                            output_path=output_path,
+                            reference_images=reference_images if reference_images else None,
+                        )
+                        if result and output_path.exists():
+                            # Update location reference and add to variants
+                            scene.direction.location_reference_path = str(output_path)
+                            if not hasattr(scene.direction, 'location_reference_variants'):
+                                scene.direction.location_reference_variants = []
+                            scene.direction.location_reference_variants.append(str(output_path))
+                            scene.direction.selected_location_variant_idx = len(scene.direction.location_reference_variants) - 1
+                            save_movie_state()
+                            st.session_state[f"connected_loc_modal_{scene_index}"] = False
+                            st.success("✅ Connected location generated!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to generate. Please try again.")
+                    except Exception as e:
+                        logger.error(f"Connected location generation failed: {e}")
+                        st.error(f"Generation failed: {str(e)[:100]}")
+
+        with btn_col2:
+            if st.button("❌ Cancel", key=f"cancel_connected_loc_{scene_index}"):
+                st.session_state[f"connected_loc_modal_{scene_index}"] = False
+                st.rerun()
+
+
+def _split_scene_by_dialogue(script: "Script", scene: "MovieScene", num_scenes: int) -> None:
+    """Split a scene into multiple scenes by distributing dialogue by WORD COUNT.
+
+    Args:
+        script: The Script object containing all scenes
+        scene: The scene to split
+        num_scenes: Number of scenes to split into
+    """
+    from src.models.schemas import MovieScene, SceneDirection, DialogueLine
+
+    if num_scenes < 2 or len(scene.dialogue) < 2:
+        return  # Nothing to split
+
+    dialogue_lines = list(scene.dialogue)
+
+    # Find scene's position in the list
+    scene_idx_in_list = next(
+        (i for i, s in enumerate(script.scenes) if s.index == scene.index),
+        None
+    )
+    if scene_idx_in_list is None:
+        return
+
+    # Calculate total words and target per scene
+    total_words = sum(len(d.text.split()) for d in dialogue_lines)
+    target_words_per_scene = total_words / num_scenes
+
+    # Distribute dialogue lines into groups based on word count
+    dialogue_groups = []
+    current_group = []
+    current_words = 0
+
+    for line in dialogue_lines:
+        line_words = len(line.text.split())
+
+        # If adding this line would exceed target AND we have content AND more groups needed
+        if (current_words + line_words > target_words_per_scene * 1.2 and
+                current_group and len(dialogue_groups) < num_scenes - 1):
+            # Save current group, start new one
+            dialogue_groups.append(current_group)
+            current_group = [line]
+            current_words = line_words
+        else:
+            current_group.append(line)
+            current_words += line_words
+
+    # Don't forget the last group
+    if current_group:
+        dialogue_groups.append(current_group)
+
+    # If we ended up with fewer groups than requested, that's fine
+    # (happens when word distribution doesn't require as many splits)
+    num_scenes = len(dialogue_groups)
+
+    # Update the original scene with first group of dialogue
+    scene.dialogue = dialogue_groups[0]
+    scene.title = f"{scene.title or scene.direction.setting} (Part 1)"
+    # Clear prompts/media since content changed
+    scene.visual_prompt = None
+    scene.video_prompt = None
+
+    # Create new scenes for remaining dialogue groups
+    new_scenes = []
+    for i, group in enumerate(dialogue_groups[1:], start=2):
+        new_scene = MovieScene(
+            index=0,  # Will be set during renumbering
+            title=f"{scene.title.replace(' (Part 1)', '')} (Part {i})" if scene.title else f"Scene Part {i}",
+            direction=SceneDirection(
+                setting=scene.direction.setting,
+                mood=scene.direction.mood,
+                lighting=scene.direction.lighting,
+                camera=scene.direction.camera,
+                visible_characters=list(scene.direction.visible_characters),
+            ),
+            dialogue=group,
+            # Inherit per-scene video settings
+            generation_model=scene.generation_model,
+            resolution=scene.resolution,
+            enable_lip_sync=scene.enable_lip_sync,
+        )
+        new_scenes.append(new_scene)
+
+    # Insert new scenes after the original scene
+    for i, new_scene in enumerate(new_scenes):
+        script.scenes.insert(scene_idx_in_list + 1 + i, new_scene)
+
+    # Renumber all scenes
+    for i, s in enumerate(script.scenes):
+        s.index = i + 1
+
+    # Log split with word counts
+    word_counts = [sum(len(d.text.split()) for d in g) for g in dialogue_groups]
+    logger.info(f"Split scene into {num_scenes} parts: {word_counts} words each ({[len(g) for g in dialogue_groups]} lines)")
+
+
+def _snip_scene_at_dialogue_line(script: "Script", scene: "MovieScene", snip_at_line_idx: int) -> None:
+    """Snip a scene at a specific dialogue line, creating a new scene for remaining dialogue.
+
+    The new scene will:
+    - Contain dialogue from snip_at_line_idx onwards
+    - Inherit all settings from the original scene
+    - Be marked to use the last frame from the original scene for continuity
+    - Keep the same image path (reuse the base image)
+
+    Args:
+        script: The Script object containing all scenes
+        scene: The scene to snip
+        snip_at_line_idx: The dialogue line index to snip at (0-based)
+                          Lines 0 to snip_at_line_idx-1 stay in original scene
+                          Lines snip_at_line_idx onwards go to new scene
+    """
+    from src.models.schemas import MovieScene, SceneDirection, DialogueLine
+
+    if snip_at_line_idx <= 0 or snip_at_line_idx >= len(scene.dialogue):
+        return  # Invalid snip point
+
+    # Find scene's position in the list
+    scene_idx_in_list = next(
+        (i for i, s in enumerate(script.scenes) if s.index == scene.index),
+        None
+    )
+    if scene_idx_in_list is None:
+        return
+
+    # Split dialogue
+    before_snip = list(scene.dialogue[:snip_at_line_idx])
+    after_snip = list(scene.dialogue[snip_at_line_idx:])
+
+    # Determine part labels
+    original_title = scene.title or scene.direction.setting or f"Scene {scene.index}"
+    # If already has (Part N), increment, otherwise add (Part 1)
+    import re
+    part_match = re.search(r'\(Part (\d+)\)$', original_title)
+    if part_match:
+        part_num = int(part_match.group(1))
+        base_title = original_title[:part_match.start()].strip()
+        new_part_num = part_num + 1
+        scene.title = f"{base_title} (Part {part_num})"
+        new_title = f"{base_title} (Part {new_part_num})"
+    else:
+        scene.title = f"{original_title} (Part 1)"
+        new_title = f"{original_title} (Part 2)"
+
+    # Update original scene with dialogue before snip
+    scene.dialogue = before_snip
+    # Clear video prompt since dialogue changed, but keep visual prompt/image
+    scene.video_prompt = None
+
+    # Create new scene with dialogue after snip
+    # NOTE: We intentionally don't copy image_path - the new scene will use
+    # the LAST FRAME from the previous scene's video for continuity
+    new_scene = MovieScene(
+        index=0,  # Will be set during renumbering
+        title=new_title,
+        direction=SceneDirection(
+            setting=scene.direction.setting,
+            mood=scene.direction.mood,
+            lighting=scene.direction.lighting,
+            camera=scene.direction.camera,
+            visible_characters=list(scene.direction.visible_characters),
+            # Copy scene type if it exists
+            scene_type=getattr(scene.direction, 'scene_type', None),
+        ),
+        dialogue=after_snip,
+        # Inherit per-scene video settings
+        generation_model=scene.generation_model,
+        resolution=scene.resolution,
+        enable_lip_sync=scene.enable_lip_sync,
+        # DO NOT copy image_path - will use last frame from previous scene's video
+        image_path=None,
+        # Keep the same visual prompt (camera/composition can be adjusted by user)
+        visual_prompt=scene.visual_prompt,
+    )
+
+    # Mark new scene to use last frame from previous scene for video continuity
+    # This will be picked up by the video generator to extract last frame
+    new_scene.use_previous_last_frame = True
+
+    # Insert new scene after the original scene
+    script.scenes.insert(scene_idx_in_list + 1, new_scene)
+
+    # Renumber all scenes
+    for i, s in enumerate(script.scenes):
+        s.index = i + 1
+
+    # Log the snip
+    before_words = sum(len(d.text.split()) for d in before_snip)
+    after_words = sum(len(d.text.split()) for d in after_snip)
+    logger.info(f"Snipped scene at line {snip_at_line_idx}: {len(before_snip)} lines ({before_words} words) + {len(after_snip)} lines ({after_words} words)")
+
+
 def _render_scene_editor_form(script: Script, state: MovieModeState, visual_style: str) -> None:
     """Render the streamlined scene editor form."""
     from src.models.schemas import Emotion, DialogueLine, SceneDirection, MovieScene
@@ -5316,13 +6741,243 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
             st.session_state.scenes_dirty = True
             st.rerun()
 
+    # Continuity toggle - use last frame from previous scene's video
+    if scene.index > 1:  # Only show for scenes after the first
+        use_prev_frame = getattr(scene, 'use_previous_last_frame', False)
+        cont_col1, cont_col2, cont_col3 = st.columns([3, 1, 1])
+        with cont_col1:
+            if use_prev_frame:
+                st.info("🔗 **Continuity Mode** - Uses last frame from previous scene's video as starting point")
+            else:
+                st.caption("🖼️ Uses this scene's image as starting point")
+        with cont_col2:
+            if use_prev_frame:
+                if st.button("🖼️ Use Image", key=f"disable_cont_{scene.index}", help="Use this scene's image instead"):
+                    scene.use_previous_last_frame = False
+                    st.session_state.scenes_dirty = True
+                    save_movie_state()
+                    st.rerun()
+            else:
+                if st.button("🔗 Use Last Frame", key=f"enable_cont_{scene.index}", help="Use last frame from previous scene's video for smooth transition"):
+                    scene.use_previous_last_frame = True
+                    st.session_state.scenes_dirty = True
+                    save_movie_state()
+                    st.rerun()
+        with cont_col3:
+            # Manual extract button - extract last frame and save as scene image
+            prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
+            if prev_scene and prev_scene.video_path and Path(prev_scene.video_path).exists():
+                if st.button("📸 Extract", key=f"extract_frame_{scene.index}", help="Extract last frame from previous video and save as this scene's image"):
+                    with st.spinner("Extracting last frame..."):
+                        # Extract to the scene's images directory (force=True to always get fresh frame)
+                        images_dir = get_project_dir() / "scenes" / f"scene_{scene.index:03d}" / "images"
+                        extracted = extract_last_frame_from_video(Path(prev_scene.video_path), images_dir, force=True)
+                        if extracted:
+                            # Set as scene image
+                            scene.image_path = str(extracted)
+                            scene.add_image_variant(str(extracted))
+                            # Turn off continuity mode since we now have an image
+                            scene.use_previous_last_frame = False
+                            st.session_state.scenes_dirty = True
+                            save_movie_state()
+                            st.success("Last frame extracted and set as scene image!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to extract last frame")
+
     # Scene direction (2 columns)
     col1, col2 = st.columns(2)
     with col1:
-        new_setting = st.text_area("Setting", value=scene.direction.setting, height=80, key=f"set_{scene.index}")
+        # Setting with regenerate button
+        setting_label_col, setting_btn_col = st.columns([3, 1])
+        with setting_label_col:
+            st.markdown("**Setting**")
+        with setting_btn_col:
+            if st.button("🔄 AI", key=f"regen_setting_{scene.index}", help="Use AI to regenerate the setting description"):
+                new_setting_text = _regenerate_scene_setting(scene, script, state)
+                if new_setting_text:
+                    scene.direction.setting = new_setting_text
+                    save_movie_state()
+                    st.success("Setting regenerated!")
+                    st.rerun()
+
+        new_setting = st.text_area("Setting", value=scene.direction.setting, height=80, key=f"set_{scene.index}",
+                                   label_visibility="collapsed")
         if new_setting != scene.direction.setting:
             scene.direction.setting = new_setting
             st.session_state.scenes_dirty = True
+            # Auto-detect location change when setting is modified
+            if scene.index > 1:
+                from src.services.cinematography import detect_location_change
+                prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
+                if prev_scene:
+                    is_new_loc = detect_location_change(new_setting, prev_scene.direction.setting)
+                    scene.direction.is_new_location = is_new_loc
+                    scene.direction.suggest_establishing = is_new_loc
+
+        # Location change indicator
+        if scene.index > 1:
+            from src.services.cinematography import detect_location_change
+            prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
+            if prev_scene:
+                is_new_location = detect_location_change(scene.direction.setting, prev_scene.direction.setting)
+                if is_new_location:
+                    st.info("📍 **New Location Detected**")
+                    current_establishing = getattr(scene.direction, 'suggest_establishing', True)
+                    establishing_override = getattr(scene.direction, 'establishing_override', None)
+                    # Show checkbox only if not explicitly overridden
+                    checked = establishing_override if establishing_override is not None else current_establishing
+                    suggest_establishing = st.checkbox(
+                        "Use establishing shot (wide angle)",
+                        value=checked,
+                        key=f"establishing_{scene.index}",
+                        help="Wide shot to establish the new location"
+                    )
+                    if suggest_establishing != checked:
+                        scene.direction.suggest_establishing = suggest_establishing
+                        scene.direction.establishing_override = suggest_establishing
+                        st.session_state.scenes_dirty = True
+                        st.session_state.force_regen_cinematography = True
+
+        # Location reference image section
+        st.markdown("##### 🏠 Location Reference")
+
+        # Get all location variants for this scene
+        loc_ref_dir = get_project_dir() / "location_refs" / f"scene_{scene.index:03d}"
+        loc_ref_dir.mkdir(parents=True, exist_ok=True)
+        existing_loc_variants = list(loc_ref_dir.glob("*.png")) + list(loc_ref_dir.glob("*.jpg")) + list(loc_ref_dir.glob("*.jpeg")) + list(loc_ref_dir.glob("*.webp"))
+
+        # Also include current location if it exists elsewhere
+        current_loc_ref = getattr(scene.direction, 'location_reference_path', None)
+        if current_loc_ref and Path(current_loc_ref).exists():
+            current_loc_path = Path(current_loc_ref)
+            if current_loc_path not in existing_loc_variants:
+                existing_loc_variants.append(current_loc_path)
+
+        num_loc_variants = len(existing_loc_variants)
+
+        if num_loc_variants > 0:
+            sorted_loc_variants = sorted(existing_loc_variants, key=lambda x: x.name)
+
+            # Find current selection
+            current_loc_idx = 0
+            if current_loc_ref:
+                for idx, v in enumerate(sorted_loc_variants):
+                    if str(v) == str(current_loc_ref):
+                        current_loc_idx = idx
+                        break
+
+            if num_loc_variants > 1:
+                selected_loc_idx = st.slider(
+                    "Browse locations",
+                    min_value=1,
+                    max_value=num_loc_variants,
+                    value=current_loc_idx + 1,
+                    key=f"loc_var_slider_{scene.index}",
+                    format="%d of " + str(num_loc_variants),
+                ) - 1
+            else:
+                selected_loc_idx = 0
+
+            selected_loc = sorted_loc_variants[selected_loc_idx]
+            st.image(str(selected_loc), width=180)
+
+            # Action buttons
+            loc_act_col1, loc_act_col2, loc_act_col3 = st.columns(3)
+            with loc_act_col1:
+                is_current_loc = str(selected_loc) == str(current_loc_ref)
+                if st.button(
+                    "✓ Use" if not is_current_loc else "✓ Active",
+                    key=f"use_loc_{scene.index}",
+                    type="primary" if not is_current_loc else "secondary",
+                    disabled=is_current_loc,
+                    use_container_width=True,
+                ):
+                    scene.direction.location_reference_path = str(selected_loc)
+                    save_movie_state()
+                    st.success("Location updated!")
+                    st.rerun()
+
+            with loc_act_col2:
+                can_delete_loc = not is_current_loc or num_loc_variants > 1
+                if st.button("🗑️", key=f"del_loc_{scene.index}", disabled=not can_delete_loc,
+                            use_container_width=True, help="Delete this location"):
+                    import os
+                    try:
+                        os.remove(selected_loc)
+                        if str(selected_loc) == str(current_loc_ref):
+                            remaining = [v for v in sorted_loc_variants if str(v) != str(selected_loc)]
+                            scene.direction.location_reference_path = str(remaining[0]) if remaining else None
+                        save_movie_state()
+                        st.success("Deleted!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
+
+            with loc_act_col3:
+                if st.button("🔍", key=f"fullsize_loc_{scene.index}", use_container_width=True, help="Full size"):
+                    st.session_state[f"fullsize_loc_{scene.index}"] = str(selected_loc)
+
+            if st.session_state.get(f"fullsize_loc_{scene.index}"):
+                with st.container(border=True):
+                    st.image(st.session_state[f"fullsize_loc_{scene.index}"], width="stretch")
+                    if st.button("Close", key=f"close_fs_loc_{scene.index}"):
+                        del st.session_state[f"fullsize_loc_{scene.index}"]
+                        st.rerun()
+            st.markdown("---")
+        else:
+            st.caption("No location reference set.")
+
+        # Location options: Create, From Previous, Upload
+        prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
+        prev_has_location = prev_scene and getattr(prev_scene.direction, 'location_reference_path', None) and Path(prev_scene.direction.location_reference_path).exists()
+
+        if prev_has_location:
+            loc_action_col1, loc_action_col2, loc_action_col3 = st.columns(3)
+        else:
+            loc_action_col1, loc_action_col2 = st.columns(2)
+            loc_action_col3 = None
+
+        with loc_action_col1:
+            if st.button("🎨 Create", key=f"create_loc_btn_{scene.index}", use_container_width=True,
+                         help="Generate new location with AI"):
+                st.session_state[f"new_loc_modal_{scene.index}"] = True
+                st.rerun()
+
+        with loc_action_col2:
+            uploaded_loc = st.file_uploader(
+                "📤 Upload",
+                type=["png", "jpg", "jpeg", "webp"],
+                key=f"loc_ref_upload_{scene.index}",
+                help="Upload a location photo",
+                label_visibility="collapsed"
+            )
+
+        if loc_action_col3 and prev_has_location:
+            with loc_action_col3:
+                if st.button("🔗 From Prev", key=f"from_prev_loc_{scene.index}", use_container_width=True,
+                             help="Generate connected location based on previous scene"):
+                    st.session_state[f"connected_loc_modal_{scene.index}"] = True
+                    st.rerun()
+
+        if uploaded_loc:
+            import time
+            timestamp = int(time.time())
+            loc_ref_path = loc_ref_dir / f"loc_{timestamp}.{uploaded_loc.name.split('.')[-1]}"
+            with open(loc_ref_path, "wb") as f:
+                f.write(uploaded_loc.getbuffer())
+            scene.direction.location_reference_path = str(loc_ref_path)
+            save_movie_state()
+            st.success(f"Location saved!")
+            st.rerun()
+
+        # Render inline location creator if active
+        if st.session_state.get(f"new_loc_modal_{scene.index}", False):
+            _render_inline_location_creator(script, state, scene.index, scene)
+
+        # Render connected location creator if active
+        if st.session_state.get(f"connected_loc_modal_{scene.index}", False) and prev_scene:
+            _render_connected_location_creator(script, state, scene.index, scene, prev_scene)
 
         cameras = ["wide shot", "medium shot", "close-up", "extreme close-up", "over-the-shoulder", "POV"]
         cam_idx = cameras.index(scene.direction.camera) if scene.direction.camera in cameras else 1
@@ -5344,15 +6999,55 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
             scene.direction.mood = new_mood
             st.session_state.scenes_dirty = True
 
-        # Characters in scene
+        # Scene type selector
+        scene_type_options = [
+            (SceneType.DIALOGUE, "Dialogue - Character conversation"),
+            (SceneType.ESTABLISHING, "Establishing - Wide shot for new location"),
+            (SceneType.ACTION, "Action - Physical movement, chase"),
+            (SceneType.MONTAGE, "Montage - Quick cuts, time passage"),
+            (SceneType.CLIMAX, "Climax - High emotional intensity"),
+            (SceneType.TRANSITION, "Transition - Scene bridge"),
+            (SceneType.REACTION, "Reaction - Character response close-up"),
+        ]
+        current_scene_type = getattr(scene.direction, 'scene_type', SceneType.DIALOGUE)
+        if current_scene_type is None:
+            current_scene_type = SceneType.DIALOGUE
+        scene_type_values = [st_type for st_type, _ in scene_type_options]
+        scene_type_idx = scene_type_values.index(current_scene_type) if current_scene_type in scene_type_values else 0
+        new_scene_type = st.selectbox(
+            "Scene Type",
+            options=scene_type_values,
+            index=scene_type_idx,
+            format_func=lambda x: next((label for st_type, label in scene_type_options if st_type == x), x.value.title()),
+            key=f"scene_type_{scene.index}",
+            help="Scene type affects camera angle selection in cinematography planning"
+        )
+        if new_scene_type != current_scene_type:
+            scene.direction.scene_type = new_scene_type
+            st.session_state.scenes_dirty = True
+            st.session_state.force_regen_cinematography = True
+
+        # Characters in scene with inline add button
         all_chars = [c.id for c in script.characters]
         char_names = {c.id: c.name for c in script.characters}
         visible = [c for c in (scene.direction.visible_characters or []) if c in all_chars]
-        new_visible = st.multiselect("Characters", all_chars, default=visible,
-                                     format_func=lambda x: char_names.get(x, x), key=f"chars_{scene.index}")
-        if set(new_visible) != set(visible):
-            scene.direction.visible_characters = new_visible
-            st.session_state.scenes_dirty = True
+
+        char_col1, char_col2 = st.columns([4, 1])
+        with char_col1:
+            new_visible = st.multiselect("Characters", all_chars, default=visible,
+                                         format_func=lambda x: char_names.get(x, x), key=f"chars_{scene.index}")
+            if set(new_visible) != set(visible):
+                scene.direction.visible_characters = new_visible
+                st.session_state.scenes_dirty = True
+        with char_col2:
+            st.write("")  # Spacer for alignment
+            if st.button("+ New", key=f"add_char_{scene.index}", help="Add a new character"):
+                st.session_state[f"new_char_modal_{scene.index}"] = True
+                st.rerun()
+
+        # Render inline character creator if active
+        if st.session_state.get(f"new_char_modal_{scene.index}", False):
+            _render_inline_character_creator(script, state, scene.index, scene)
 
     # Prompts section with regenerate buttons
     st.markdown("##### Prompts")
@@ -5694,8 +7389,8 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
                 dur_options = [4, 6, 8]
             elif effective_model == "wan26":
                 dur_options = [5, 10, 15]
-            else:  # seedance15
-                dur_options = [3, 5, 8, 10, 15]
+            else:  # seedance15 - max 12s per API spec
+                dur_options = [3, 5, 8, 10, 12]
 
             # Calculate auto duration from dialogue
             auto_dur = scene.get_clip_duration(effective_model)
@@ -5712,6 +7407,63 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
             if new_dur != current_dur:
                 scene.clip_duration = new_dur
                 st.session_state.scenes_dirty = True
+
+            # Dialogue-duration validation warning
+            effective_dur = new_dur if new_dur else auto_dur
+            word_count = scene.word_count
+            if word_count > 0:
+                speaking_time = word_count / 2.5  # ~2.5 words/second = 150 WPM
+                # Max words that reasonably fit in the clip duration (with 0.5s buffer)
+                max_words = int((effective_dur - 0.5) * 2.5)
+                if speaking_time > effective_dur:
+                    excess_seconds = speaking_time - effective_dur
+                    st.warning(
+                        f"⚠️ **Dialogue too long!** {word_count} words ≈ {speaking_time:.1f}s "
+                        f"(exceeds {effective_dur}s by {excess_seconds:.1f}s). "
+                    )
+                    # Calculate how many scenes this should split into based on WORDS
+                    num_dialogue_lines = len(scene.dialogue)
+                    # Target words per scene (85% of clip duration at 2.5 words/sec)
+                    target_words_per_scene = int(effective_dur * 2.5 * 0.85)
+                    # How many scenes needed to fit all words
+                    scenes_needed = max(2, -(-word_count // target_words_per_scene))  # Ceiling division
+                    # But can't have more scenes than dialogue lines
+                    scenes_needed = min(scenes_needed, num_dialogue_lines)
+                    words_per_scene = word_count // scenes_needed
+
+                    if num_dialogue_lines >= 2:
+                        # Let user choose number of scenes (2 to num_dialogue_lines)
+                        max_splits = num_dialogue_lines
+                        split_col1, split_col2 = st.columns([2, 1])
+                        with split_col1:
+                            chosen_splits = st.number_input(
+                                "Split into",
+                                min_value=2,
+                                max_value=max_splits,
+                                value=min(scenes_needed, max_splits),
+                                step=1,
+                                key=f"split_count_{scene.index}",
+                                help=f"Recommended: {scenes_needed} (max {max_splits} = 1 line each)"
+                            )
+                        with split_col2:
+                            chosen_words = word_count // chosen_splits
+                            chosen_time = chosen_words / 2.5
+                            st.caption(f"~{chosen_words} words\n≈ {chosen_time:.1f}s each")
+
+                        if st.button(
+                            f"✂️ Split into {chosen_splits} scenes",
+                            key=f"split_scene_{scene.index}",
+                        ):
+                            _split_scene_by_dialogue(script, scene, chosen_splits)
+                            save_movie_state()
+                            st.success(f"Split into {chosen_splits} scenes (~{chosen_words} words each)!")
+                            st.rerun()
+                    elif num_dialogue_lines == 1:
+                        st.caption("Single dialogue line - consider shortening the text")
+                    else:
+                        st.caption("Not enough dialogue lines to split")
+                elif speaking_time > effective_dur * 0.9:  # Within 10% of limit
+                    st.caption(f"ℹ️ {word_count} words ≈ {speaking_time:.1f}s (tight fit for {effective_dur}s)")
 
         with v_col2:
             # Resolution - options depend on effective model
@@ -5904,7 +7656,25 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
 
     # Dialogue
     st.markdown("##### Dialogue")
+    num_dialogue_lines = len(scene.dialogue)
     for d_idx, d in enumerate(scene.dialogue):
+        # Show snip line (scissors) between dialogue lines (not before first line)
+        if d_idx > 0 and num_dialogue_lines > 1:
+            snip_cols = st.columns([1, 10, 1])
+            with snip_cols[1]:
+                # Show a subtle snip indicator
+                if st.button(
+                    "✂️ ─────── snip here ───────",
+                    key=f"snip_{scene.index}_{d_idx}",
+                    use_container_width=True,
+                    help=f"Split scene here: lines 1-{d_idx} stay in this scene, lines {d_idx+1}-{num_dialogue_lines} go to new scene"
+                ):
+                    _snip_scene_at_dialogue_line(script, scene, d_idx)
+                    st.session_state.scenes_dirty = True
+                    save_movie_state()
+                    st.success(f"Snipped! Lines {d_idx+1}-{num_dialogue_lines} moved to new scene (uses same image for continuity)")
+                    st.rerun()
+
         cols = st.columns([2, 4, 2, 1])
         with cols[0]:
             char_ids = [c.id for c in script.characters]
@@ -6502,8 +8272,8 @@ def render_visuals_page() -> None:
 
     if scenes_needing_video:
         # Show count summary
-        model_names = {"veo3": "Veo 3.1", "wan26": "WAN 2.6", "seedance15": "Seedance 1.5"}
-        counts_text = " | ".join(f"{model_names[m]}: {c}" for m, c in model_counts.items() if c > 0)
+        model_names = {"veo3": "Veo 3.1", "wan26": "WAN 2.6", "seedance15": "Seedance 1.5", "seedance_fast": "Seedance Fast"}
+        counts_text = " | ".join(f"{model_names.get(m, m)}: {c}" for m, c in model_counts.items() if c > 0)
         st.info(f"**{len(scenes_needing_video)} scenes to generate:** {counts_text}")
 
         # Button text based on dominant model or mixed
@@ -6733,7 +8503,9 @@ def _render_movie_scene_card(state, scene, generation_method: str, model_info: d
         variant_info.append(f"{num_vid_variants}🎬")
     variant_str = f" ({', '.join(variant_info)})" if variant_info else ""
 
-    st.markdown(f"**Scene {scene.index}** {status_icon}{variant_str}")
+    # Add continuity indicator if applicable
+    continuity_icon = "🔗" if getattr(scene, 'use_previous_last_frame', False) else ""
+    st.markdown(f"**Scene {scene.index}** {status_icon}{continuity_icon}{variant_str}")
     duration = scene.get_clip_duration(generation_method)
     title_text = scene.title or scene.direction.setting[:30] if scene.direction.setting else "Untitled"
     st.caption(f"{title_text} ({duration}s)")
@@ -7063,7 +8835,7 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
                 from src.services.atlascloud_animator import AtlasCloudAnimator, WanModel, SeedanceModel
                 visual_style = state.config.visual_style if state.config else state.script.visual_style
 
-                if scene_model == "seedance15":
+                if scene_model in ("seedance15", "seedance15_i2v"):
                     animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
                     result = animator.animate_scene(
                         image_path=Path(scene.image_path),
@@ -7082,6 +8854,22 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
                         duration_seconds=duration,
                         resolution=resolution,
                         visual_style=visual_style,
+                    )
+                elif scene_model in ("wan26", "wan26_i2v"):
+                    # WAN 2.6 I2V mode
+                    animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
+                    result = animator.animate_scene(
+                        image_path=Path(scene.image_path),
+                        prompt=prompt,
+                        output_path=output_path,
+                        duration_seconds=duration,
+                        resolution=resolution,
+                        visual_style=visual_style,
+                        guidance_scale=state.config.wan_guidance_scale if state.config else None,
+                        flow_shift=state.config.wan_flow_shift if state.config else None,
+                        inference_steps=state.config.wan_inference_steps if state.config else None,
+                        shot_type=state.config.wan_shot_type if state.config else None,
+                        seed=state.config.wan_seed if state.config else 0,
                     )
                 elif previous_video and use_prev_video:
                     # WAN 2.6 V2V mode
@@ -7164,12 +8952,12 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
 
     for i, scene in enumerate(scenes_to_generate):
         scene_model = getattr(scene, 'generation_model', None) or project_default
-        model_names = {"veo3": "Veo 3.1", "wan26": "WAN 2.6", "seedance15": "Seedance 1.5"}
+        model_names = {"veo3": "Veo 3.1", "wan26": "WAN 2.6", "seedance15": "Seedance 1.5", "seedance_fast": "Seedance Fast"}
         v2v_info = " (v2v)" if use_v2v and last_generated_video and scene_model == "veo3" else ""
         progress_bar.progress((i / total), text=f"Scene {scene.index} ({model_names.get(scene_model, scene_model)}{v2v_info})...")
 
-        # Check image requirement for WAN/Seedance
-        if scene_model in ["wan26", "seedance15"] and not (scene.image_path and Path(scene.image_path).exists()):
+        # Check image requirement for WAN/Seedance I2V modes
+        if scene_model in ["wan26", "wan26_i2v", "seedance15", "seedance15_i2v", "seedance_fast", "seedance_fast_i2v"] and not (scene.image_path and Path(scene.image_path).exists()):
             st.warning(f"Scene {scene.index} has no image - skipping")
             continue
 
@@ -7177,7 +8965,7 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
         resolution = getattr(scene, 'resolution', None) or (
             config.veo_resolution if scene_model == "veo3" else
             config.wan_resolution if scene_model == "wan26" else
-            config.seedance_resolution if scene_model == "seedance15" else "720p"
+            config.seedance_resolution if scene_model in ("seedance15", "seedance_fast") else "720p"
         ) if config else "720p"
         prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
 
@@ -7197,6 +8985,20 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
                     previous_video = Path(prev_scene.video_path)
                     logger.info(f"Using previous scene video for v2v continuity: {previous_video.name}")
 
+        # Check if this scene should use previous scene's last frame for continuity (from snip)
+        first_frame_override = None
+        if getattr(scene, 'use_previous_last_frame', False) and scene.index > 1:
+            prev_scene = next((s for s in state.script.scenes if s.index == scene.index - 1), None)
+            if prev_scene and prev_scene.video_path and Path(prev_scene.video_path).exists():
+                # Extract last frame from previous scene's video
+                extracted_frame = extract_last_frame_from_video(
+                    Path(prev_scene.video_path),
+                    output_dir / "continuity_frames"
+                )
+                if extracted_frame:
+                    first_frame_override = extracted_frame
+                    logger.info(f"Scene {scene.index}: Using extracted last frame from previous video for continuity")
+
         try:
             result = None
             if scene_model == "veo3":
@@ -7206,6 +9008,10 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
                         resolution=resolution,
                         duration=duration,
                     )
+                # Determine first frame: priority is extracted frame > scene image
+                effective_first_frame = first_frame_override if first_frame_override else (
+                    Path(scene.image_path) if use_scene_continuity and scene.image_path else None
+                )
                 result = veo_generator.generate_scene(
                     scene=scene,
                     script=state.script,
@@ -7213,15 +9019,17 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
                     style=config.visual_style if config else state.script.visual_style,
                     custom_prompt=getattr(scene, 'video_prompt', None),
                     reference_images=portraits[:3] if use_char_refs and portraits else None,
-                    first_frame=Path(scene.image_path) if use_scene_continuity and scene.image_path else None,
+                    first_frame=effective_first_frame,
                     previous_video=previous_video,
                     use_video_continuity=use_v2v and previous_video is not None,
                 )
-            elif scene_model == "wan26":
+            elif scene_model in ("wan26", "wan26_i2v"):
                 if wan_animator is None:
                     wan_animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
+                # Use extracted frame for continuity if available, otherwise scene image
+                input_image = first_frame_override if first_frame_override else Path(scene.image_path)
                 result = wan_animator.animate_scene(
-                    image_path=Path(scene.image_path),
+                    image_path=input_image,
                     prompt=prompt,
                     output_path=output_path,
                     duration_seconds=duration,
@@ -7233,7 +9041,7 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
                     shot_type=config.wan_shot_type if config else None,
                     seed=config.wan_seed if config else 0,
                 )
-            elif scene_model == "seedance15":
+            elif scene_model in ("seedance15", "seedance15_i2v"):
                 if seedance_animator is None:
                     seedance_animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
                 # Check if lip sync is enabled
@@ -7246,9 +9054,11 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
                         if d.audio_path and Path(d.audio_path).exists():
                             audio_path = Path(d.audio_path)
                             break
+                # Use extracted frame for continuity if available, otherwise scene image
+                input_image = first_frame_override if first_frame_override else Path(scene.image_path)
                 # Generate video first (without lip sync)
                 result = seedance_animator.animate_scene(
-                    image_path=Path(scene.image_path),
+                    image_path=input_image,
                     prompt=prompt,
                     output_path=output_path,
                     duration_seconds=duration,
@@ -7280,9 +9090,11 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
                         if d.audio_path and Path(d.audio_path).exists():
                             audio_path = Path(d.audio_path)
                             break
+                # Use extracted frame for continuity if available, otherwise scene image
+                input_image = first_frame_override if first_frame_override else Path(scene.image_path)
                 # Generate video first (without lip sync)
                 result = seedance_fast_animator.animate_scene(
-                    image_path=Path(scene.image_path),
+                    image_path=input_image,
                     prompt=prompt,
                     output_path=output_path,
                     duration_seconds=duration,
@@ -7334,8 +9146,8 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
         if model in model_counts:
             model_counts[model] += 1
 
-    model_names = {"veo3": "Veo 3.1", "wan26": "WAN 2.6", "seedance15": "Seedance 1.5"}
-    counts = " | ".join(f"{model_names[m]}: {c}" for m, c in model_counts.items() if c > 0)
+    model_names = {"veo3": "Veo 3.1", "wan26": "WAN 2.6", "seedance15": "Seedance 1.5", "seedance_fast": "Seedance Fast"}
+    counts = " | ".join(f"{model_names.get(m, m)}: {c}" for m, c in model_counts.items() if c > 0)
     st.info(f"**Per-scene models:** {counts}")
 
     if st.button("🎬 Generate All Scenes", type="primary", use_container_width=True):
@@ -7357,8 +9169,8 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
             scene_model = getattr(scene, 'generation_model', None) or project_default
             progress_bar.progress((i / total_scenes), text=f"Scene {i + 1}/{total_scenes} ({scene_model})...")
 
-            # Check if scene has an image (required for WAN/Seedance)
-            if scene_model in ["wan26", "seedance15"]:
+            # Check if scene has an image (required for WAN/Seedance I2V)
+            if scene_model in ["wan26", "wan26_i2v", "seedance15", "seedance15_i2v"]:
                 if not scene.image_path or not Path(scene.image_path).exists():
                     st.warning(f"Scene {i + 1} has no image. Skipping...")
                     continue
@@ -7393,7 +9205,7 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
                         use_video_continuity=use_v2v and previous_video is not None and previous_video.exists(),
                     )
 
-                elif scene_model == "wan26":
+                elif scene_model in ("wan26", "wan26_i2v"):
                     # Use WAN 2.6
                     if wan_animator is None:
                         wan_animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
@@ -7419,7 +9231,7 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
                         seed=config.wan_seed if config else 0,
                     )
 
-                elif scene_model == "seedance15":
+                elif scene_model in ("seedance15", "seedance15_i2v"):
                     # Use Seedance 1.5 Pro
                     if seedance_animator is None:
                         seedance_animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)

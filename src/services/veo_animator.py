@@ -133,12 +133,9 @@ class VeoAnimator:
             # Veo expects types.Image, not types.Part
             veo_image = types.Image(image_bytes=img_bytes, mime_type="image/jpeg")
 
-            # Enhance prompt with cinematic camera work and identity preservation
-            # Veo controls camera through prompt text (no shot_type API parameter)
+            # Enhance prompt with identity preservation
+            # Note: Camera work should come from the project's video prompt, not hardcoded here
             enhanced_prompt = f"""{prompt}
-
-CINEMATIC CAMERA WORK:
-Use varied camera angles for cinematic storytelling - start with an establishing wide shot, smoothly transition to medium shots for character interaction, and push in for close-ups during emotional moments. Include subtle dolly movements, natural parallax, and professional cinematography.
 
 CRITICAL - CHARACTER IDENTITY PRESERVATION:
 The input image shows the EXACT person(s) that must appear in the video.

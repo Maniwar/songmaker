@@ -218,14 +218,30 @@ class ImageGenerator:
                 # Use provided image_size or fall back to config default
                 effective_image_size = image_size or self.config.image.image_size
 
+                # gemini-2.5-flash-image doesn't support image_size parameter - omit it
+                # gemini-3-pro-image-preview supports 2K, 4K
+                is_flash_model = "flash" in model_name.lower() or "2.5" in model_name
+                if is_flash_model:
+                    effective_image_size = None  # Let the API use its default
+                    logger.info(f"{model_name} doesn't support image_size parameter, using default")
+
                 # Configure generation with image output
-                generate_content_config = types.GenerateContentConfig(
-                    response_modalities=["TEXT", "IMAGE"],
-                    image_config=types.ImageConfig(
-                        aspect_ratio=aspect_ratio,
-                        image_size=effective_image_size,
-                    ),
-                )
+                # Only include image_size if supported by the model
+                if effective_image_size:
+                    generate_content_config = types.GenerateContentConfig(
+                        response_modalities=["TEXT", "IMAGE"],
+                        image_config=types.ImageConfig(
+                            aspect_ratio=aspect_ratio,
+                            image_size=effective_image_size,
+                        ),
+                    )
+                else:
+                    generate_content_config = types.GenerateContentConfig(
+                        response_modalities=["TEXT", "IMAGE"],
+                        image_config=types.ImageConfig(
+                            aspect_ratio=aspect_ratio,
+                        ),
+                    )
 
                 # Log the image generation prompt
                 logger.info("=" * 60)
@@ -233,7 +249,7 @@ class ImageGenerator:
                 logger.info("-" * 60)
                 for line in full_prompt.split('\n'):
                     logger.info(line)
-                logger.info(f"Refs: {len(all_ref_images)}, Size: {effective_image_size}, Ratio: {aspect_ratio}")
+                logger.info(f"Refs: {len(all_ref_images)}, Size: {effective_image_size or 'default'}, Ratio: {aspect_ratio}")
                 logger.info("=" * 60)
 
                 # Use generate_content (not streaming) for image generation

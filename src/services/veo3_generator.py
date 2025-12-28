@@ -154,9 +154,10 @@ class Veo3Generator:
         """
         parts = []
 
-        # Visual style
-        visual_style = style or script.visual_style or "photorealistic, cinematic lighting"
-        parts.append(f"Style: {visual_style}")
+        # Visual style (use provided style, no hardcoded default)
+        visual_style = style or script.visual_style or ""
+        if visual_style:
+            parts.append(f"Style: {visual_style}")
 
         # Scene setting
         parts.append(f"Setting: {scene.direction.setting}")
@@ -254,23 +255,21 @@ class Veo3Generator:
         client = self._get_client()
 
         # Use custom prompt if provided, otherwise build from scene
+        visual_style = style or script.visual_style or ""
         if custom_prompt and custom_prompt.strip():
             # Use custom prompt but prepend style for consistency
-            visual_style = style or script.visual_style or "photorealistic, cinematic lighting"
-            prompt = f"VISUAL STYLE (CRITICAL - maintain throughout): {visual_style}\n\n{custom_prompt}"
+            if visual_style:
+                prompt = f"VISUAL STYLE (CRITICAL - maintain throughout): {visual_style}\n\n{custom_prompt}"
+            else:
+                prompt = custom_prompt
         else:
             prompt = self.build_scene_prompt(scene, script, style)
 
-        # Add style enforcement at the end for consistency
-        visual_style = style or script.visual_style or "photorealistic, cinematic lighting"
-        if "photorealistic" in visual_style.lower() or "realistic" in visual_style.lower():
+        # Add style enforcement at the end for consistency (only if style is set)
+        if visual_style and ("photorealistic" in visual_style.lower() or "realistic" in visual_style.lower()):
             prompt += f"\n\nIMPORTANT: Maintain {visual_style} style throughout. This must look like real footage, NOT CGI or animation."
-
-        # Add cinematic camera work instructions (Veo controls camera through prompt text)
-        prompt += """
-
-CINEMATIC CAMERA WORK:
-Use varied camera angles for cinematic storytelling - start with an establishing wide shot, smoothly transition to medium shots for character interaction, and push in for close-ups during emotional moments. Include subtle dolly movements, natural parallax, and professional cinematography."""
+        elif visual_style:
+            prompt += f"\n\nIMPORTANT: Maintain {visual_style} style throughout."
 
         # Add strong character identity preservation when first_frame is provided
         if first_frame and first_frame.exists():

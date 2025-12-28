@@ -16,6 +16,7 @@ from src.models.schemas import (
     Emotion,
     MovieScene,
     SceneCameraContext,
+    SceneType,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,91 @@ MULTI_SHOT_ENDING_ANGLES = {
     CameraAngle.POV: CameraAngle.CLOSE_UP,
     CameraAngle.TWO_SHOT: CameraAngle.OVER_SHOULDER,
 }
+
+# Scene type to preferred camera angles mapping
+SCENE_TYPE_CAMERA_PREFERENCES = {
+    SceneType.ESTABLISHING: [CameraAngle.EXTREME_WIDE, CameraAngle.WIDE],
+    SceneType.DIALOGUE: [CameraAngle.MEDIUM, CameraAngle.OVER_SHOULDER, CameraAngle.TWO_SHOT],
+    SceneType.ACTION: [CameraAngle.WIDE, CameraAngle.MEDIUM_WIDE, CameraAngle.POV],
+    SceneType.MONTAGE: [CameraAngle.MEDIUM, CameraAngle.CLOSE_UP, CameraAngle.EXTREME_CLOSE],
+    SceneType.CLIMAX: [CameraAngle.CLOSE_UP, CameraAngle.EXTREME_CLOSE],
+    SceneType.TRANSITION: [CameraAngle.WIDE, CameraAngle.MEDIUM_WIDE],
+    SceneType.REACTION: [CameraAngle.CLOSE_UP, CameraAngle.EXTREME_CLOSE],
+}
+
+
+def detect_location_change(current_setting: str, previous_setting: Optional[str]) -> bool:
+    """Detect if the location/setting has meaningfully changed between scenes.
+
+    Uses heuristics to detect location changes:
+    - Completely different text = change
+    - Same key words (office, home, street) = same location
+    - INT/EXT changes = different location
+
+    Args:
+        current_setting: The current scene's setting description
+        previous_setting: The previous scene's setting description (None if first scene)
+
+    Returns:
+        True if location has changed, False otherwise
+    """
+    if previous_setting is None:
+        return True  # First scene is always a "new" location
+
+    current = current_setting.lower().strip()
+    previous = previous_setting.lower().strip()
+
+    if current == previous:
+        return False
+
+    # Extract location keywords
+    location_words = {
+        'office', 'home', 'house', 'street', 'park', 'car', 'restaurant',
+        'kitchen', 'bedroom', 'living', 'room', 'bathroom', 'hallway',
+        'outside', 'interior', 'exterior', 'int', 'ext', 'beach', 'forest',
+        'city', 'apartment', 'building', 'school', 'hospital', 'store',
+        'bar', 'club', 'church', 'library', 'studio', 'warehouse', 'alley',
+    }
+
+    def extract_location(text: str) -> set:
+        words = set(text.split())
+        return words.intersection(location_words)
+
+    current_loc = extract_location(current)
+    previous_loc = extract_location(previous)
+
+    # If no overlap in location words, it's a change
+    if current_loc and previous_loc and not current_loc.intersection(previous_loc):
+        return True
+
+    # Check for INT/EXT changes (screenplay format)
+    if ('int' in current and 'ext' in previous) or ('ext' in current and 'int' in previous):
+        return True
+
+    # Check for explicit location indicators
+    if 'interior' in current and 'exterior' in previous:
+        return True
+    if 'exterior' in current and 'interior' in previous:
+        return True
+
+    return False
+
+
+def detect_character_introductions(
+    current_visible: list[str],
+    seen_characters: set[str]
+) -> tuple[bool, list[str]]:
+    """Detect if any characters in the current scene haven't appeared before.
+
+    Args:
+        current_visible: Character IDs visible in current scene
+        seen_characters: Set of character IDs that have appeared in previous scenes
+
+    Returns:
+        Tuple of (is_introduction, list_of_new_character_ids)
+    """
+    new_chars = [c for c in current_visible if c not in seen_characters]
+    return (len(new_chars) > 0, new_chars)
 
 
 def get_natural_next_camera(
@@ -143,6 +229,8 @@ def calculate_scene_context(
     total_scenes: int,
     previous_context: Optional[SceneCameraContext] = None,
     is_multi_shot: bool = True,
+    previous_scene: Optional[MovieScene] = None,
+    seen_characters: Optional[set[str]] = None,
 ) -> SceneCameraContext:
     """Calculate camera context for a scene based on its narrative position.
 
@@ -152,10 +240,38 @@ def calculate_scene_context(
         total_scenes: Total number of scenes in the movie
         previous_context: Camera context from the previous scene
         is_multi_shot: Whether video generation uses multi-shot mode
+        previous_scene: The previous MovieScene (for location change detection)
+        seen_characters: Set of character IDs that have appeared in previous scenes
 
     Returns:
         SceneCameraContext with camera angle and context information
     """
+    # Get scene type from direction (default to DIALOGUE)
+    scene_type = getattr(scene.direction, 'scene_type', SceneType.DIALOGUE)
+    if scene_type is None:
+        scene_type = SceneType.DIALOGUE
+
+    # Detect location change
+    is_location_change = False
+    if previous_scene:
+        previous_setting = previous_scene.direction.setting if previous_scene.direction else None
+        current_setting = scene.direction.setting if scene.direction else ""
+        is_location_change = detect_location_change(current_setting, previous_setting)
+    elif scene_index == 0:
+        # First scene is always a "new" location
+        is_location_change = True
+
+    # Detect character introductions
+    is_character_introduction = False
+    new_characters: list[str] = []
+    if seen_characters is not None:
+        visible = scene.direction.visible_characters if scene.direction else []
+        is_character_introduction, new_characters = detect_character_introductions(visible, seen_characters)
+
+    # Check if establishing shot is suggested/overridden
+    suggest_establishing = getattr(scene.direction, 'suggest_establishing', False)
+    establishing_override = getattr(scene.direction, 'establishing_override', None)
+
     # Determine narrative role based on position
     if scene_index == 0:
         narrative_role = "opening"
@@ -213,20 +329,69 @@ def calculate_scene_context(
     # Number of visible characters
     num_characters = len(scene.direction.visible_characters)
 
-    # Determine camera angle
-    camera_angle = get_natural_next_camera(
-        previous_ending_camera=previous_ending_camera,
-        narrative_role=narrative_role,
-        emotional_intensity=emotional_intensity,
-        dialogue_density=dialogue_density,
-        num_characters=num_characters,
-    )
+    # Determine camera angle based on multiple factors
+    camera_angle: CameraAngle
+
+    # Priority 1: User override for establishing shot
+    if establishing_override is True:
+        # User explicitly wants establishing shot
+        camera_angle = CameraAngle.WIDE
+    elif establishing_override is False:
+        # User explicitly doesn't want establishing shot - use normal logic
+        camera_angle = get_natural_next_camera(
+            previous_ending_camera=previous_ending_camera,
+            narrative_role=narrative_role,
+            emotional_intensity=emotional_intensity,
+            dialogue_density=dialogue_density,
+            num_characters=num_characters,
+        )
+    # Priority 2: Scene type is ESTABLISHING
+    elif scene_type == SceneType.ESTABLISHING:
+        preferred = SCENE_TYPE_CAMERA_PREFERENCES.get(scene_type, [CameraAngle.WIDE])
+        camera_angle = preferred[0] if preferred else CameraAngle.WIDE
+    # Priority 3: Location change with suggested establishing shot
+    elif is_location_change and suggest_establishing:
+        camera_angle = CameraAngle.WIDE
+    # Priority 4: Scene type preferences (if not opening/climax/resolution which have special logic)
+    elif scene_type != SceneType.DIALOGUE and narrative_role == "standard":
+        preferred = SCENE_TYPE_CAMERA_PREFERENCES.get(scene_type, [])
+        if preferred:
+            # Pick from preferred angles, considering previous camera
+            if previous_ending_camera and previous_ending_camera in preferred:
+                # Avoid same angle, pick next in preference list
+                idx = preferred.index(previous_ending_camera)
+                camera_angle = preferred[(idx + 1) % len(preferred)]
+            else:
+                camera_angle = preferred[0]
+        else:
+            camera_angle = get_natural_next_camera(
+                previous_ending_camera=previous_ending_camera,
+                narrative_role=narrative_role,
+                emotional_intensity=emotional_intensity,
+                dialogue_density=dialogue_density,
+                num_characters=num_characters,
+            )
+    # Priority 5: Default natural progression
+    else:
+        camera_angle = get_natural_next_camera(
+            previous_ending_camera=previous_ending_camera,
+            narrative_role=narrative_role,
+            emotional_intensity=emotional_intensity,
+            dialogue_density=dialogue_density,
+            num_characters=num_characters,
+        )
 
     # Determine camera movement suggestion
-    if narrative_role == "opening":
+    if scene_type == SceneType.ESTABLISHING or is_location_change:
         movement = "slow establishing dolly or crane down"
-    elif narrative_role == "climax":
+    elif scene_type == SceneType.ACTION:
+        movement = "dynamic tracking or handheld for energy"
+    elif scene_type == SceneType.CLIMAX or narrative_role == "climax":
         movement = "dynamic push-in or handheld for intensity"
+    elif scene_type == SceneType.REACTION:
+        movement = "subtle push-in for emotional emphasis"
+    elif narrative_role == "opening":
+        movement = "slow establishing dolly or crane down"
     elif narrative_role == "resolution":
         movement = "gentle pull-back or static"
     elif emotional_intensity > 0.7:
@@ -240,7 +405,11 @@ def calculate_scene_context(
     transition_from_previous = None
     if previous_context:
         prev_end = get_multi_shot_ending_camera(previous_context.camera_angle) if is_multi_shot else previous_context.camera_angle
-        if prev_end in (CameraAngle.CLOSE_UP, CameraAngle.EXTREME_CLOSE) and camera_angle in (CameraAngle.WIDE, CameraAngle.MEDIUM_WIDE):
+        if is_location_change:
+            transition_from_previous = "cut to new location establishing shot"
+        elif is_character_introduction:
+            transition_from_previous = "cut to introduce new character(s)"
+        elif prev_end in (CameraAngle.CLOSE_UP, CameraAngle.EXTREME_CLOSE) and camera_angle in (CameraAngle.WIDE, CameraAngle.MEDIUM_WIDE):
             transition_from_previous = "pull back to re-establish after intimate moment"
         elif prev_end in (CameraAngle.WIDE, CameraAngle.EXTREME_WIDE) and camera_angle in (CameraAngle.CLOSE_UP, CameraAngle.EXTREME_CLOSE):
             transition_from_previous = "cut to close-up for emotional focus"
@@ -257,6 +426,10 @@ def calculate_scene_context(
         narrative_role=narrative_role,
         emotional_intensity=emotional_intensity,
         dialogue_density=dialogue_density,
+        scene_type=scene_type,
+        is_location_change=is_location_change,
+        is_character_introduction=is_character_introduction,
+        new_characters=new_characters,
     )
 
 
@@ -279,6 +452,8 @@ def generate_cinematography_plan(
 
     plan_scenes = []
     previous_context = None
+    previous_scene = None
+    seen_characters: set[str] = set()
 
     for i, scene in enumerate(scenes):
         context = calculate_scene_context(
@@ -287,9 +462,16 @@ def generate_cinematography_plan(
             total_scenes=len(scenes),
             previous_context=previous_context,
             is_multi_shot=is_multi_shot,
+            previous_scene=previous_scene,
+            seen_characters=seen_characters,
         )
         plan_scenes.append(context)
         previous_context = context
+        previous_scene = scene
+
+        # Update seen characters with this scene's visible characters
+        if scene.direction and scene.direction.visible_characters:
+            seen_characters.update(scene.direction.visible_characters)
 
     # Determine pacing based on average scene duration
     if scenes:

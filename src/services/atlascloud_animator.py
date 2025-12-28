@@ -41,6 +41,14 @@ class WanModel(str, Enum):
     WAN_25_FAST = "alibaba/wan-2.5/image-to-video-fast"
 
 
+class AtlasCloudTimeoutError(Exception):
+    """Raised when AtlasCloud request times out - signals retry is possible."""
+    def __init__(self, prediction_id: str, elapsed: float):
+        self.prediction_id = prediction_id
+        self.elapsed = elapsed
+        super().__init__(f"Timeout after {elapsed:.0f}s waiting for {prediction_id}")
+
+
 class SeedanceModel(str, Enum):
     """Available Seedance models on AtlasCloud."""
     # Seedance 1.5 Pro (higher quality, slower)
@@ -53,29 +61,19 @@ class SeedanceModel(str, Enum):
 
 
 def format_wan_prompt(prompt: str, camera_hint: str = None, multi_shot: bool = True) -> str:
-    """Format a prompt for WAN 2.6's expected shot-breakdown format.
+    """Format a prompt for WAN 2.6.
 
-    WAN 2.6 works best with prompts in this format:
-    Panoramic shot: description
-    Medium shot: description
-    Close-up: description
-
-    For multi-shot mode, provide multiple camera angles for cinematic variety.
+    Cleans up the prompt and adds identity preservation instructions.
+    Camera work should be specified by the user in their video prompt, not hardcoded.
 
     Args:
         prompt: The original prompt text
         camera_hint: Optional camera/shot type hint from scene direction
-        multi_shot: If True, format for multi-shot mode with varied angles
+        multi_shot: If True, WAN will use multi-shot mode (varied angles)
 
     Returns:
         Formatted prompt for WAN 2.6
     """
-    # If prompt already has shot breakdown format, return as-is
-    shot_keywords = ["shot:", "close-up:", "closeup:", "wide:", "medium:", "panoramic:", "tracking:"]
-    prompt_lower = prompt.lower()
-    if any(kw in prompt_lower for kw in shot_keywords):
-        return prompt
-
     # Clean up the prompt - remove any "CRITICAL" instructions meant for other models
     lines = prompt.split('\n')
     clean_lines = []
@@ -97,50 +95,21 @@ def format_wan_prompt(prompt: str, camera_hint: str = None, multi_shot: bool = T
     # Identity preservation instruction
     identity_instruction = "Maintain the EXACT same person from the input image - same face, same features, same hair, same skin tone."
 
-    if multi_shot:
-        # Multi-shot format: provide multiple camera angles for cinematic variety
-        # WAN 2.6's AI will choose and blend between these angles
-        shot_breakdown = f"""Wide establishing shot: {clean_prompt}
-Medium shot: Character interaction and dialogue, natural body language
-Close-up: Emotional expressions and reactions, subtle facial movements
-{identity_instruction}"""
-        return shot_breakdown
-    else:
-        # Single shot mode - use camera hint or default
-        shot_type = "Medium shot"
-        if camera_hint:
-            hint_lower = camera_hint.lower()
-            if "close" in hint_lower or "closeup" in hint_lower:
-                shot_type = "Close-up"
-            elif "wide" in hint_lower or "panoramic" in hint_lower or "establishing" in hint_lower:
-                shot_type = "Wide shot"
-            elif "tracking" in hint_lower or "dolly" in hint_lower:
-                shot_type = "Tracking shot"
-            elif "over the shoulder" in hint_lower or "ots" in hint_lower:
-                shot_type = "Over-the-shoulder shot"
-            elif "pov" in hint_lower or "point of view" in hint_lower:
-                shot_type = "POV shot"
-
-        return f"{shot_type}: {clean_prompt}. {identity_instruction}"
+    # Return prompt with identity preservation - no hardcoded camera work
+    return f"{clean_prompt}\n{identity_instruction}"
 
 
 def format_seedance_prompt(prompt: str, camera_hint: str = None, visual_style: str = None, multi_shot: bool = True) -> str:
-    """Format a prompt for Seedance 1.5 Pro's cinematic style.
+    """Format a prompt for Seedance 1.5 Pro.
 
-    Seedance works best with prompts that include:
-    - Scene/shot description
-    - Subtle motion descriptions
-    - Camera behavior
-    - Style guidance
-    - Negative guidance embedded in prompt
-
-    For multi-shot mode, provide varied camera angles for cinematic variety.
+    Cleans up the prompt and adds identity preservation instructions.
+    Camera work and style should be specified by the user in their video prompt, not hardcoded.
 
     Args:
         prompt: The original prompt text
-        camera_hint: Optional camera/shot type hint from scene direction
-        visual_style: Visual style for style guidance
-        multi_shot: If True, format for multi-shot mode with varied angles
+        camera_hint: Optional camera/shot type hint (unused - camera should be in prompt)
+        visual_style: Visual style (passed for reference, not hardcoded into prompt)
+        multi_shot: If True, Seedance will use multi-shot mode
 
     Returns:
         Formatted prompt for Seedance 1.5 Pro
@@ -162,51 +131,12 @@ def format_seedance_prompt(prompt: str, camera_hint: str = None, visual_style: s
 
     clean_prompt = " ".join(clean_lines)
 
-    # Build style guidance
-    style_guidance = ""
-    if visual_style:
-        style_lower = visual_style.lower()
-        if "photorealistic" in style_lower or "realistic" in style_lower:
-            style_guidance = "Look/style: photorealistic, natural lighting, cinematic film grain, lifelike textures."
-        elif "anime" in style_lower:
-            style_guidance = "Look/style: high-quality anime illustration, clean linework, vibrant colors."
-        elif "3d" in style_lower or "pixar" in style_lower:
-            style_guidance = "Look/style: 3D rendered animation, smooth surfaces, dynamic lighting."
-
-    # Identity and quality guidance (embedded as negative guidance)
+    # Identity and quality guidance - no hardcoded camera work or style
     quality_guidance = "Avoid identity drift, warping, morphing faces, extra limbs, text artifacts, or sudden camera jumps."
     identity_instruction = "Maintain the EXACT same person from the input image - same face, same features, same hair, same skin tone."
 
-    if multi_shot:
-        # Multi-shot format: provide cinematic variety with multiple camera descriptions
-        camera_description = """Camera work: Start with an establishing wide shot, smoothly transition to medium shot for character interaction, then push in to close-up for emotional moments. Use natural parallax and subtle dolly movements."""
-
-        parts = [clean_prompt, camera_description]
-        if style_guidance:
-            parts.append(style_guidance)
-        parts.append(identity_instruction)
-        parts.append(quality_guidance)
-        return " ".join(parts)
-    else:
-        # Single shot mode - use camera hint
-        camera_behavior = "Camera: subtle movement with natural parallax."
-        if camera_hint:
-            hint_lower = camera_hint.lower()
-            if "close" in hint_lower:
-                camera_behavior = "Camera: slow, subtle push-in on the subject, shallow depth of field."
-            elif "wide" in hint_lower or "establishing" in hint_lower:
-                camera_behavior = "Camera: slow pan across the scene with gentle parallax on foreground elements."
-            elif "tracking" in hint_lower or "dolly" in hint_lower:
-                camera_behavior = "Camera: smooth dolly movement following the action."
-            elif "static" in hint_lower or "fixed" in hint_lower:
-                camera_behavior = "Camera: locked off, minimal movement, stable framing."
-
-        parts = [clean_prompt, camera_behavior]
-        if style_guidance:
-            parts.append(style_guidance)
-        parts.append(identity_instruction)
-        parts.append(quality_guidance)
-        return " ".join(parts)
+    # Return prompt with identity preservation - no hardcoded camera work or style
+    return f"{clean_prompt} {identity_instruction} {quality_guidance}"
 
 
 class AtlasCloudAnimator:
@@ -311,7 +241,7 @@ class AtlasCloudAnimator:
         shot_type: Optional[str] = None,
         progress_callback: Optional[Callable[[str, float], None]] = None,
         poll_interval: float = 5.0,
-        max_wait_time: float = 300.0,
+        max_wait_time: float = 600.0,
     ) -> Optional[Path]:
         """
         Animate a scene with WAN 2.6 or Seedance 1.5 Pro.
@@ -331,7 +261,7 @@ class AtlasCloudAnimator:
             audio_path: Optional audio file for lip sync (Seedance 1.5 Pro)
             progress_callback: Optional callback for progress updates
             poll_interval: Seconds between status checks (default 5)
-            max_wait_time: Maximum seconds to wait for completion (default 300)
+            max_wait_time: Maximum seconds to wait for completion (default 600 = 10 min)
 
         Returns:
             Path to the generated video, or None if generation failed
@@ -347,6 +277,9 @@ class AtlasCloudAnimator:
         is_seedance = "seedance" in str(active_model).lower()
         is_video_to_video = source_video_urls is not None or source_video is not None or "video-to-video" in str(active_model)
 
+        # Debug: Log model selection
+        logger.info(f"[MODEL DEBUG] self._model={self._model}, model_param={model}, active_model={active_model}, is_seedance={is_seedance}")
+
         # Validate duration
         # WAN 2.6 I2V/T2V supports 5, 10, 15 seconds; V2V supports 5, 10 seconds
         # Seedance supports 3-12 seconds
@@ -360,7 +293,8 @@ class AtlasCloudAnimator:
         duration = int(duration_seconds)
         if duration not in valid_durations:
             if is_seedance:
-                duration = max(3, min(15, duration))
+                # Seedance 1.5 Pro supports 3-12 seconds
+                duration = max(3, min(12, duration))
             else:
                 # Round to nearest valid WAN 2.6 duration
                 if duration < 7:
@@ -390,21 +324,12 @@ class AtlasCloudAnimator:
             progress_callback("Encoding media...", 0.1)
 
         try:
-            # Determine which model to actually use based on inputs
+            # Use the model that was passed to the animator, only override for V2V mode
             if is_video_to_video and source_video:
                 actual_model = WanModel.VIDEO_TO_VIDEO
-            elif is_seedance:
-                actual_model = (
-                    SeedanceModel.IMAGE_TO_VIDEO
-                    if image_path
-                    else SeedanceModel.TEXT_TO_VIDEO
-                )
             else:
-                actual_model = (
-                    WanModel.IMAGE_TO_VIDEO
-                    if image_path
-                    else WanModel.TEXT_TO_VIDEO
-                )
+                # Respect the model passed in (active_model already set from self._model or model param)
+                actual_model = active_model
 
             if progress_callback:
                 progress_callback("Submitting to AtlasCloud...", 0.2)
@@ -499,11 +424,11 @@ class AtlasCloudAnimator:
                     payload["generate_audio"] = True  # Generate audio with video
                     # Use actual_shot_type determined earlier (defaults to "multi" for cinematic feel)
                     payload["shot_type"] = actual_shot_type
-                    # Seedance uses -1 for random seed (per API docs)
+                    # AtlasCloud API: -1 means random seed, >=0 means specific seed
                     if seed >= 0:
                         payload["seed"] = seed
                     else:
-                        payload["seed"] = -1
+                        payload["seed"] = -1  # Explicitly send -1 for random (per API docs)
                 else:
                     # WAN 2.6 specific parameters
                     # shot_type only works when enable_prompt_expansion=true
@@ -602,9 +527,9 @@ class AtlasCloudAnimator:
             while True:
                 elapsed = time.time() - start_time
                 if elapsed > max_wait_time:
-                    logger.error(f"Timeout waiting for AtlasCloud result: {prediction_id}")
+                    logger.error(f"Timeout waiting for AtlasCloud result after {elapsed:.0f}s: {prediction_id}")
                     if progress_callback:
-                        progress_callback("Error: Request timed out", 0.0)
+                        progress_callback("Error: Request timed out - try again", 0.0)
                     return None
 
                 # Check status with retry on timeout
@@ -1018,8 +943,8 @@ class AtlasCloudAnimator:
                 capture_output=True, text=True
             )
             duration = float(result.stdout.strip())
-            # Clamp to Seedance limits (3-15 seconds)
-            duration = max(3, min(15, int(duration)))
+            # Clamp to Seedance limits (3-12 seconds)
+            duration = max(3, min(12, int(duration)))
         except Exception:
             duration = 8  # Default if we can't determine
 
