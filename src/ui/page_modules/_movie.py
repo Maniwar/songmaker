@@ -180,6 +180,63 @@ def get_project_dir(create_if_missing: bool = True) -> Path:
     return project_dir
 
 
+def get_scene_video_dir(scene_index: int, create: bool = True) -> Path:
+    """Get the video output directory for a specific scene.
+
+    Args:
+        scene_index: The 1-based scene index
+        create: If True, create the directory if it doesn't exist
+
+    Returns:
+        Path to the scene's video directory: project/scenes/scene_XXX/videos/
+    """
+    video_dir = get_project_dir() / "scenes" / f"scene_{scene_index:03d}" / "videos"
+    if create:
+        video_dir.mkdir(parents=True, exist_ok=True)
+    return video_dir
+
+
+def get_legacy_video_dir(create: bool = True) -> Path:
+    """Get the legacy shared video directory (for backward compatibility).
+
+    Returns:
+        Path to the project's shared videos folder: project/videos/
+    """
+    video_dir = get_project_dir() / "videos"
+    if create:
+        video_dir.mkdir(parents=True, exist_ok=True)
+    return video_dir
+
+
+def get_scene_video_variants(scene_index: int) -> list[Path]:
+    """Get all video variants for a scene from both per-scene and legacy directories.
+
+    Checks both:
+    - Per-scene folder: scenes/scene_XXX/videos/*.mp4
+    - Legacy shared folder: videos/scene_XXX_*.mp4
+
+    Args:
+        scene_index: The 1-based scene index
+
+    Returns:
+        List of video file paths, sorted by modification time (newest first)
+    """
+    videos = []
+
+    # Check per-scene folder first (new location)
+    scene_video_dir = get_project_dir(create_if_missing=False) / "scenes" / f"scene_{scene_index:03d}" / "videos"
+    if scene_video_dir.exists():
+        videos.extend(scene_video_dir.glob("*.mp4"))
+
+    # Also check legacy shared folder (backward compatibility)
+    legacy_dir = get_project_dir(create_if_missing=False) / "videos"
+    if legacy_dir.exists():
+        videos.extend(legacy_dir.glob(f"scene_{scene_index:03d}*.mp4"))
+
+    # Sort by modification time, newest first
+    return sorted(videos, key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+
+
 def extract_last_frame_from_video(video_path: Path, output_dir: Path = None, force: bool = False) -> Optional[Path]:
     """Extract the last frame from a video file for continuity.
 
@@ -2204,12 +2261,12 @@ def _generate_single_video_inline(state, scene, generation_method: str, config, 
 
     logger.info(f"[SINGLE VIDEO] scene_model={scene_model}, generation_method={generation_method}")
 
-    output_dir = get_project_dir() / "videos"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Save videos to per-scene folder: scenes/scene_XXX/videos/
+    output_dir = get_scene_video_dir(scene.index)
 
     # Use timestamp suffix to create variants instead of overwriting
     timestamp = get_readable_timestamp()
-    output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
+    output_path = output_dir / f"video_{timestamp}.mp4"
 
     # Get base model for duration calculation
     # For seedance_fast, base is seedance15 for duration lookup
@@ -2286,15 +2343,27 @@ def _generate_single_video_inline(state, scene, generation_method: str, config, 
                 if scene_model in ("seedance15", "seedance15_i2v"):
                     logger.info(f"[SINGLE] Creating Seedance Pro animator for {scene_model}")
                     animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
-                    result = animator.animate_scene(image_path=Path(scene.image_path), prompt=prompt,
+                    # Get custom start/target images
+                    custom_start = getattr(scene, 'custom_start_image', None)
+                    custom_target = getattr(scene, 'custom_target_image', None)
+                    start_img = Path(custom_start) if custom_start and Path(custom_start).exists() else Path(scene.image_path)
+                    target_img = Path(custom_target) if custom_target and Path(custom_target).exists() else Path(scene.image_path)
+                    logger.info(f"[SINGLE] Seedance Pro: start={start_img.name}, target={target_img.name}")
+                    result = animator.animate_scene(image_path=start_img, prompt=prompt,
                                                     output_path=output_path, duration_seconds=duration, resolution=resolution,
-                                                    visual_style=visual_style)
+                                                    visual_style=visual_style, last_frame=target_img)
                 elif scene_model in ("seedance_fast", "seedance_fast_i2v"):
                     logger.info(f"[SINGLE] Creating Seedance FAST animator for {scene_model} -> {SeedanceModel.IMAGE_TO_VIDEO_FAST.value}")
                     animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO_FAST)
-                    result = animator.animate_scene(image_path=Path(scene.image_path), prompt=prompt,
+                    # Get custom start/target images
+                    custom_start = getattr(scene, 'custom_start_image', None)
+                    custom_target = getattr(scene, 'custom_target_image', None)
+                    start_img = Path(custom_start) if custom_start and Path(custom_start).exists() else Path(scene.image_path)
+                    target_img = Path(custom_target) if custom_target and Path(custom_target).exists() else Path(scene.image_path)
+                    logger.info(f"[SINGLE] Seedance Fast: start={start_img.name}, target={target_img.name}")
+                    result = animator.animate_scene(image_path=start_img, prompt=prompt,
                                                     output_path=output_path, duration_seconds=duration, resolution=resolution,
-                                                    visual_style=visual_style)
+                                                    visual_style=visual_style, last_frame=target_img)
                 elif scene_model == "seedance15_t2v":
                     animator = AtlasCloudAnimator(model=SeedanceModel.TEXT_TO_VIDEO)
                     # T2V: Pass None for image_path, animator will detect and use text-to-video
@@ -2386,8 +2455,7 @@ def _generate_all_videos_inline(state, scenes, generation_method: str, config) -
 
     logger.info(f"[BATCH VIDEO] generation_method={generation_method}")
 
-    output_dir = get_project_dir() / "videos"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Note: output_dir is now set per-scene using get_scene_video_dir()
 
     # Get video consistency option
     use_prev_video = st.session_state.get("use_prev_scene_video", False)
@@ -2416,9 +2484,10 @@ def _generate_all_videos_inline(state, scenes, generation_method: str, config) -
         )
         prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
 
-        # Use timestamp suffix to create variants instead of overwriting
+        # Save videos to per-scene folder: scenes/scene_XXX/videos/
+        output_dir = get_scene_video_dir(scene.index)
         timestamp = get_readable_timestamp()
-        output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
+        output_path = output_dir / f"video_{timestamp}.mp4"
 
         # Check requirements
         is_t2v = "_t2v" in scene_model
@@ -2478,11 +2547,25 @@ def _generate_all_videos_inline(state, scenes, generation_method: str, config) -
                 animator = animators[scene_model]
                 image_path = Path(scene.image_path) if has_image and not is_t2v else None
                 visual_style = config.visual_style if config else state.script.visual_style
+
+                # Get custom start/target images for Seedance
+                is_seedance = "seedance" in scene_model.lower()
+                custom_start = getattr(scene, 'custom_start_image', None)
+                custom_target = getattr(scene, 'custom_target_image', None)
+                if is_seedance and has_image:
+                    start_img = Path(custom_start) if custom_start and Path(custom_start).exists() else image_path
+                    target_img = Path(custom_target) if custom_target and Path(custom_target).exists() else image_path
+                    logger.info(f"[BATCH] Scene {scene.index}: Seedance start={start_img.name if start_img else 'None'}, target={target_img.name if target_img else 'None'}")
+                else:
+                    start_img = image_path
+                    target_img = None
+
                 # Pass WAN config params (ignored by non-WAN models)
                 result = animator.animate_scene(
-                    image_path=image_path, prompt=prompt,
+                    image_path=start_img, prompt=prompt,
                     output_path=output_path, duration_seconds=duration, resolution=resolution,
                     visual_style=visual_style,
+                    last_frame=target_img if is_seedance else None,
                     guidance_scale=config.wan_guidance_scale if config else None,
                     flow_shift=config.wan_flow_shift if config else None,
                     inference_steps=config.wan_inference_steps if config else None,
@@ -3357,7 +3440,27 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                         type_icon = type_icons.get(scene_type, "💬")
                         is_new_loc = getattr(scene.direction, 'is_new_location', False)
                         loc_indicator = " 📍" if is_new_loc else ""
-                        st.caption(f"{type_icon} {scene_type.value.title()}{loc_indicator}")
+                        # Add continuity indicator
+                        use_prev = sd.get("use_prev_frame", False)
+                        cont_indicator = " 🔗" if use_prev else ""
+                        st.caption(f"{type_icon} {scene_type.value.title()}{loc_indicator}{cont_indicator}")
+
+                        # Continuity toggle for scenes after the first (compact version for grid)
+                        if scene.index > 1:
+                            use_prev_frame = getattr(scene, 'use_previous_last_frame', False)
+                            prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
+                            has_prev_video = prev_scene and prev_scene.video_path and Path(prev_scene.video_path).exists()
+                            if has_prev_video:
+                                new_use_prev = st.checkbox(
+                                    "🔗 Link",
+                                    value=use_prev_frame,
+                                    key=f"grid_cont_{scene.index}",
+                                    help="Use last frame from previous scene for smooth transition"
+                                )
+                                if new_use_prev != use_prev_frame:
+                                    scene.use_previous_last_frame = new_use_prev
+                                    save_movie_state()
+                                    st.rerun()
 
                         # Scene metadata
                         st.caption(f"📍 {scene.direction.setting[:50]}..." if len(scene.direction.setting) > 50 else f"📍 {scene.direction.setting}")
@@ -3651,15 +3754,53 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                             has_scene_image = scene.image_path and Path(scene.image_path).exists()
                             has_scene_video = scene.video_path and Path(scene.video_path).exists()
 
-                            st.markdown("**Input Image (for I2V):**")
-                            if has_scene_image:
-                                vid_img_col1, vid_img_col2 = st.columns([1, 3])
-                                with vid_img_col1:
-                                    st.image(scene.image_path, width=100)
-                                with vid_img_col2:
-                                    st.success("✅ Scene image ready for I2V")
+                            # Get effective model to determine if we need dual-image display
+                            scene_gen_model_disp = getattr(scene, 'generation_model', None) or project_method
+                            is_seedance_disp = "seedance" in str(scene_gen_model_disp).lower()
+                            custom_start = getattr(scene, 'custom_start_image', None)
+                            custom_target = getattr(scene, 'custom_target_image', None)
+                            has_custom_start = custom_start and Path(custom_start).exists()
+                            has_custom_target = custom_target and Path(custom_target).exists()
+
+                            if is_seedance_disp:
+                                st.markdown("**Input Images (Seedance I2V - Start + Target):**")
+                                img_col1, img_col2 = st.columns(2)
+                                with img_col1:
+                                    st.caption("🎬 Start Frame")
+                                    if has_custom_start:
+                                        st.image(custom_start, width=100)
+                                        st.caption(f"✅ Custom: {Path(custom_start).stem[-15:]}")
+                                    elif has_scene_image:
+                                        st.image(scene.image_path, width=100)
+                                        st.caption("✅ Scene image")
+                                    else:
+                                        st.warning("❌ Missing")
+                                with img_col2:
+                                    st.caption("🎯 Target Frame")
+                                    if has_custom_target:
+                                        st.image(custom_target, width=100)
+                                        st.caption(f"✅ Custom: {Path(custom_target).stem[-15:]}")
+                                    elif has_scene_image:
+                                        st.image(scene.image_path, width=100)
+                                        st.caption("✅ Scene image")
+                                    else:
+                                        st.warning("❌ Missing")
                             else:
-                                st.warning("❌ No scene image - generate image first for I2V models")
+                                st.markdown("**Input Image (for I2V):**")
+                                if has_custom_start:
+                                    vid_img_col1, vid_img_col2 = st.columns([1, 3])
+                                    with vid_img_col1:
+                                        st.image(custom_start, width=100)
+                                    with vid_img_col2:
+                                        st.success(f"✅ Custom: {Path(custom_start).stem[-15:]}")
+                                elif has_scene_image:
+                                    vid_img_col1, vid_img_col2 = st.columns([1, 3])
+                                    with vid_img_col1:
+                                        st.image(scene.image_path, width=100)
+                                    with vid_img_col2:
+                                        st.success("✅ Scene image ready for I2V")
+                                else:
+                                    st.warning("❌ No scene image - generate image first for I2V models")
 
                             st.markdown("**Video Prompt:**")
                             # Get video prompt from scene - use session state override if just regenerated
@@ -3815,8 +3956,237 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                 _, eff_gen_model, _ = model_opts[new_model_key]
                                 eff_model = eff_gen_model or project_method
                                 is_i2v = "i2v" in str(eff_model).lower() or eff_model in ["wan26", "seedance15", "seedance_fast"]
+                                is_seedance = "seedance" in str(eff_model).lower()
                                 if is_i2v and not has_scene_image:
                                     st.warning("⚠️ I2V requires scene image - generate image first!")
+
+                                # === START/TARGET FRAME PREVIEW AND SELECTION (for I2V models) ===
+                                if is_i2v:
+                                    st.markdown("**📸 Video Input Frames:**")
+                                    use_prev_frame = getattr(scene, 'use_previous_last_frame', False)
+
+                                    # Get previous scene for last frame extraction
+                                    prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
+                                    has_prev_video = prev_scene and prev_scene.video_path and Path(prev_scene.video_path).exists()
+
+                                    # Extract last frame from previous video if available
+                                    extracted_frame_path = None
+                                    if has_prev_video:
+                                        cache_dir = get_project_dir() / "scenes" / f"scene_{scene.index:03d}" / "continuity"
+                                        extracted_frame_path = extract_last_frame_from_video(Path(prev_scene.video_path), cache_dir)
+
+                                    # Collect ALL images from ALL scenes (for frame selection)
+                                    # This allows picking any image from any scene as start/target
+                                    all_project_images = {}  # path -> (scene_idx, variant_name)
+                                    scenes_dir = get_project_dir() / "scenes"
+                                    print(f"\n[DEBUG] Collecting images from all {len(script.scenes)} scenes. scenes_dir={scenes_dir}")
+
+                                    for s in script.scenes:
+                                        s_idx = s.index
+                                        # From scene's image_path (keep first scene that owns this image)
+                                        if s.image_path and Path(s.image_path).exists():
+                                            p = str(Path(s.image_path).resolve())
+                                            if p not in all_project_images:
+                                                all_project_images[p] = (s_idx, "main")
+                                                print(f"[DEBUG] Scene {s_idx}: Added image_path: {p}")
+                                            else:
+                                                print(f"[DEBUG] Scene {s_idx}: SKIPPED (already S{all_project_images[p][0]}): {Path(p).name}")
+                                        # From scene's variants list
+                                        for var_path in getattr(s, 'image_variants', []) or []:
+                                            if Path(var_path).exists():
+                                                p = str(Path(var_path).resolve())
+                                                if p not in all_project_images:
+                                                    all_project_images[p] = (s_idx, Path(var_path).stem[-8:])
+                                                    print(f"[DEBUG] Scene {s_idx}: Added variant: {p}")
+                                        # From scene's images directory
+                                        s_img_dir = scenes_dir / f"scene_{s_idx:03d}" / "images"
+                                        if s_img_dir.exists():
+                                            for img in list(s_img_dir.glob("*.png")) + list(s_img_dir.glob("*.jpg")):
+                                                p = str(img.resolve())
+                                                if p not in all_project_images:
+                                                    all_project_images[p] = (s_idx, img.stem[-8:])
+                                                    print(f"[DEBUG] Scene {s_idx}: Added from dir: {p}")
+
+                                    # Also collect extracted frames from continuity directories
+                                    for s in script.scenes:
+                                        cont_dir = scenes_dir / f"scene_{s.index:03d}" / "continuity"
+                                        if cont_dir.exists():
+                                            for img in list(cont_dir.glob("*.png")) + list(cont_dir.glob("*.jpg")):
+                                                p = str(img.resolve())
+                                                if p not in all_project_images:
+                                                    all_project_images[p] = (s.index, f"frame_{img.stem[-6:]}")
+
+                                    # Sort by scene index, then by name
+                                    sorted_images = sorted(all_project_images.keys(), key=lambda x: (all_project_images[x][0], x))
+
+                                    # Create labels showing scene number
+                                    def get_img_label(path):
+                                        s_idx, name = all_project_images.get(path, (0, Path(path).stem[-12:]))
+                                        return f"S{s_idx}: {name}"
+
+                                    # Debug: show how many images found
+                                    if sorted_images:
+                                        unique_scenes = len(set(v[0] for v in all_project_images.values()))
+                                        st.caption(f"📷 {len(sorted_images)} images available from {unique_scenes} scene{'s' if unique_scenes != 1 else ''}")
+                                        # Detailed debug output
+                                        print(f"\n[DEBUG] === IMAGE COLLECTION SUMMARY ===")
+                                        print(f"[DEBUG] Total images found: {len(sorted_images)}")
+                                        print(f"[DEBUG] From scenes: {sorted(set(v[0] for v in all_project_images.values()))}")
+                                        for img_path, (s_idx, label) in sorted(all_project_images.items(), key=lambda x: x[1][0]):
+                                            print(f"[DEBUG]   S{s_idx}: {label} -> {Path(img_path).name}")
+                                        print(f"[DEBUG] ================================\n")
+                                    else:
+                                        st.warning("⚠️ No images found in project - generate scene images first")
+                                        print(f"\n[DEBUG] ⚠️ NO IMAGES FOUND!")
+                                        print(f"[DEBUG] scenes_dir exists: {scenes_dir.exists()}")
+                                        print(f"[DEBUG] script.scenes count: {len(script.scenes)}")
+
+                                    # === INPUT BADGES (what will be passed to video gen) ===
+                                    # Get custom image paths
+                                    custom_start_path = getattr(scene, 'custom_start_image', None)
+                                    custom_target_path = getattr(scene, 'custom_target_image', None)
+                                    has_custom_start = custom_start_path and Path(custom_start_path).exists()
+                                    has_custom_target = custom_target_path and Path(custom_target_path).exists()
+
+                                    badge_col1, badge_col2, badge_col3 = st.columns(3)
+                                    with badge_col1:
+                                        if has_custom_start:
+                                            start_label = get_img_label(str(Path(custom_start_path).resolve())) if custom_start_path in all_project_images or str(Path(custom_start_path).resolve()) in all_project_images else Path(custom_start_path).stem[-10:]
+                                            st.success(f"🎬 Start: {start_label}")
+                                        elif use_prev_frame and extracted_frame_path:
+                                            st.success("🎬 Start: Prev frame")
+                                        elif has_scene_image:
+                                            st.info("🎬 Start: Scene img")
+                                        else:
+                                            st.error("🎬 Start: Missing!")
+                                    with badge_col2:
+                                        if is_seedance:
+                                            if has_custom_target:
+                                                target_label = get_img_label(str(Path(custom_target_path).resolve())) if str(Path(custom_target_path).resolve()) in all_project_images else Path(custom_target_path).stem[-10:]
+                                                st.success(f"🎯 Target: {target_label}")
+                                            elif has_scene_image:
+                                                st.success("🎯 Target: Scene img")
+                                            else:
+                                                st.error("🎯 Target: Missing!")
+                                        else:
+                                            st.caption("🎯 N/A (WAN)")
+                                    with badge_col3:
+                                        st.caption(f"Model: {eff_model}")
+
+                                    frame_col1, frame_col2 = st.columns(2)
+
+                                    with frame_col1:
+                                        st.markdown("**🎬 Start Frame**")
+
+                                        # Source type selector
+                                        start_type_opts = []
+                                        if has_prev_video and extracted_frame_path:
+                                            start_type_opts.append(("prev_frame", f"🔗 Prev scene last frame"))
+                                        start_type_opts.append(("pick_image", "🖼️ Pick from images"))
+
+                                        # Get current start image path for custom selection
+                                        custom_start_path = getattr(scene, 'custom_start_image', None)
+
+                                        if len(start_type_opts) > 1:
+                                            current_type = "prev_frame" if use_prev_frame else "pick_image"
+                                            type_labels = {k: v for k, v in start_type_opts}
+                                            type_keys = [k for k, _ in start_type_opts]
+                                            type_idx = type_keys.index(current_type) if current_type in type_keys else 0
+                                            new_type = st.selectbox(
+                                                "Source type",
+                                                options=type_keys,
+                                                index=type_idx,
+                                                format_func=lambda x: type_labels.get(x, x),
+                                                key=f"start_type_{scene.index}",
+                                                label_visibility="collapsed"
+                                            )
+                                            if (new_type == "prev_frame") != use_prev_frame:
+                                                scene.use_previous_last_frame = (new_type == "prev_frame")
+                                                save_movie_state()
+                                                st.rerun()
+
+                                        # If picking from images, show image selector
+                                        if not use_prev_frame and sorted_images:
+                                            # Default to current scene's image
+                                            default_img = custom_start_path or (str(Path(scene.image_path).resolve()) if has_scene_image else "")
+                                            img_idx = sorted_images.index(default_img) if default_img in sorted_images else 0
+                                            new_start_img = st.selectbox(
+                                                "Select start image",
+                                                options=sorted_images,
+                                                index=img_idx,
+                                                format_func=get_img_label,
+                                                key=f"start_img_{scene.index}",
+                                                label_visibility="collapsed"
+                                            )
+                                            if new_start_img != custom_start_path:
+                                                try:
+                                                    scene.custom_start_image = new_start_img
+                                                except Exception:
+                                                    object.__setattr__(scene, 'custom_start_image', new_start_img)
+                                                save_movie_state()
+                                                # Update for immediate preview
+                                                custom_start_path = new_start_img
+
+                                        # Show preview (use newly selected value if available)
+                                        if use_prev_frame and extracted_frame_path:
+                                            st.image(str(extracted_frame_path), width="stretch")
+                                        elif not use_prev_frame and sorted_images and new_start_img and Path(new_start_img).exists():
+                                            st.image(new_start_img, width="stretch")
+                                        elif custom_start_path and Path(custom_start_path).exists():
+                                            st.image(custom_start_path, width="stretch")
+                                        elif has_scene_image:
+                                            st.image(str(scene.image_path), width="stretch")
+                                        else:
+                                            st.warning("No start frame")
+
+                                    with frame_col2:
+                                        if is_seedance:
+                                            st.markdown("**🎯 Target Frame**")
+
+                                            # Get custom target image (separate from scene.image_path)
+                                            custom_target_path = getattr(scene, 'custom_target_image', None)
+                                            # Default to scene's own image if no custom target set
+                                            effective_target = custom_target_path if (custom_target_path and Path(custom_target_path).exists()) else (scene.image_path if has_scene_image else None)
+
+                                            # Show image picker for target frame (all project images)
+                                            if sorted_images:
+                                                current_img = str(Path(effective_target).resolve()) if effective_target else ""
+                                                img_idx = sorted_images.index(current_img) if current_img in sorted_images else 0
+                                                new_target = st.selectbox(
+                                                    "Select target",
+                                                    options=sorted_images,
+                                                    index=img_idx,
+                                                    format_func=get_img_label,
+                                                    key=f"target_img_{scene.index}",
+                                                    label_visibility="collapsed"
+                                                )
+                                                if new_target != custom_target_path:
+                                                    try:
+                                                        scene.custom_target_image = new_target
+                                                    except Exception:
+                                                        object.__setattr__(scene, 'custom_target_image', new_target)
+                                                    save_movie_state()
+                                                    # Update effective_target to show correct preview immediately
+                                                    effective_target = new_target
+
+                                            # Show preview (use new_target if set, otherwise effective_target)
+                                            preview_target = new_target if (sorted_images and new_target) else effective_target
+                                            if preview_target and Path(preview_target).exists():
+                                                st.image(str(preview_target), width="stretch")
+                                            else:
+                                                st.warning("No target frame")
+
+                                            # Generate new target button
+                                            if st.button("🎨 Generate New", key=f"gen_target_{scene.index}", width="stretch"):
+                                                _generate_single_scene_image(scene, script, state)
+                                                st.rerun()
+                                        else:
+                                            st.markdown("**ℹ️ WAN: Single Input**")
+                                            st.caption("WAN uses start frame only")
+                                            if has_scene_image:
+                                                st.image(str(scene.image_path), width="stretch", caption="Fallback")
+
+                                    st.markdown("---")
 
                                 v_col1, v_col2 = st.columns(2)
                                 with v_col1:
@@ -4633,6 +5003,59 @@ REQUIREMENTS:
 
                     scenes_updated += 1
 
+            # === AUTO-SET CONTINUITY (use_previous_last_frame) BASED ON SCENE ANALYSIS ===
+            # For scenes after the first, enable continuity if:
+            # 1. Same characters appear in consecutive scenes (no character change)
+            # 2. Location hasn't changed significantly (not a new establishing shot)
+            st.write("🔗 Setting up scene continuity...")
+            continuity_set = 0
+            sorted_scenes = sorted(script.scenes, key=lambda s: s.index)
+            for i, scene in enumerate(sorted_scenes):
+                if i == 0:
+                    # First scene doesn't use previous frame
+                    scene.use_previous_last_frame = False
+                    continue
+
+                prev_scene = sorted_scenes[i - 1]
+
+                # Get visible characters for both scenes
+                curr_chars = set(scene.direction.visible_characters) if scene.direction.visible_characters else set()
+                prev_chars = set(prev_scene.direction.visible_characters) if prev_scene.direction.visible_characters else set()
+
+                # Check if it's a new location/establishing shot
+                is_new_location = getattr(scene.direction, 'is_new_location', False)
+                is_establishing = getattr(scene.direction, 'scene_type', None) == SceneType.ESTABLISHING
+
+                # Enable continuity if:
+                # - Characters are the same (or at least overlapping significantly)
+                # - Not an establishing shot (those should use fresh wide shots)
+                # - Not marked as a new location
+                characters_same = curr_chars == prev_chars
+                characters_overlap = len(curr_chars & prev_chars) > 0 if (curr_chars and prev_chars) else False
+
+                if (characters_same or characters_overlap) and not is_establishing and not is_new_location:
+                    try:
+                        scene.use_previous_last_frame = True
+                    except Exception:
+                        object.__setattr__(scene, 'use_previous_last_frame', True)
+                    continuity_set += 1
+                    logger.info(f"Scene {scene.index}: Enabled continuity (same chars, same location)")
+                else:
+                    try:
+                        scene.use_previous_last_frame = False
+                    except Exception:
+                        object.__setattr__(scene, 'use_previous_last_frame', False)
+                    reason = []
+                    if not characters_same and not characters_overlap:
+                        reason.append("different characters")
+                    if is_establishing:
+                        reason.append("establishing shot")
+                    if is_new_location:
+                        reason.append("new location")
+                    logger.info(f"Scene {scene.index}: Disabled continuity ({', '.join(reason)})")
+
+            st.write(f"✓ Enabled continuity for {continuity_set}/{len(sorted_scenes) - 1} scenes")
+
             # Save after all scenes processed
             save_movie_state()
 
@@ -5097,10 +5520,17 @@ Generate an image prompt in {visual_style} style. Start with the style, then des
 CRITICAL I2V RULES:
 1. {style_rule}
 2. NO STYLE DESCRIPTION - style is in the image
-3. MAX 50 WORDS total - shorter = more faithful
+3. MAX 80 WORDS total - includes camera work
 4. Focus on: lip movements, subtle expressions, natural dialogue delivery
-5. MULTI-SHOT CAMERA: Include cinematic variety - "camera work transitions from wide to medium to close-up"
+5. MULTI-SHOT CAMERA: Include explicit camera movements and transitions
 6. ALWAYS END WITH: "{style_ending}"
+
+MULTI-SHOT CAMERA WORK (CRITICAL):
+Include these camera instructions in your prompt:
+- MOVEMENTS: "slow push-in", "gentle dolly forward", "subtle pan left/right", "smooth tilt up/down", "steady tracking shot"
+- TRANSITIONS: "cut to close-up", "match cut to", "smooth transition from wide to medium"
+- SHOT TYPES: "wide establishing shot", "medium two-shot", "over-the-shoulder", "close-up on face", "extreme close-up on eyes"
+- TIMING: "hold on reaction", "quick cut to", "slow reveal"
 
 DIALOGUE FORMAT (CRITICAL FOR LIP-SYNC):
 - Single speaker: "[Name] says [emotion]: '[dialogue]'"
@@ -5108,10 +5538,10 @@ DIALOGUE FORMAT (CRITICAL FOR LIP-SYNC):
 - Each character MUST be named explicitly with their emotion
 
 SINGLE SPEAKER EXAMPLE:
-"Karen says angrily: 'I can't believe you did this.' Expression shifts from shock to anger. Camera transitions from medium to close-up. {style_ending}"
+"Wide establishing shot. Karen says angrily: 'I can't believe you did this.' Camera slowly pushes in. Expression shifts from shock to anger. Cut to close-up on her face. Subtle eye movement. {style_ending}"
 
 MULTI-SPEAKER EXAMPLE:
-"Marcus says calmly: 'We need to talk about what happened.' Then Sarah replies nervously: 'I was hoping you wouldn't find out.' Marcus continues seriously: 'It's too late for that now.' Camera work: wide establishing, medium for dialogue, close-ups for reactions. {style_ending}"
+"Wide two-shot. Marcus says calmly: 'We need to talk.' Slow push-in to medium. Then Sarah replies nervously: 'I was hoping you wouldn't find out.' Cut to close-up on Marcus's reaction. Marcus continues seriously: 'It's too late for that now.' Hold on his intense expression. {style_ending}"
 """
             else:  # wan26 (I2V, T2V, or Fast)
                 # Determine WAN model variant name
@@ -5314,7 +5744,7 @@ Generate a video animation prompt that:
                 # Build user prompt with emphasis on dialogue and MULTI-SHOT format
                 if dialogue_text:
                     if "seedance" in gen_method:
-                        # Seedance-specific prompt with proper dialogue attribution
+                        # Seedance-specific prompt with proper dialogue attribution and camera work
                         user_prompt = f"""Create a MULTI-SHOT CINEMATIC I2V prompt for {model_label}. MAX 100 WORDS.
 
 **DIALOGUE (CRITICAL - INCLUDE ALL LINES WITH CHARACTER NAMES AND EMOTIONS):**
@@ -5326,16 +5756,18 @@ Setting: {scene.direction.setting}
 DIALOGUE FORMAT (USE EXACTLY AS PROVIDED):
 - Each line has character name + emotion + dialogue
 - Multi-character: use transitions like "Then [Name] replies..."
-- This enables proper lip-sync attribution
 
-USE MULTI-SHOT FORMAT:
-Wide shot: [establishing]
-Medium shot: [dialogue with character actions]
-Close-up: [emotional reactions]
+CAMERA WORK (CRITICAL FOR CINEMATIC FEEL):
+Include specific camera instructions:
+- Start with shot type: "Wide establishing shot" or "Medium two-shot"
+- Add camera movements: "slow push-in", "gentle pan", "smooth dolly"
+- Use transitions: "cut to close-up", "match cut to reaction"
+- Include timing: "hold on expression", "quick cut to"
+
+EXAMPLE STRUCTURE:
+"Wide establishing shot. [Character] says [emotion]: '[line]'. Camera slowly pushes in. [Action/expression]. Cut to close-up on [character]. [Reaction]. {style_ending_seedance}"
 
 End with: "{style_ending_seedance}"
-
-CRITICAL: Use EXACT dialogue format provided above. Each character's name MUST appear with their line.
 
 Output ONLY the prompt text."""
                     else:
@@ -5365,9 +5797,14 @@ Scene mood: {scene.direction.mood}
 Setting: {scene.direction.setting}
 (No dialogue in this scene)
 
+CAMERA WORK (CRITICAL FOR CINEMATIC FEEL):
+- Start with shot type: "Wide establishing shot", "Medium shot"
+- Include camera movements: "slow push-in", "gentle pan", "subtle dolly"
+- Add transitions: "cut to close-up", "smooth transition to medium"
+
 USE MULTI-SHOT FORMAT:
-Wide shot: [establishing - setting, atmosphere]
-Medium shot: [character action, body language]
+Wide shot: [establishing - setting, atmosphere, camera movement]
+Medium shot: [character action, body language, camera movement]
 Close-up: [emotional expressions, subtle movements]
 
 Include motion verbs (sway, tilt, blink) with speed adverbs (gently, slowly).
@@ -6542,8 +6979,15 @@ def _split_scene_by_dialogue(script: "Script", scene: "MovieScene", num_scenes: 
     scene.dialogue = dialogue_groups[0]
     scene.title = f"{scene.title or scene.direction.setting} (Part 1)"
     # Clear prompts/media since content changed
-    scene.visual_prompt = None
-    scene.video_prompt = None
+    try:
+        scene.visual_prompt = None
+        scene.video_prompt = None
+    except Exception:
+        object.__setattr__(scene, 'visual_prompt', None)
+        object.__setattr__(scene, 'video_prompt', None)
+    # Clear session state caches
+    if f"video_prompt_value_{scene.index}" in st.session_state:
+        del st.session_state[f"video_prompt_value_{scene.index}"]
 
     # Create new scenes for remaining dialogue groups
     new_scenes = []
@@ -6579,14 +7023,14 @@ def _split_scene_by_dialogue(script: "Script", scene: "MovieScene", num_scenes: 
     logger.info(f"Split scene into {num_scenes} parts: {word_counts} words each ({[len(g) for g in dialogue_groups]} lines)")
 
 
-def _snip_scene_at_dialogue_line(script: "Script", scene: "MovieScene", snip_at_line_idx: int) -> None:
+def _snip_scene_at_dialogue_line(script: "Script", scene: "MovieScene", snip_at_line_idx: int, state: "MovieModeState" = None) -> None:
     """Snip a scene at a specific dialogue line, creating a new scene for remaining dialogue.
 
     The new scene will:
     - Contain dialogue from snip_at_line_idx onwards
     - Inherit all settings from the original scene
     - Be marked to use the last frame from the original scene for continuity
-    - Keep the same image path (reuse the base image)
+    - Have video prompts auto-regenerated based on the new dialogue
 
     Args:
         script: The Script object containing all scenes
@@ -6594,6 +7038,7 @@ def _snip_scene_at_dialogue_line(script: "Script", scene: "MovieScene", snip_at_
         snip_at_line_idx: The dialogue line index to snip at (0-based)
                           Lines 0 to snip_at_line_idx-1 stay in original scene
                           Lines snip_at_line_idx onwards go to new scene
+        state: MovieModeState for regenerating prompts (optional but recommended)
     """
     from src.models.schemas import MovieScene, SceneDirection, DialogueLine
 
@@ -6630,7 +7075,13 @@ def _snip_scene_at_dialogue_line(script: "Script", scene: "MovieScene", snip_at_
     # Update original scene with dialogue before snip
     scene.dialogue = before_snip
     # Clear video prompt since dialogue changed, but keep visual prompt/image
-    scene.video_prompt = None
+    try:
+        scene.video_prompt = None
+    except Exception:
+        object.__setattr__(scene, 'video_prompt', None)
+    # Also clear session state cache for video prompt
+    if f"video_prompt_value_{scene.index}" in st.session_state:
+        del st.session_state[f"video_prompt_value_{scene.index}"]
 
     # Create new scene with dialogue after snip
     # NOTE: We intentionally don't copy image_path - the new scene will use
@@ -6673,6 +7124,43 @@ def _snip_scene_at_dialogue_line(script: "Script", scene: "MovieScene", snip_at_
     before_words = sum(len(d.text.split()) for d in before_snip)
     after_words = sum(len(d.text.split()) for d in after_snip)
     logger.info(f"Snipped scene at line {snip_at_line_idx}: {len(before_snip)} lines ({before_words} words) + {len(after_snip)} lines ({after_words} words)")
+
+    # Auto-regenerate video prompts for both scenes if state is available
+    if state is not None:
+        # Check if scene has an image for context
+        has_original_image = scene.image_path and Path(scene.image_path).exists()
+
+        # Regenerate video prompt for original scene (now has fewer dialogue lines)
+        try:
+            original_prompt = _regenerate_scene_prompt(
+                scene, script, state,
+                prompt_type="video",
+                use_image_context=has_original_image
+            )
+            if original_prompt:
+                try:
+                    scene.video_prompt = original_prompt
+                except Exception:
+                    object.__setattr__(scene, 'video_prompt', original_prompt)
+                logger.info(f"Auto-regenerated video prompt for original scene {scene.index}")
+        except Exception as e:
+            logger.warning(f"Failed to auto-regenerate video prompt for scene {scene.index}: {e}")
+
+        # Regenerate video prompt for new scene
+        try:
+            new_prompt = _regenerate_scene_prompt(
+                new_scene, script, state,
+                prompt_type="video",
+                use_image_context=False  # New scene has no image yet
+            )
+            if new_prompt:
+                try:
+                    new_scene.video_prompt = new_prompt
+                except Exception:
+                    object.__setattr__(new_scene, 'video_prompt', new_prompt)
+                logger.info(f"Auto-regenerated video prompt for new scene {new_scene.index}")
+        except Exception as e:
+            logger.warning(f"Failed to auto-regenerate video prompt for new scene {new_scene.index}: {e}")
 
 
 def _render_scene_editor_form(script: Script, state: MovieModeState, visual_style: str) -> None:
@@ -7669,10 +8157,11 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
                     use_container_width=True,
                     help=f"Split scene here: lines 1-{d_idx} stay in this scene, lines {d_idx+1}-{num_dialogue_lines} go to new scene"
                 ):
-                    _snip_scene_at_dialogue_line(script, scene, d_idx)
-                    st.session_state.scenes_dirty = True
-                    save_movie_state()
-                    st.success(f"Snipped! Lines {d_idx+1}-{num_dialogue_lines} moved to new scene (uses same image for continuity)")
+                    with st.spinner("Snipping and regenerating prompts..."):
+                        _snip_scene_at_dialogue_line(script, scene, d_idx, state)
+                        st.session_state.scenes_dirty = True
+                        save_movie_state()
+                    st.success(f"Snipped! Lines {d_idx+1}-{num_dialogue_lines} moved to new scene with updated video prompts")
                     st.rerun()
 
         cols = st.columns([2, 4, 2, 1])
@@ -8784,12 +9273,12 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
 
     scene_model = getattr(scene, 'generation_model', None) or generation_method
 
-    output_dir = get_project_dir() / "videos"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Save videos to per-scene folder: scenes/scene_XXX/videos/
+    output_dir = get_scene_video_dir(scene.index)
 
     # Use timestamp suffix to create variants instead of overwriting
     timestamp = get_readable_timestamp()
-    output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
+    output_path = output_dir / f"video_{timestamp}.mp4"
 
     duration = scene.get_clip_duration(scene_model)
     resolution = getattr(scene, 'resolution', None) or defaults.get("resolution", "720p")
@@ -8805,6 +9294,27 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
         if prev_scene and prev_scene.video_path and Path(prev_scene.video_path).exists():
             previous_video = Path(prev_scene.video_path)
             logger.info(f"Using previous scene video as reference: {previous_video.name}")
+
+    # Check if this scene should use previous scene's last frame for continuity
+    first_frame_override = None
+    if getattr(scene, 'use_previous_last_frame', False) and scene.index > 1:
+        prev_scene = next((s for s in state.script.scenes if s.index == scene.index - 1), None)
+        if prev_scene and prev_scene.video_path and Path(prev_scene.video_path).exists():
+            # CRITICAL: Check if visible characters changed between scenes
+            prev_chars = set(prev_scene.direction.visible_characters) if prev_scene.direction else set()
+            curr_chars = set(scene.direction.visible_characters) if scene.direction else set()
+            characters_changed = curr_chars != prev_chars
+
+            if characters_changed:
+                logger.warning(f"Scene {scene.index}: Characters changed - skipping last frame for I2V to preserve identity")
+            else:
+                extracted_frame = extract_last_frame_from_video(
+                    Path(prev_scene.video_path),
+                    output_dir / "continuity_frames"
+                )
+                if extracted_frame:
+                    first_frame_override = extracted_frame
+                    logger.info(f"Scene {scene.index}: Using extracted last frame for continuity")
 
     with st.status(f"Generating scene {scene.index} with {scene_model}...", expanded=True) as status:
         try:
@@ -8835,31 +9345,122 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
                 from src.services.atlascloud_animator import AtlasCloudAnimator, WanModel, SeedanceModel
                 visual_style = state.config.visual_style if state.config else state.script.visual_style
 
+                # For WAN/Seedance I2V, the input image MUST have correct character faces
+                # (These models don't support separate reference images like Veo)
+                input_image = first_frame_override if first_frame_override else (
+                    Path(scene.image_path) if scene.image_path else None
+                )
+
+                # Auto-generate image if missing (ensures correct character faces from portraits)
+                if not input_image or not input_image.exists():
+                    status.update(label=f"Generating image first (required for {scene_model})...", state="running")
+                    _generate_single_scene_image(scene, state.script, state)
+                    if scene.image_path and Path(scene.image_path).exists():
+                        input_image = Path(scene.image_path)
+                    else:
+                        status.update(label="Failed to generate image", state="error")
+                        return
+
                 if scene_model in ("seedance15", "seedance15_i2v"):
                     animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
+                    # Seedance supports BOTH image (start) and last_image (target)
+                    # This allows smooth transitions between different characters!
+
+                    # Check for custom start image (user-selected from UI)
+                    custom_start = getattr(scene, 'custom_start_image', None)
+                    print(f"\n[DEBUG GEN] Scene {scene.index}: custom_start_image = {custom_start}")
+                    print(f"[DEBUG GEN] Scene {scene.index}: first_frame_override = {first_frame_override}")
+                    print(f"[DEBUG GEN] Scene {scene.index}: input_image = {input_image}")
+                    if custom_start and Path(custom_start).exists():
+                        start_image = Path(custom_start)
+                        logger.info(f"Scene {scene.index}: Using custom start image: {start_image.name}")
+                    elif first_frame_override and first_frame_override.exists():
+                        start_image = first_frame_override
+                    else:
+                        start_image = input_image
+
+                    # Check for custom target image (user-selected from UI)
+                    custom_target = getattr(scene, 'custom_target_image', None)
+                    print(f"[DEBUG GEN] Scene {scene.index}: custom_target_image = {custom_target}")
+                    print(f"[DEBUG GEN] Scene {scene.index}: scene.image_path = {scene.image_path}")
+                    if custom_target and Path(custom_target).exists():
+                        target_image = Path(custom_target)
+                        logger.info(f"Scene {scene.index}: Using custom target image: {target_image.name}")
+                        print(f"[DEBUG GEN] Scene {scene.index}: -> Using CUSTOM target: {target_image.name}")
+                    elif scene.image_path and Path(scene.image_path).exists():
+                        # Default: use scene's own image as target (for smooth transition)
+                        target_image = Path(scene.image_path)
+                        logger.info(f"Scene {scene.index}: Using scene image as target: {target_image.name}")
+                    else:
+                        # No target available - generate scene image
+                        _generate_single_scene_image(scene, state.script, state)
+                        if scene.image_path and Path(scene.image_path).exists():
+                            target_image = Path(scene.image_path)
+                            logger.info(f"Scene {scene.index}: Generated scene image as target: {target_image.name}")
+                        else:
+                            target_image = None
+                            logger.warning(f"Scene {scene.index}: No target image available")
+
+                    logger.info(f"Scene {scene.index}: Seedance dual-image - start={start_image.name}, target={target_image.name if target_image else 'None'}")
+
                     result = animator.animate_scene(
-                        image_path=Path(scene.image_path),
+                        image_path=start_image,
                         prompt=prompt,
                         output_path=output_path,
                         duration_seconds=duration,
                         resolution=resolution,
                         visual_style=visual_style,
+                        last_frame=target_image,  # Target frame with correct characters
                     )
                 elif scene_model in ("seedance_fast", "seedance_fast_i2v"):
                     animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO_FAST)
+                    # Same dual-image logic for Seedance Fast
+
+                    # Check for custom start image (user-selected from UI)
+                    custom_start = getattr(scene, 'custom_start_image', None)
+                    if custom_start and Path(custom_start).exists():
+                        start_image = Path(custom_start)
+                        logger.info(f"Scene {scene.index}: Using custom start image: {start_image.name}")
+                    elif first_frame_override and first_frame_override.exists():
+                        start_image = first_frame_override
+                    else:
+                        start_image = input_image
+
+                    # Check for custom target image (user-selected from UI)
+                    custom_target = getattr(scene, 'custom_target_image', None)
+                    if custom_target and Path(custom_target).exists():
+                        target_image = Path(custom_target)
+                        logger.info(f"Scene {scene.index}: Using custom target image: {target_image.name}")
+                    elif scene.image_path and Path(scene.image_path).exists():
+                        # Default: use scene's own image as target (for smooth transition)
+                        target_image = Path(scene.image_path)
+                        logger.info(f"Scene {scene.index}: Using scene image as target: {target_image.name}")
+                    else:
+                        # No target available - generate scene image
+                        _generate_single_scene_image(scene, state.script, state)
+                        if scene.image_path and Path(scene.image_path).exists():
+                            target_image = Path(scene.image_path)
+                            logger.info(f"Scene {scene.index}: Generated scene image as target: {target_image.name}")
+                        else:
+                            target_image = None
+                            logger.warning(f"Scene {scene.index}: No target image available")
+
+                    logger.info(f"Scene {scene.index}: Seedance Fast dual-image - start={start_image.name}, target={target_image.name if target_image else 'None'}")
+
                     result = animator.animate_scene(
-                        image_path=Path(scene.image_path),
+                        image_path=start_image,
                         prompt=prompt,
                         output_path=output_path,
                         duration_seconds=duration,
                         resolution=resolution,
                         visual_style=visual_style,
+                        last_frame=target_image,  # Target frame with correct characters
                     )
                 elif scene_model in ("wan26", "wan26_i2v"):
                     # WAN 2.6 I2V mode
                     animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
                     result = animator.animate_scene(
-                        image_path=Path(scene.image_path),
+                        image_path=input_image,
                         prompt=prompt,
                         output_path=output_path,
                         duration_seconds=duration,
@@ -8875,7 +9476,7 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
                     # WAN 2.6 V2V mode
                     animator = AtlasCloudAnimator(model=WanModel.VIDEO_TO_VIDEO)
                     result = animator.animate_scene(
-                        image_path=Path(scene.image_path),
+                        image_path=input_image,
                         prompt=prompt,
                         output_path=output_path,
                         duration_seconds=duration,
@@ -8889,10 +9490,10 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
                         seed=state.config.wan_seed if state.config else 0,
                     )
                 else:
-                    # WAN 2.6 I2V mode
+                    # WAN 2.6 I2V mode (fallback)
                     animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
                     result = animator.animate_scene(
-                        image_path=Path(scene.image_path),
+                        image_path=input_image,
                         prompt=prompt,
                         output_path=output_path,
                         duration_seconds=duration,
@@ -8927,8 +9528,7 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
 
     project_default = config.generation_method if config else "veo3"
 
-    output_dir = get_project_dir() / "videos"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Note: output_dir is now set per-scene using get_scene_video_dir()
 
     # Filter scenes that need videos
     scenes_to_generate = [
@@ -8969,9 +9569,10 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
         ) if config else "720p"
         prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
 
-        # Use timestamp suffix to create variants instead of overwriting
+        # Save videos to per-scene folder: scenes/scene_XXX/videos/
+        output_dir = get_scene_video_dir(scene.index)
         timestamp = get_readable_timestamp()
-        output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
+        output_path = output_dir / f"video_{timestamp}.mp4"
 
         # Get previous video for continuity (from last generated or previous scene)
         previous_video = None
@@ -8990,14 +9591,26 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
         if getattr(scene, 'use_previous_last_frame', False) and scene.index > 1:
             prev_scene = next((s for s in state.script.scenes if s.index == scene.index - 1), None)
             if prev_scene and prev_scene.video_path and Path(prev_scene.video_path).exists():
-                # Extract last frame from previous scene's video
-                extracted_frame = extract_last_frame_from_video(
-                    Path(prev_scene.video_path),
-                    output_dir / "continuity_frames"
-                )
-                if extracted_frame:
-                    first_frame_override = extracted_frame
-                    logger.info(f"Scene {scene.index}: Using extracted last frame from previous video for continuity")
+                # CRITICAL: Check if visible characters changed between scenes
+                # If characters changed, DON'T use the last frame as it will have the wrong face
+                prev_chars = set(prev_scene.direction.visible_characters) if prev_scene.direction else set()
+                curr_chars = set(scene.direction.visible_characters) if scene.direction else set()
+                characters_changed = curr_chars != prev_chars
+
+                if characters_changed:
+                    # Characters changed - don't use last frame for I2V as it has wrong faces
+                    logger.warning(f"Scene {scene.index}: Characters changed from {prev_chars} to {curr_chars} - skipping last frame for I2V to preserve identity")
+                    # For I2V models, we MUST use the scene's own image with correct character faces
+                    # The last frame would show different characters and cause identity confusion
+                else:
+                    # Same characters - safe to use last frame for continuity
+                    extracted_frame = extract_last_frame_from_video(
+                        Path(prev_scene.video_path),
+                        output_dir / "continuity_frames"
+                    )
+                    if extracted_frame:
+                        first_frame_override = extracted_frame
+                        logger.info(f"Scene {scene.index}: Using extracted last frame from previous video for continuity (same characters)")
 
         try:
             result = None
@@ -9026,8 +9639,22 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
             elif scene_model in ("wan26", "wan26_i2v"):
                 if wan_animator is None:
                     wan_animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
-                # Use extracted frame for continuity if available, otherwise scene image
+
+                # For WAN I2V, the input image MUST have correct character faces
+                # (WAN doesn't support separate reference images like Veo)
                 input_image = first_frame_override if first_frame_override else Path(scene.image_path)
+
+                # If characters changed and we don't have a proper scene image, generate one first
+                if not first_frame_override and (not scene.image_path or not Path(scene.image_path).exists()):
+                    logger.warning(f"Scene {scene.index}: No image available for WAN I2V - generating one first")
+                    progress_bar.progress((scene_idx / total), text=f"Scene {scene.index}: Generating image first...")
+                    _generate_single_scene_image(scene, state.script, state)
+                    if scene.image_path and Path(scene.image_path).exists():
+                        input_image = Path(scene.image_path)
+                    else:
+                        logger.error(f"Scene {scene.index}: Failed to generate image for WAN I2V")
+                        continue
+
                 result = wan_animator.animate_scene(
                     image_path=input_image,
                     prompt=prompt,
@@ -9054,15 +9681,54 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
                         if d.audio_path and Path(d.audio_path).exists():
                             audio_path = Path(d.audio_path)
                             break
-                # Use extracted frame for continuity if available, otherwise scene image
-                input_image = first_frame_override if first_frame_override else Path(scene.image_path)
-                # Generate video first (without lip sync)
+
+                # Seedance supports BOTH image (start) and last_image (target)
+                # This allows smooth transitions between different characters!
+                # - image: Starting frame (can be last frame from previous scene)
+                # - last_image: Target frame with correct character for this scene
+                start_image = None
+                target_image = None
+
+                # Check for custom start image (user-selected from UI)
+                custom_start = getattr(scene, 'custom_start_image', None)
+                if custom_start and Path(custom_start).exists():
+                    start_image = Path(custom_start)
+                    logger.info(f"Scene {scene.index}: Using custom start image: {start_image.name}")
+                elif first_frame_override and first_frame_override.exists():
+                    start_image = first_frame_override
+                    logger.info(f"Scene {scene.index}: Using last frame as start for Seedance transition")
+                elif scene.image_path and Path(scene.image_path).exists():
+                    start_image = Path(scene.image_path)
+                else:
+                    # Generate scene image
+                    logger.info(f"Scene {scene.index}: Generating image with correct characters for Seedance...")
+                    progress_bar.progress((scene_idx / total), text=f"Scene {scene.index}: Generating image first...")
+                    _generate_single_scene_image(scene, state.script, state)
+                    if scene.image_path and Path(scene.image_path).exists():
+                        start_image = Path(scene.image_path)
+                    else:
+                        logger.error(f"Scene {scene.index}: Failed to generate image for Seedance I2V")
+                        continue
+
+                # Check for custom target image (user-selected from UI)
+                custom_target = getattr(scene, 'custom_target_image', None)
+                if custom_target and Path(custom_target).exists():
+                    target_image = Path(custom_target)
+                    logger.info(f"Scene {scene.index}: Using custom target image: {target_image.name}")
+                elif scene.image_path and Path(scene.image_path).exists():
+                    target_image = Path(scene.image_path)
+                else:
+                    target_image = start_image  # Fallback to start image
+
+                # Generate video with start and target images
+                logger.info(f"Scene {scene.index}: Seedance - start={start_image.name}, target={target_image.name if target_image else 'None'}")
                 result = seedance_animator.animate_scene(
-                    image_path=input_image,
+                    image_path=start_image,
                     prompt=prompt,
                     output_path=output_path,
                     duration_seconds=duration,
                     resolution=resolution,
+                    last_frame=target_image if target_image and target_image != start_image else None,
                 )
                 # Apply lip sync as post-processing if audio available
                 if result and audio_path:
@@ -9090,15 +9756,40 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
                         if d.audio_path and Path(d.audio_path).exists():
                             audio_path = Path(d.audio_path)
                             break
-                # Use extracted frame for continuity if available, otherwise scene image
-                input_image = first_frame_override if first_frame_override else Path(scene.image_path)
-                # Generate video first (without lip sync)
+
+                # Check for custom start image (user-selected from UI)
+                custom_start = getattr(scene, 'custom_start_image', None)
+                if custom_start and Path(custom_start).exists():
+                    start_image = Path(custom_start)
+                    logger.info(f"Scene {scene.index}: Using custom start image: {start_image.name}")
+                elif first_frame_override and first_frame_override.exists():
+                    start_image = first_frame_override
+                    logger.info(f"Scene {scene.index}: Using last frame as start for Seedance Fast transition")
+                elif scene.image_path and Path(scene.image_path).exists():
+                    start_image = Path(scene.image_path)
+                else:
+                    logger.error(f"Scene {scene.index}: No image available for Seedance Fast I2V")
+                    continue
+
+                # Check for custom target image (user-selected from UI)
+                custom_target = getattr(scene, 'custom_target_image', None)
+                if custom_target and Path(custom_target).exists():
+                    target_image = Path(custom_target)
+                    logger.info(f"Scene {scene.index}: Using custom target image: {target_image.name}")
+                elif scene.image_path and Path(scene.image_path).exists():
+                    target_image = Path(scene.image_path)
+                else:
+                    target_image = start_image
+
+                # Generate video with start and target images
+                logger.info(f"Scene {scene.index}: Seedance Fast - start={start_image.name}, target={target_image.name if target_image else 'None'}")
                 result = seedance_fast_animator.animate_scene(
-                    image_path=input_image,
+                    image_path=start_image,
                     prompt=prompt,
                     output_path=output_path,
                     duration_seconds=duration,
                     resolution=resolution,
+                    last_frame=target_image if target_image and target_image != start_image else None,
                 )
                 # Apply lip sync as post-processing if audio available
                 if result and audio_path:
@@ -9151,8 +9842,7 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
     st.info(f"**Per-scene models:** {counts}")
 
     if st.button("🎬 Generate All Scenes", type="primary", use_container_width=True):
-        output_dir = get_project_dir() / "videos"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Note: output_dir is now set per-scene using get_scene_video_dir()
 
         # Initialize generators lazily
         veo_generator = None
@@ -9179,9 +9869,10 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
             duration = scene.get_clip_duration(scene_model)  # Auto-calculates based on dialogue
             resolution = scene.resolution
 
-            # Use timestamp suffix to create variants instead of overwriting
+            # Save videos to per-scene folder: scenes/scene_XXX/videos/
+            output_dir = get_scene_video_dir(scene.index)
             timestamp = get_readable_timestamp()
-            output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
+            output_path = output_dir / f"video_{timestamp}.mp4"
 
             try:
                 if scene_model == "veo3":
@@ -9250,15 +9941,36 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
 
                     source_video = previous_video if use_v2v and previous_video and previous_video.exists() else None
 
+                    # Check for custom start image (user-selected from UI)
+                    custom_start = getattr(scene, 'custom_start_image', None)
+                    if custom_start and Path(custom_start).exists():
+                        start_image = Path(custom_start)
+                    elif scene.image_path and Path(scene.image_path).exists():
+                        start_image = Path(scene.image_path)
+                    else:
+                        start_image = None
+
+                    # Check for custom target image (user-selected from UI)
+                    custom_target = getattr(scene, 'custom_target_image', None)
+                    if custom_target and Path(custom_target).exists():
+                        target_image = Path(custom_target)
+                    elif scene.image_path and Path(scene.image_path).exists():
+                        target_image = Path(scene.image_path)
+                    else:
+                        target_image = start_image
+
+                    logger.info(f"Scene {scene.index}: Seedance - start={start_image.name if start_image else 'None'}, target={target_image.name if target_image else 'None'}")
+
                     # Generate video first (without lip sync)
                     result = seedance_animator.animate_scene(
-                        image_path=Path(scene.image_path),
+                        image_path=start_image,
                         prompt=prompt,
                         output_path=output_path,
                         duration_seconds=duration,
                         resolution=res,
                         source_video=source_video,
-                        first_frame=Path(scene.image_path) if use_scene_continuity else None,
+                        first_frame=start_image if use_scene_continuity else None,
+                        last_frame=target_image if target_image and target_image != start_image else None,
                     )
                     # Apply lip sync as post-processing if audio available
                     if result and audio_path:
@@ -9291,15 +10003,27 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
 
                     source_video = previous_video if use_v2v and previous_video and previous_video.exists() else None
 
+                    # Get custom start/target images
+                    custom_start = getattr(scene, 'custom_start_image', None)
+                    custom_target = getattr(scene, 'custom_target_image', None)
+                    start_image = Path(custom_start) if custom_start and Path(custom_start).exists() else Path(scene.image_path)
+                    if custom_target and Path(custom_target).exists():
+                        target_image = Path(custom_target)
+                    elif scene.image_path and Path(scene.image_path).exists():
+                        target_image = Path(scene.image_path)
+                    else:
+                        target_image = start_image
+
                     # Generate video first (without lip sync)
                     result = seedance_fast_animator.animate_scene(
-                        image_path=Path(scene.image_path),
+                        image_path=start_image,
                         prompt=prompt,
                         output_path=output_path,
                         duration_seconds=duration,
                         resolution=res,
                         source_video=source_video,
-                        first_frame=Path(scene.image_path) if use_scene_continuity else None,
+                        first_frame=start_image if use_scene_continuity else None,
+                        last_frame=target_image if target_image and target_image != start_image else None,
                     )
                     # Apply lip sync as post-processing if audio available
                     if result and audio_path:
@@ -9332,8 +10056,9 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
             with st.expander(f"Scene {i + 1}", expanded=i == 0):
                 st.video(str(video_path))
 
-        # Save state
+        # Save state and refresh UI
         save_movie_state()
+        st.rerun()
 
 
 def _render_veo3_generation(state, config, use_char_refs: bool, use_scene_continuity: bool, portraits: list) -> None:
@@ -9349,8 +10074,7 @@ def _render_veo3_generation(state, config, use_char_refs: bool, use_scene_contin
             resolution=default_resolution,
             duration=default_duration,
         )
-        output_dir = get_project_dir() / "videos"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Note: output_dir is now set per-scene using get_scene_video_dir()
 
         progress_bar = st.progress(0, text="Generating scenes with Veo 3.1...")
 
@@ -9378,8 +10102,9 @@ def _render_veo3_generation(state, config, use_char_refs: bool, use_scene_contin
                 with st.expander(f"Scene {i + 1}", expanded=i == 0):
                     st.video(str(video_path))
 
-            # Save state
+            # Save state and refresh UI
             save_movie_state()
+            st.rerun()
 
         except Exception as e:
             st.error(f"Veo 3.1 generation failed: {e}")
@@ -9395,8 +10120,7 @@ def _render_wan26_generation(state, config, use_char_refs: bool, use_scene_conti
         default_resolution = config.wan_resolution if config else "720p"
 
         animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
-        output_dir = get_project_dir() / "videos"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Note: output_dir is now set per-scene using get_scene_video_dir()
 
         progress_bar = st.progress(0, text="Generating scenes with WAN 2.6...")
         total_scenes = len(state.script.scenes)
@@ -9418,9 +10142,10 @@ def _render_wan26_generation(state, config, use_char_refs: bool, use_scene_conti
             # Build prompt from video_prompt or fallback to scene direction
             prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
 
-            # Use timestamp suffix to create variants instead of overwriting
+            # Save videos to per-scene folder: scenes/scene_XXX/videos/
+            output_dir = get_scene_video_dir(scene.index)
             timestamp = get_readable_timestamp()
-            output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
+            output_path = output_dir / f"video_{timestamp}.mp4"
 
             # Determine input for video-to-video continuity
             source_video = None
@@ -9460,8 +10185,9 @@ def _render_wan26_generation(state, config, use_char_refs: bool, use_scene_conti
             with st.expander(f"Scene {i + 1}", expanded=i == 0):
                 st.video(str(video_path))
 
-        # Save state
+        # Save state and refresh UI
         save_movie_state()
+        st.rerun()
 
 
 def _render_seedance_generation(state, config, use_char_refs: bool, use_scene_continuity: bool, use_v2v: bool, portraits: list) -> None:
@@ -9475,8 +10201,7 @@ def _render_seedance_generation(state, config, use_char_refs: bool, use_scene_co
         default_lip_sync = config.seedance_lip_sync if config else True
 
         animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
-        output_dir = get_project_dir() / "videos"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Note: output_dir is now set per-scene using get_scene_video_dir()
 
         progress_bar = st.progress(0, text="Generating scenes with Seedance 1.5 Pro...")
         total_scenes = len(state.script.scenes)
@@ -9500,9 +10225,10 @@ def _render_seedance_generation(state, config, use_char_refs: bool, use_scene_co
             # Build prompt from video_prompt or fallback to scene direction
             prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
 
-            # Use timestamp suffix to create variants instead of overwriting
+            # Save videos to per-scene folder: scenes/scene_XXX/videos/
+            output_dir = get_scene_video_dir(scene.index)
             timestamp = get_readable_timestamp()
-            output_path = output_dir / f"scene_{scene.index:03d}_{timestamp}.mp4"
+            output_path = output_dir / f"video_{timestamp}.mp4"
 
             # Get audio for lip sync if enabled
             audio_path = None
@@ -9559,8 +10285,9 @@ def _render_seedance_generation(state, config, use_char_refs: bool, use_scene_co
             with st.expander(f"Scene {i + 1}", expanded=i == 0):
                 st.video(str(video_path))
 
-        # Save state
+        # Save state and refresh UI
         save_movie_state()
+        st.rerun()
 
 
 def _render_traditional_generation(state) -> None:
@@ -11090,8 +11817,8 @@ def render_render_page() -> None:
         from src.models.schemas import KenBurnsEffect
 
         video_gen = VideoGenerator()
-        output_dir = get_project_dir() / "videos"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Final combined video goes to shared videos folder (not per-scene)
+        output_dir = get_legacy_video_dir()
 
         # Collect valid audio tracks from timeline
         audio_tracks_to_mix = [

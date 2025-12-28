@@ -82,9 +82,10 @@ class MovieImageGenerator:
             if is_photorealistic:
                 parts.append("natural skin texture, subsurface scattering, soft diffused lighting, 8K resolution, film grain")
 
-            # Explicit environment preservation instructions
-            parts.append("CRITICAL ENVIRONMENT PRESERVATION: The reference image shows the EXACT room/location. You MUST keep ALL furniture, props, decorations, and environmental details EXACTLY as shown in the reference. Do NOT add, remove, or change any furniture or objects in the room.")
-            parts.append("REFERENCE USAGE: Match character FACES from portraits. Preserve ENVIRONMENT/FURNITURE exactly from scene reference. Character POSITIONS and CAMERA ANGLE come from this prompt.")
+            # Explicit environment preservation and face separation instructions
+            parts.append("CRITICAL ENVIRONMENT PRESERVATION: The scene reference image shows the EXACT room/location. You MUST keep ALL furniture, props, decorations, and environmental details EXACTLY as shown in the reference. Do NOT add, remove, or change any furniture or objects in the room.")
+            parts.append("CRITICAL CHARACTER FACES: Get character FACES ONLY from the CHARACTER PORTRAITS, NOT from the scene reference. The scene reference may show different characters - IGNORE their faces completely. Each character's face MUST match their specific portrait image exactly.")
+            parts.append("Character POSITIONS and CAMERA ANGLE come from this prompt, not from any reference images.")
         else:
             # FULL PROMPT - no reference, describe everything
             if is_photorealistic:
@@ -178,8 +179,9 @@ class MovieImageGenerator:
             # For custom prompts, respect the user's camera angle and composition
             # Only use reference images for face/appearance matching, NOT for composition
             if has_refs:
-                if has_location_ref:
-                    prompt = prompt + ". CRITICAL: Use the location reference image for the ENVIRONMENT/ROOM/SETTING. Match character FACES from portraits. Character POSITIONS and CAMERA ANGLE come from this prompt."
+                if has_location_ref or reference_image:
+                    # When we have both scene reference AND character portraits, be very explicit
+                    prompt = prompt + ". CRITICAL CHARACTER IDENTITY: Get character FACES ONLY from the CHARACTER PORTRAITS, NOT from the scene reference. The scene reference may show different characters - IGNORE their faces completely. Use scene reference for ENVIRONMENT/ROOM/LIGHTING only. Character POSITIONS and CAMERA ANGLE come from this prompt."
                 else:
                     prompt = prompt + ". Match character FACES and APPEARANCE from reference portraits, but use THIS PROMPT's camera angle and character positions."
             logger.info(f"Using custom visual prompt for scene {scene.index}")

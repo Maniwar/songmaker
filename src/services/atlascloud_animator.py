@@ -487,6 +487,22 @@ class AtlasCloudAnimator:
             if payload.get("negative_prompt"):
                 logger.info("-" * 60)
                 logger.info(f"NEGATIVE PROMPT: {payload['negative_prompt']}")
+            # Log image inputs - CRITICAL DEBUG INFO
+            logger.info("-" * 60)
+            has_start_img = "image" in payload
+            has_target_img = "last_image" in payload
+            start_size = len(payload['image']) if has_start_img else 0
+            target_size = len(payload['last_image']) if has_target_img else 0
+            logger.info(f"IMAGE INPUTS:")
+            logger.info(f"  start_image (image): {'YES - ' + str(start_size) + ' bytes' if has_start_img else 'NO - NOT SENT'}")
+            logger.info(f"  target_image (last_image): {'YES - ' + str(target_size) + ' bytes' if has_target_img else 'NO - NOT SENT'}")
+            logger.info(f"  Function params: image_path={image_path}, last_frame={last_frame}")
+            # Also print to console for immediate visibility
+            print(f"\n{'='*60}")
+            print(f"ATLASCLOUD API CALL - IMAGE INPUTS:")
+            print(f"  start_image (image): {'✅ YES - ' + str(start_size) + ' bytes from ' + str(image_path) if has_start_img else '❌ NO - NOT SENT'}")
+            print(f"  target_image (last_image): {'✅ YES - ' + str(target_size) + ' bytes from ' + str(last_frame) if has_target_img else '❌ NO - NOT SENT'}")
+            print(f"{'='*60}\n")
             # Log parameters based on model type
             if is_seedance:
                 logger.info(f"SEEDANCE PARAMS: seed={payload.get('seed')}, shot_type={payload.get('shot_type')}, aspect_ratio={payload.get('aspect_ratio')}, camera_fixed={payload.get('camera_fixed')}, generate_audio={payload.get('generate_audio')}")

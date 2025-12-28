@@ -165,45 +165,72 @@ class ImageGenerator:
 
                 contents = []
 
-                # Collect all reference images (support both single and list)
-                all_ref_images = []
-                if reference_images:
-                    all_ref_images.extend(reference_images)
-                if reference_image is not None and reference_image not in all_ref_images:
-                    all_ref_images.append(reference_image)
+                # SEPARATE character portraits from scene reference for better control
+                # Character portraits should be used for FACES, scene reference for ENVIRONMENT/STYLE
+                has_portraits = reference_images and len(reference_images) > 0
+                has_scene_ref = reference_image is not None
 
-                # IMAGES FIRST - Per documentation: "placing a single image before
-                # the text prompt might lead to better results"
-                if all_ref_images:
-                    for idx, ref_img in enumerate(all_ref_images[:max_ref_images]):
-                        # Check if image is large enough to need Files API
+                # Add CHARACTER PORTRAITS first (these define the faces)
+                if has_portraits:
+                    contents.append("=== CHARACTER PORTRAITS (use for FACES and APPEARANCE only) ===")
+                    portrait_count = 0
+                    for idx, ref_img in enumerate(reference_images[:max_ref_images - 1 if has_scene_ref else max_ref_images]):
                         img_size = self._get_image_size_bytes(ref_img)
                         if img_size > FILES_API_THRESHOLD:
-                            # Use Files API for large images
-                            uploaded = self._upload_large_image(ref_img, f"reference_{idx}")
+                            uploaded = self._upload_large_image(ref_img, f"portrait_{idx}")
                             if uploaded:
                                 contents.append(uploaded)
+                                portrait_count += 1
                             else:
-                                # Fallback to inline if upload fails
                                 contents.append(ref_img)
+                                portrait_count += 1
                         else:
-                            # Small enough for inline data
                             contents.append(ref_img)
+                            portrait_count += 1
 
-                    # Add specific instruction for reference image usage AFTER images
-                    if len(all_ref_images) == 1:
+                    contents.append(
+                        f"CHARACTER PORTRAITS ABOVE ({portrait_count} images): "
+                        "CRITICAL - Match the EXACT face, hair, skin tone, and features of each character "
+                        "shown in these portrait images. These define how each character MUST look. "
+                        "DO NOT mix up character faces or use faces from other reference images."
+                    )
+
+                # Add SCENE REFERENCE separately (for environment/style ONLY)
+                if has_scene_ref:
+                    contents.append("=== SCENE REFERENCE (use for ENVIRONMENT and LIGHTING only) ===")
+                    img_size = self._get_image_size_bytes(reference_image)
+                    if img_size > FILES_API_THRESHOLD:
+                        uploaded = self._upload_large_image(reference_image, "scene_ref")
+                        if uploaded:
+                            contents.append(uploaded)
+                        else:
+                            contents.append(reference_image)
+                    else:
+                        contents.append(reference_image)
+
+                    if has_portraits:
+                        # CRITICAL: When we have both portraits AND scene ref, be very explicit
                         contents.append(
-                            "REFERENCE IMAGE ABOVE: Use this image as a visual reference. "
-                            "Maintain the exact character appearance (face, hair, clothing, colors). "
-                            "Create a new scene that is visually consistent with this reference."
+                            "SCENE REFERENCE ABOVE: Use this ONLY for environment, lighting, color palette, and style. "
+                            "DO NOT use any faces from this scene reference image. "
+                            "Character faces MUST come from the CHARACTER PORTRAITS above, not from this scene. "
+                            "This scene may show different characters - IGNORE their faces completely."
                         )
                     else:
+                        # Only scene ref, no portraits - use for everything
                         contents.append(
-                            f"REFERENCE IMAGES ABOVE ({len(all_ref_images[:max_ref_images])} images): "
-                            "These are character portraits. CRITICAL: Maintain the EXACT appearance "
-                            "of each character (face shape, hair style/color, clothing, features). "
-                            "Include ALL these characters in the new scene with perfect visual consistency."
+                            "SCENE REFERENCE ABOVE: Use this image for visual consistency - "
+                            "match the style, lighting, and character appearance from this reference."
                         )
+
+                # Handle case with only a single reference image (legacy behavior)
+                if not has_portraits and not has_scene_ref and reference_image:
+                    contents.append(reference_image)
+                    contents.append(
+                        "REFERENCE IMAGE ABOVE: Use this image as a visual reference. "
+                        "Maintain the exact character appearance (face, hair, clothing, colors). "
+                        "Create a new scene that is visually consistent with this reference."
+                    )
 
                 # Add the main scene prompt AFTER images and reference instructions
                 contents.append(f"GENERATE THIS SCENE: {full_prompt}")
