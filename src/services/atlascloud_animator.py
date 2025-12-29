@@ -615,13 +615,40 @@ class AtlasCloudAnimator:
                     if progress_callback:
                         progress_callback("Downloading video...", 0.9)
 
-                    # Download video
-                    video_response = requests.get(video_url, timeout=300)  # 5 minutes for download
-                    video_response.raise_for_status()
+                    # Download video with retry logic for network issues
+                    max_download_retries = 3
+                    download_success = False
+                    last_download_error = None
 
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(output_path, "wb") as f:
-                        f.write(video_response.content)
+                    for download_attempt in range(max_download_retries):
+                        try:
+                            if download_attempt > 0:
+                                wait_time = 5 * (2 ** download_attempt)  # 10s, 20s backoff
+                                logger.info(f"Retry {download_attempt + 1}/{max_download_retries} after {wait_time}s...")
+                                if progress_callback:
+                                    progress_callback(f"Download retry {download_attempt + 1}...", 0.9)
+                                time.sleep(wait_time)
+
+                            video_response = requests.get(video_url, timeout=300)  # 5 minutes for download
+                            video_response.raise_for_status()
+
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+                            with open(output_path, "wb") as f:
+                                f.write(video_response.content)
+
+                            download_success = True
+                            break
+
+                        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                            last_download_error = e
+                            logger.warning(f"Download attempt {download_attempt + 1} failed: {e}")
+
+                    if not download_success:
+                        logger.error(f"Failed to download video after {max_download_retries} attempts: {last_download_error}")
+                        logger.error(f"Video URL was: {video_url[:100]}...")
+                        if progress_callback:
+                            progress_callback("Download failed - network error", 0.0)
+                        return None
 
                     logger.info(f"Animation saved to: {output_path}")
 
