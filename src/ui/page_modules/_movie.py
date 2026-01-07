@@ -4905,7 +4905,12 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                         has_scene_image = scene.image_path and Path(scene.image_path).exists()
                         custom_start_img = getattr(scene, 'custom_start_image', None)
                         has_custom_start = custom_start_img and custom_start_img != "none" and Path(custom_start_img).exists()
-                        has_image = has_scene_image or has_custom_start
+                        # Check if using previous scene's last frame
+                        has_prev_frame = False
+                        if getattr(scene, 'use_previous_last_frame', False) and scene.index > 1:
+                            prev_s = next((ps for ps in script.scenes if ps.index == scene.index - 1), None)
+                            has_prev_frame = prev_s and prev_s.video_path and Path(prev_s.video_path).exists()
+                        has_image = has_scene_image or has_custom_start or has_prev_frame
                         has_video = scene.video_path and Path(scene.video_path).exists()
 
                         # Note: Video preview and variants are shown in the Video tab above
