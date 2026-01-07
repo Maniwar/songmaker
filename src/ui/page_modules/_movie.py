@@ -39,6 +39,202 @@ def get_readable_timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+# =============================================================================
+# PARALLEL GENERATION SYSTEM
+# Allows multiple generations to run simultaneously in background threads
+# =============================================================================
+
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Any, Dict
+import time as time_module
+
+# Global thread pool for parallel generation (persists across Streamlit reruns)
+_generation_executor: Optional[ThreadPoolExecutor] = None
+_generation_futures: Dict[str, Future] = {}
+
+
+def get_executor() -> ThreadPoolExecutor:
+    """Get or create the global thread pool executor."""
+    global _generation_executor
+    if _generation_executor is None:
+        # Allow up to 4 parallel generations
+        _generation_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="gen_")
+    return _generation_executor
+
+
+class GenerationStatus(Enum):
+    """Status of a generation task."""
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass
+class GenerationTask:
+    """A task being generated in background."""
+    id: str
+    task_type: str  # "image" or "video"
+    scene_index: int
+    description: str
+    status: GenerationStatus = GenerationStatus.RUNNING
+    progress: str = ""
+    result: Any = None
+    error: str = ""
+    started_at: float = field(default_factory=time_module.time)
+    completed_at: float = 0.0
+
+
+def get_running_generations() -> Dict[str, GenerationTask]:
+    """Get all running/completed generation tasks from session state."""
+    if "running_generations" not in st.session_state:
+        st.session_state.running_generations = {}
+    return st.session_state.running_generations
+
+
+def start_background_generation(
+    task_id: str,
+    task_type: str,
+    scene_index: int,
+    description: str,
+    generation_func: Callable,
+    *args,
+    **kwargs
+) -> str:
+    """Start a generation in background thread.
+
+    Args:
+        task_id: Unique ID for this task
+        task_type: "image" or "video"
+        scene_index: Scene index being generated
+        description: Human-readable description
+        generation_func: Function to call for generation
+        *args, **kwargs: Arguments to pass to generation_func
+
+    Returns:
+        Task ID
+    """
+    global _generation_futures
+
+    # Create task record
+    task = GenerationTask(
+        id=task_id,
+        task_type=task_type,
+        scene_index=scene_index,
+        description=description,
+    )
+
+    # Store in session state
+    generations = get_running_generations()
+    generations[task_id] = task
+
+    # Wrapper to update task status when done
+    def run_and_update():
+        try:
+            result = generation_func(*args, **kwargs)
+            task.status = GenerationStatus.COMPLETED
+            task.result = result
+            task.completed_at = time_module.time()
+            return result
+        except Exception as e:
+            task.status = GenerationStatus.FAILED
+            task.error = str(e)
+            task.completed_at = time_module.time()
+            logger.error(f"Background generation failed: {e}")
+            raise
+
+    # Submit to thread pool
+    executor = get_executor()
+    future = executor.submit(run_and_update)
+    _generation_futures[task_id] = future
+
+    return task_id
+
+
+def is_generation_running(scene_index: int, task_type: str = None) -> bool:
+    """Check if a generation is running for a scene."""
+    generations = get_running_generations()
+    for task in generations.values():
+        if task.scene_index == scene_index and task.status == GenerationStatus.RUNNING:
+            if task_type is None or task.task_type == task_type:
+                return True
+    return False
+
+
+def get_generation_for_scene(scene_index: int, task_type: str = None) -> Optional[GenerationTask]:
+    """Get the generation task for a scene if running."""
+    generations = get_running_generations()
+    for task in generations.values():
+        if task.scene_index == scene_index:
+            if task_type is None or task.task_type == task_type:
+                return task
+    return None
+
+
+def clear_completed_generations():
+    """Remove completed and failed tasks from tracking."""
+    generations = get_running_generations()
+    to_remove = [
+        task_id for task_id, task in generations.items()
+        if task.status in (GenerationStatus.COMPLETED, GenerationStatus.FAILED)
+    ]
+    for task_id in to_remove:
+        del generations[task_id]
+        if task_id in _generation_futures:
+            del _generation_futures[task_id]
+
+
+def get_generation_summary() -> dict:
+    """Get summary of all running generations."""
+    generations = get_running_generations()
+    return {
+        "running": len([t for t in generations.values() if t.status == GenerationStatus.RUNNING]),
+        "completed": len([t for t in generations.values() if t.status == GenerationStatus.COMPLETED]),
+        "failed": len([t for t in generations.values() if t.status == GenerationStatus.FAILED]),
+        "total": len(generations),
+    }
+
+
+def render_generation_status_bar():
+    """Render a compact status bar showing all running generations."""
+    generations = get_running_generations()
+    summary = get_generation_summary()
+
+    if summary["total"] == 0:
+        return  # Nothing to show
+
+    # Show running tasks
+    running_tasks = [t for t in generations.values() if t.status == GenerationStatus.RUNNING]
+    completed_tasks = [t for t in generations.values() if t.status == GenerationStatus.COMPLETED]
+    failed_tasks = [t for t in generations.values() if t.status == GenerationStatus.FAILED]
+
+    with st.container():
+        # Header row
+        col1, col2 = st.columns([5, 1])
+        with col1:
+            parts = []
+            if running_tasks:
+                parts.append(f"🔄 **{len(running_tasks)} generating**")
+            if completed_tasks:
+                parts.append(f"✅ {len(completed_tasks)} done")
+            if failed_tasks:
+                parts.append(f"❌ {len(failed_tasks)} failed")
+            st.markdown(" | ".join(parts))
+        with col2:
+            if completed_tasks or failed_tasks:
+                if st.button("Clear", key="clear_gen_btn", type="secondary"):
+                    clear_completed_generations()
+                    st.rerun()
+
+        # Show individual running tasks
+        if running_tasks:
+            for task in running_tasks:
+                elapsed = int(time_module.time() - task.started_at)
+                st.caption(f"  ↳ Scene {task.scene_index}: {task.description} ({elapsed}s)")
+
+
 def get_image_anti_prompt(visual_style: str) -> str:
     """Get the 'avoid' keywords for image generation based on visual style.
 
@@ -1572,6 +1768,12 @@ def render_characters_page() -> None:
                 or ""
             )
 
+            # Show current style being used
+            if visual_style:
+                st.caption(f"🎨 Style: **{visual_style}**")
+            else:
+                st.warning("⚠️ No visual style set. Go back to Setup to choose a style.")
+
             # Create two-column layout for portrait section
             portrait_left, portrait_right = st.columns([1, 2])
 
@@ -1842,10 +2044,10 @@ Centered composition, neutral background, professional headshot.
 
 AVOID: CGI, cartoon, anime, 3D render, digital art, stylized, artificial, plastic skin, airbrushed, smooth skin."""
                         elif is_anime:
-                            default_regen_prompt = f"""High-quality anime illustration of {char.description}.
+                            default_regen_prompt = f"""High-quality {visual_style} illustration of {char.description}.
 
 {visual_style} style, clean linework, vibrant colors.
-Professional anime character portrait, centered composition.
+Professional {visual_style} character portrait, centered composition.
 Detailed eyes, expressive face, polished illustration.
 Neutral background, studio lighting style.
 
@@ -2143,10 +2345,10 @@ Centered composition, neutral background, professional headshot.
 
 AVOID: CGI, cartoon, anime, 3D render, digital art, stylized, artificial, plastic skin, airbrushed, smooth skin."""
                     elif is_anime:
-                        default_gen_prompt = f"""High-quality anime illustration of {char.description}.
+                        default_gen_prompt = f"""High-quality {visual_style} illustration of {char.description}.
 
 {visual_style} style, clean linework, vibrant colors.
-Professional anime character portrait, centered composition.
+Professional {visual_style} character portrait, centered composition.
 Detailed eyes, expressive face, polished illustration.
 Neutral background, studio lighting style.
 
@@ -2371,8 +2573,14 @@ def _generate_single_video_inline(state, scene, generation_method: str, config, 
                     custom_start = getattr(scene, 'custom_start_image', None)
                     custom_target = getattr(scene, 'custom_target_image', None)
                     start_img = Path(custom_start) if custom_start and Path(custom_start).exists() else Path(scene.image_path)
-                    target_img = Path(custom_target) if custom_target and Path(custom_target).exists() else Path(scene.image_path)
-                    logger.info(f"[SINGLE] Seedance Pro: start={start_img.name}, target={target_img.name}")
+                    # Check if target is disabled ("none") or not set
+                    if custom_target == "none":
+                        target_img = None  # No target frame - prompt-driven animation
+                    elif custom_target and Path(custom_target).exists():
+                        target_img = Path(custom_target)
+                    else:
+                        target_img = None  # Default to no target for first scene or if not explicitly set
+                    logger.info(f"[SINGLE] Seedance Pro: start={start_img.name}, target={target_img.name if target_img else 'None'}")
                     result = animator.animate_scene(image_path=start_img, prompt=prompt,
                                                     output_path=output_path, duration_seconds=duration, resolution=resolution,
                                                     visual_style=visual_style, last_frame=target_img)
@@ -2383,8 +2591,14 @@ def _generate_single_video_inline(state, scene, generation_method: str, config, 
                     custom_start = getattr(scene, 'custom_start_image', None)
                     custom_target = getattr(scene, 'custom_target_image', None)
                     start_img = Path(custom_start) if custom_start and Path(custom_start).exists() else Path(scene.image_path)
-                    target_img = Path(custom_target) if custom_target and Path(custom_target).exists() else Path(scene.image_path)
-                    logger.info(f"[SINGLE] Seedance Fast: start={start_img.name}, target={target_img.name}")
+                    # Check if target is disabled ("none") or not set
+                    if custom_target == "none":
+                        target_img = None  # No target frame - prompt-driven animation
+                    elif custom_target and Path(custom_target).exists():
+                        target_img = Path(custom_target)
+                    else:
+                        target_img = None  # Default to no target for first scene or if not explicitly set
+                    logger.info(f"[SINGLE] Seedance Fast: start={start_img.name}, target={target_img.name if target_img else 'None'}")
                     result = animator.animate_scene(image_path=start_img, prompt=prompt,
                                                     output_path=output_path, duration_seconds=duration, resolution=resolution,
                                                     visual_style=visual_style, last_frame=target_img)
@@ -2578,7 +2792,13 @@ def _generate_all_videos_inline(state, scenes, generation_method: str, config) -
                 custom_target = getattr(scene, 'custom_target_image', None)
                 if is_seedance and has_image:
                     start_img = Path(custom_start) if custom_start and Path(custom_start).exists() else image_path
-                    target_img = Path(custom_target) if custom_target and Path(custom_target).exists() else image_path
+                    # Check if target is disabled ("none") or not set
+                    if custom_target == "none":
+                        target_img = None  # No target frame - prompt-driven animation
+                    elif custom_target and Path(custom_target).exists():
+                        target_img = Path(custom_target)
+                    else:
+                        target_img = None  # Default to no target
                     logger.info(f"[BATCH] Scene {scene.index}: Seedance start={start_img.name if start_img else 'None'}, target={target_img.name if target_img else 'None'}")
                 else:
                     start_img = image_path
@@ -3026,25 +3246,35 @@ JSON FORMATTING RULES (CRITICAL):
                         st.session_state.scene_assistant_images = []
                         st.rerun()
 
-            # Image upload section
-            img_col1, img_col2 = st.columns([3, 1])
-            with img_col1:
-                uploaded_images = st.file_uploader(
-                    "📎 Attach images (optional)",
-                    type=["png", "jpg", "jpeg", "gif", "webp"],
-                    accept_multiple_files=True,
-                    key="scene_assistant_img_upload",
-                    help="Upload images to show the AI what you're referring to"
-                )
-            with img_col2:
+            # Chat bar with paperclip attachment
+            chat_col1, chat_col2 = st.columns([1, 15])
+
+            with chat_col1:
+                # Paperclip button using popover for file upload
+                with st.popover("📎", help="Attach images"):
+                    st.markdown("**Attach Images**")
+                    uploaded_images = st.file_uploader(
+                        "Upload images",
+                        type=["png", "jpg", "jpeg", "gif", "webp"],
+                        accept_multiple_files=True,
+                        key="scene_assistant_img_upload",
+                        label_visibility="collapsed"
+                    )
+                    if uploaded_images:
+                        st.success(f"{len(uploaded_images)} image(s) ready")
+                        # Show thumbnails
+                        thumb_cols = st.columns(min(len(uploaded_images), 3))
+                        for i, img in enumerate(uploaded_images[:3]):
+                            with thumb_cols[i]:
+                                st.image(img, width=60)
+
+            with chat_col2:
+                # Show attachment indicator if images are pending
                 if uploaded_images:
-                    st.caption(f"{len(uploaded_images)} image(s) attached")
-                    # Preview thumbnails
-                    for img in uploaded_images[:2]:
-                        st.image(img, width=50)
+                    st.caption(f"📎 {len(uploaded_images)} image(s) attached")
 
             # Chat input
-            user_input = st.chat_input("e.g., 'Add more tension to scene 2' or 'Rewrite the dialogue to be funnier'")
+            user_input = st.chat_input("Type message... (use 📎 to attach images)")
             if user_input:
                 import base64
 
@@ -3201,35 +3431,14 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
     """Render a visual storyboard grid with overlay titles and video generation."""
     import base64
 
-    # AUTO-GENERATE PROMPTS: Check if scenes need prompts and auto-run setup
-    # Track by project hash to avoid re-running on every refresh
-    project_hash = f"{state.project_name}_{len(script.scenes)}"
-    auto_gen_key = f"auto_prompt_gen_{project_hash}"
-
-    # Count scenes missing prompts
+    # Check scenes missing prompts (no auto-generation - user must click Prompts button)
     scenes_missing_visual = [s for s in script.scenes if not s.visual_prompt]
     scenes_missing_video = [s for s in script.scenes if not s.video_prompt]
 
-    # Auto-generate if there are scenes without prompts and we haven't done it yet
-    if (scenes_missing_visual or scenes_missing_video) and not st.session_state.get(auto_gen_key):
+    # Show notification if prompts are missing (but don't auto-generate)
+    if scenes_missing_visual or scenes_missing_video:
         missing_count = max(len(scenes_missing_visual), len(scenes_missing_video))
-        st.info(f"🤖 Auto-generating prompts for {missing_count} scene(s)...")
-
-        # Mark as auto-generating to prevent loop
-        st.session_state[auto_gen_key] = True
-
-        # Run auto-setup with defaults (all prompts enabled)
-        _run_ai_scene_setup(
-            script, state,
-            update_direction=True,
-            update_characters=True,
-            update_visual_prompt=True,
-            update_video_prompt=True,
-            gen_method=gen_method,
-            ai_pick_models=False,
-            veo_variant=None
-        )
-        st.rerun()
+        st.info(f"💡 {missing_count} scene(s) missing prompts. Click **🤖 Prompts** to generate them.")
 
     # Quick duration metrics
     target_duration = state.config.target_duration if state.config else 180
@@ -3539,7 +3748,25 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                 # Video variants (from both per-scene and legacy folders)
                                 vid_variants = get_scene_video_variants(scene.index)
                                 if len(vid_variants) > 1:
-                                    st.caption(f"📹 {len(vid_variants)} variants")
+                                    # Create dropdown to switch between variants
+                                    current_vid = str(Path(scene.video_path).resolve()) if scene.video_path else ""
+                                    vid_idx = 0
+                                    for i, v in enumerate(vid_variants):
+                                        if str(Path(v).resolve()) == current_vid:
+                                            vid_idx = i
+                                            break
+                                    new_vid = st.selectbox(
+                                        "Video",
+                                        options=vid_variants,
+                                        index=vid_idx,
+                                        format_func=lambda x: f"📹 {Path(x).stem[-12:]}",
+                                        key=f"grid_vid_var_{scene.index}",
+                                        label_visibility="collapsed"
+                                    )
+                                    if new_vid and str(Path(new_vid).resolve()) != current_vid:
+                                        scene.video_path = str(new_vid)
+                                        save_movie_state()
+                                        st.rerun()
                         elif display_image:
                             st.image(display_image, width="stretch")
                             if display_is_last_frame:
@@ -3870,14 +4097,19 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                             key=f"img_style_ref_{scene.index}",
                                             label_visibility="collapsed"
                                         )
+                                        # Compare against the actual displayed value, not just custom_style_ref
+                                        # This handles the case where custom_style_ref is None but auto ref is shown
                                         if new_style_ref == "(auto)":
+                                            # User selected auto - clear custom ref if it was set
                                             if custom_style_ref is not None:
                                                 try:
                                                     scene.custom_style_ref = None
                                                 except Exception:
                                                     object.__setattr__(scene, 'custom_style_ref', None)
                                                 save_movie_state()
-                                        elif new_style_ref != custom_style_ref:
+                                                st.rerun()
+                                        elif new_style_ref != current_style_resolved:
+                                            # User selected a different image than what was displayed
                                             try:
                                                 scene.custom_style_ref = new_style_ref
                                             except Exception:
@@ -4316,7 +4548,7 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
 
                                         # If picking from images, show image selector
                                         if not use_prev_frame and sorted_images:
-                                            # Default to current scene's image
+                                            # Default to current scene's image (or custom if already set)
                                             default_img = custom_start_path or (str(Path(scene.image_path).resolve()) if has_scene_image else "")
                                             img_idx = sorted_images.index(default_img) if default_img in sorted_images else 0
                                             new_start_img = st.selectbox(
@@ -4327,14 +4559,17 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                                 key=f"start_img_{scene.index}",
                                                 label_visibility="collapsed"
                                             )
-                                            if new_start_img != custom_start_path:
+                                            # Compare against the actual default, not just custom_start_path
+                                            current_effective = custom_start_path or default_img
+                                            if new_start_img and new_start_img != current_effective:
                                                 try:
                                                     scene.custom_start_image = new_start_img
                                                 except Exception:
                                                     object.__setattr__(scene, 'custom_start_image', new_start_img)
                                                 save_movie_state()
-                                                # Update for immediate preview
-                                                custom_start_path = new_start_img
+                                                st.rerun()  # Refresh to show the change
+                                            # Update for immediate preview
+                                            custom_start_path = new_start_img
 
                                         # Show preview (use newly selected value if available)
                                         preview_start = None
@@ -4359,34 +4594,73 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
 
                                             # Get custom target image (separate from scene.image_path)
                                             custom_target_path = getattr(scene, 'custom_target_image', None)
-                                            # Default to scene's own image if no custom target set
-                                            effective_target = custom_target_path if (custom_target_path and Path(custom_target_path).exists()) else (scene.image_path if has_scene_image else None)
+                                            # Check if target is disabled (set to "none")
+                                            target_disabled = custom_target_path == "none"
 
-                                            # Show image picker for target frame (all project images)
+                                            # Show image picker for target frame with "None" option
                                             if sorted_images:
-                                                current_img = str(Path(effective_target).resolve()) if effective_target else ""
-                                                img_idx = sorted_images.index(current_img) if current_img in sorted_images else 0
+                                                # Add "None" option at the beginning
+                                                target_options = ["(No target frame)"] + sorted_images
+                                                if target_disabled:
+                                                    target_idx = 0  # "None" option
+                                                elif custom_target_path and custom_target_path != "none" and str(Path(custom_target_path).resolve()) in sorted_images:
+                                                    target_idx = sorted_images.index(str(Path(custom_target_path).resolve())) + 1
+                                                elif scene.image_path and str(Path(scene.image_path).resolve()) in sorted_images:
+                                                    target_idx = sorted_images.index(str(Path(scene.image_path).resolve())) + 1
+                                                else:
+                                                    target_idx = 0
+
+                                                def get_target_label(x):
+                                                    if x == "(No target frame)":
+                                                        return "🚫 None (no target)"
+                                                    return get_img_label(x)
+
                                                 new_target = st.selectbox(
                                                     "Select target",
-                                                    options=sorted_images,
-                                                    index=img_idx,
-                                                    format_func=get_img_label,
+                                                    options=target_options,
+                                                    index=target_idx,
+                                                    format_func=get_target_label,
                                                     key=f"target_img_{scene.index}",
                                                     label_visibility="collapsed"
                                                 )
-                                                if new_target != custom_target_path:
-                                                    try:
-                                                        scene.custom_target_image = new_target
-                                                    except Exception:
-                                                        object.__setattr__(scene, 'custom_target_image', new_target)
-                                                    save_movie_state()
-                                                    # Update effective_target to show correct preview immediately
-                                                    effective_target = new_target
 
-                                            # Show preview (use new_target if set, otherwise effective_target)
-                                            preview_target = new_target if (sorted_images and new_target) else effective_target
-                                            if preview_target and Path(preview_target).exists():
-                                                st.image(str(preview_target), width="stretch")
+                                                # Determine the effective current target for comparison
+                                                if custom_target_path == "none":
+                                                    current_effective_target = "(No target frame)"
+                                                elif custom_target_path:
+                                                    current_effective_target = custom_target_path
+                                                elif scene.image_path:
+                                                    current_effective_target = str(Path(scene.image_path).resolve())
+                                                else:
+                                                    current_effective_target = "(No target frame)"
+
+                                                # Save selection if changed
+                                                if new_target == "(No target frame)":
+                                                    if current_effective_target != "(No target frame)":
+                                                        try:
+                                                            scene.custom_target_image = "none"
+                                                        except Exception:
+                                                            object.__setattr__(scene, 'custom_target_image', "none")
+                                                        save_movie_state()
+                                                        st.rerun()
+                                                    effective_target = None
+                                                else:
+                                                    if new_target != current_effective_target:
+                                                        try:
+                                                            scene.custom_target_image = new_target
+                                                        except Exception:
+                                                            object.__setattr__(scene, 'custom_target_image', new_target)
+                                                        save_movie_state()
+                                                        st.rerun()
+                                                    effective_target = new_target
+                                            else:
+                                                effective_target = None
+
+                                            # Show preview
+                                            if effective_target and Path(effective_target).exists():
+                                                st.image(str(effective_target), width="stretch")
+                                            elif effective_target is None:
+                                                st.info("No target - animation will be prompt-driven")
                                             else:
                                                 st.warning("No target frame")
 
@@ -4512,6 +4786,8 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                         has_image = scene.image_path and Path(scene.image_path).exists()
                         has_video = scene.video_path and Path(scene.video_path).exists()
 
+                        # Note: Video preview and variants are shown in the Video tab above
+
                         if is_video_mode:
                             btn1, btn2, btn3 = st.columns(3)
                         else:
@@ -4535,6 +4811,7 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                             with btn3:
                                 # Video button
                                 can_gen_video = has_image or gen_method == "veo3"
+
                                 if has_video:
                                     if st.button("🔁", key=f"vid_{scene.index}", use_container_width=True,
                                                 help="Regenerate video"):
@@ -9676,6 +9953,7 @@ def _render_movie_scene_card(state, scene, generation_method: str, model_info: d
     btn_col1, btn_col2 = st.columns(2)
     with btn_col1:
         can_gen = has_image or generation_method == "veo3"
+
         if can_gen and st.button("🎬 Gen Video", key=f"v_gen_{scene.index}", use_container_width=True,
                                   help="Generate video for this scene"):
             _generate_single_scene_video(state, scene, generation_method, defaults)
@@ -9692,8 +9970,288 @@ def _render_movie_scene_card(state, scene, generation_method: str, model_info: d
             st.rerun()
 
 
+def _generate_video_core(
+    scene_index: int,
+    scene_model: str,
+    output_path: Path,
+    duration: int,
+    resolution: str,
+    prompt: str,
+    visual_style: str,
+    input_image: Optional[Path],
+    previous_video: Optional[Path],
+    use_prev_video: bool,
+    first_frame_override: Optional[Path],
+    custom_start: Optional[str],
+    custom_target: Optional[str],
+    wan_config: Optional[dict],
+    veo_model: str,
+) -> Optional[Path]:
+    """Core video generation logic without UI - can run in background thread.
+
+    Returns:
+        Path to generated video, or None if failed
+    """
+    try:
+        if scene_model == "veo3":
+            from src.services.veo3_generator import Veo3Generator
+            generator = Veo3Generator(
+                model=veo_model,
+                resolution=resolution,
+                duration=duration,
+            )
+            # For Veo, we'd need the full scene/script - simplified here
+            # This path is less common for background gen
+            logger.warning("Veo3 background generation not fully supported yet")
+            return None
+
+        # WAN or Seedance
+        from src.services.atlascloud_animator import AtlasCloudAnimator, WanModel, SeedanceModel
+
+        if scene_model in ("seedance15", "seedance15_i2v"):
+            animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
+
+            # Determine start image
+            if custom_start and Path(custom_start).exists():
+                start_image = Path(custom_start)
+            elif first_frame_override and first_frame_override.exists():
+                start_image = first_frame_override
+            else:
+                start_image = input_image
+
+            # Determine target image
+            if custom_target == "none":
+                target_image = None
+            elif custom_target and Path(custom_target).exists():
+                target_image = Path(custom_target)
+            else:
+                target_image = None
+
+            result = animator.animate_scene(
+                image_path=start_image,
+                prompt=prompt,
+                output_path=output_path,
+                duration_seconds=duration,
+                resolution=resolution,
+                visual_style=visual_style,
+                last_frame=target_image,
+            )
+            return result
+
+        elif scene_model in ("seedance_fast", "seedance_fast_i2v"):
+            animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO_FAST)
+
+            if custom_start and Path(custom_start).exists():
+                start_image = Path(custom_start)
+            elif first_frame_override and first_frame_override.exists():
+                start_image = first_frame_override
+            else:
+                start_image = input_image
+
+            if custom_target == "none":
+                target_image = None
+            elif custom_target and Path(custom_target).exists():
+                target_image = Path(custom_target)
+            else:
+                target_image = None
+
+            result = animator.animate_scene(
+                image_path=start_image,
+                prompt=prompt,
+                output_path=output_path,
+                duration_seconds=duration,
+                resolution=resolution,
+                visual_style=visual_style,
+                last_frame=target_image,
+            )
+            return result
+
+        elif scene_model in ("wan26", "wan26_i2v"):
+            animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
+            result = animator.animate_scene(
+                image_path=input_image,
+                prompt=prompt,
+                output_path=output_path,
+                duration_seconds=duration,
+                resolution=resolution,
+                visual_style=visual_style,
+                guidance_scale=wan_config.get("guidance_scale") if wan_config else None,
+                flow_shift=wan_config.get("flow_shift") if wan_config else None,
+                inference_steps=wan_config.get("inference_steps") if wan_config else None,
+                shot_type=wan_config.get("shot_type") if wan_config else None,
+                seed=wan_config.get("seed", 0) if wan_config else 0,
+            )
+            return result
+
+        elif previous_video and use_prev_video:
+            animator = AtlasCloudAnimator(model=WanModel.VIDEO_TO_VIDEO)
+            result = animator.animate_scene(
+                image_path=input_image,
+                prompt=prompt,
+                output_path=output_path,
+                duration_seconds=duration,
+                resolution=resolution,
+                source_video=previous_video,
+                visual_style=visual_style,
+                guidance_scale=wan_config.get("guidance_scale") if wan_config else None,
+                flow_shift=wan_config.get("flow_shift") if wan_config else None,
+                inference_steps=wan_config.get("inference_steps") if wan_config else None,
+                shot_type=wan_config.get("shot_type") if wan_config else None,
+                seed=wan_config.get("seed", 0) if wan_config else 0,
+            )
+            return result
+
+        else:
+            animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
+            result = animator.animate_scene(
+                image_path=input_image,
+                prompt=prompt,
+                output_path=output_path,
+                duration_seconds=duration,
+                resolution=resolution,
+                visual_style=visual_style,
+                guidance_scale=wan_config.get("guidance_scale") if wan_config else None,
+                flow_shift=wan_config.get("flow_shift") if wan_config else None,
+                inference_steps=wan_config.get("inference_steps") if wan_config else None,
+                shot_type=wan_config.get("shot_type") if wan_config else None,
+                seed=wan_config.get("seed", 0) if wan_config else 0,
+            )
+            return result
+
+    except Exception as e:
+        logger.error(f"Background video generation failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+
+
+def start_background_video_generation(state, scene, generation_method: str, defaults: dict) -> Optional[str]:
+    """Start video generation in background thread.
+
+    Returns:
+        Task ID if started, None if already running for this scene
+    """
+    if is_generation_running(scene.index, "video"):
+        return None  # Already running
+
+    scene_model = getattr(scene, 'generation_model', None) or generation_method
+    output_dir = get_scene_video_dir(scene.index)
+    timestamp = get_readable_timestamp()
+    output_path = output_dir / f"video_{timestamp}.mp4"
+
+    duration = scene.get_clip_duration(scene_model)
+    resolution = getattr(scene, 'resolution', None) or defaults.get("resolution", "720p")
+    prompt = getattr(scene, 'video_prompt', None) or f"{scene.direction.setting}. {scene.direction.camera}."
+    visual_style = state.config.visual_style if state.config else (state.script.visual_style if state.script else "")
+
+    # Get image path
+    input_image = Path(scene.image_path) if scene.image_path else None
+
+    # Get continuity options from session state before starting thread
+    use_prev_video = st.session_state.get("use_prev_scene_video", False)
+
+    # Find previous video
+    previous_video = None
+    if use_prev_video and scene.index > 1:
+        prev_scene = next((s for s in state.script.scenes if s.index == scene.index - 1), None)
+        if prev_scene and prev_scene.video_path and Path(prev_scene.video_path).exists():
+            previous_video = Path(prev_scene.video_path)
+
+    # Get first frame override
+    first_frame_override = None
+    if getattr(scene, 'use_previous_last_frame', False) and scene.index > 1:
+        prev_scene = next((s for s in state.script.scenes if s.index == scene.index - 1), None)
+        if prev_scene and prev_scene.video_path and Path(prev_scene.video_path).exists():
+            extracted = extract_last_frame_from_video(
+                Path(prev_scene.video_path),
+                output_dir / "continuity_frames"
+            )
+            if extracted:
+                first_frame_override = extracted
+
+    # Custom start/target
+    custom_start = getattr(scene, 'custom_start_image', None)
+    custom_target = getattr(scene, 'custom_target_image', None)
+
+    # WAN config
+    wan_config = None
+    if state.config:
+        wan_config = {
+            "guidance_scale": state.config.wan_guidance_scale,
+            "flow_shift": state.config.wan_flow_shift,
+            "inference_steps": state.config.wan_inference_steps,
+            "shot_type": state.config.wan_shot_type,
+            "seed": state.config.wan_seed,
+        }
+
+    # Veo model variant
+    from src.config import config as app_config
+    veo_model = getattr(scene, 'veo_model_variant', None) or \
+               (app_config.veo_model if hasattr(app_config, 'veo_model') else "veo-3.1-generate-preview")
+
+    # Create task ID
+    task_id = f"video_{scene.index}_{timestamp}"
+
+    # Wrapper function that updates scene when done
+    def generate_and_save():
+        result = _generate_video_core(
+            scene_index=scene.index,
+            scene_model=scene_model,
+            output_path=output_path,
+            duration=duration,
+            resolution=resolution,
+            prompt=prompt,
+            visual_style=visual_style,
+            input_image=input_image,
+            previous_video=previous_video,
+            use_prev_video=use_prev_video,
+            first_frame_override=first_frame_override,
+            custom_start=custom_start,
+            custom_target=custom_target,
+            wan_config=wan_config,
+            veo_model=veo_model,
+        )
+        if result:
+            # Write result path to a completion file for the main thread to pick up
+            completion_file = output_dir / f".completed_{task_id}"
+            completion_file.write_text(str(result))
+            logger.info(f"Background generation complete: {result}")
+        return result
+
+    # Start in background
+    start_background_generation(
+        task_id=task_id,
+        task_type="video",
+        scene_index=scene.index,
+        description=f"Video {scene_model}",
+        generation_func=generate_and_save,
+    )
+
+    return task_id
+
+
+def check_and_apply_completed_generations(state):
+    """Check for completed background generations and apply results to scenes."""
+    generations = get_running_generations()
+
+    for task_id, task in list(generations.items()):
+        if task.status == GenerationStatus.COMPLETED and task.task_type == "video":
+            scene = next((s for s in state.script.scenes if s.index == task.scene_index), None)
+            if scene:
+                # Check for completion file
+                output_dir = get_scene_video_dir(task.scene_index)
+                completion_file = output_dir / f".completed_{task_id}"
+                if completion_file.exists():
+                    result_path = completion_file.read_text().strip()
+                    if Path(result_path).exists():
+                        scene.video_path = result_path
+                        save_movie_state()
+                        logger.info(f"Applied background generation result to scene {task.scene_index}")
+                    completion_file.unlink()  # Clean up
+
+
 def _generate_single_scene_video(state, scene, generation_method: str, defaults: dict) -> None:
-    """Generate video for a single scene."""
+    """Generate video for a single scene (blocking version with UI feedback)."""
     import time as time_module
 
     scene_model = getattr(scene, 'generation_model', None) or generation_method
@@ -9803,22 +10361,17 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
 
                     # Check for custom target image (user-selected from UI)
                     custom_target = getattr(scene, 'custom_target_image', None)
-                    if custom_target and Path(custom_target).exists():
+                    if custom_target == "none":
+                        # Target explicitly disabled - prompt-driven animation
+                        target_image = None
+                        logger.info(f"Scene {scene.index}: Target disabled - using prompt-driven animation")
+                    elif custom_target and Path(custom_target).exists():
                         target_image = Path(custom_target)
                         logger.info(f"Scene {scene.index}: Using custom target image: {target_image.name}")
-                    elif scene.image_path and Path(scene.image_path).exists():
-                        # Default: use scene's own image as target (for smooth transition)
-                        target_image = Path(scene.image_path)
-                        logger.info(f"Scene {scene.index}: Using scene image as target: {target_image.name}")
                     else:
-                        # No target available - generate scene image
-                        _generate_single_scene_image(scene, state.script, state)
-                        if scene.image_path and Path(scene.image_path).exists():
-                            target_image = Path(scene.image_path)
-                            logger.info(f"Scene {scene.index}: Generated scene image as target: {target_image.name}")
-                        else:
-                            target_image = None
-                            logger.warning(f"Scene {scene.index}: No target image available")
+                        # No target set - default to None (prompt-driven)
+                        target_image = None
+                        logger.info(f"Scene {scene.index}: No target set - using prompt-driven animation")
 
                     logger.info(f"Scene {scene.index}: Seedance dual-image - start={start_image.name}, target={target_image.name if target_image else 'None'}")
 
@@ -9847,22 +10400,17 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
 
                     # Check for custom target image (user-selected from UI)
                     custom_target = getattr(scene, 'custom_target_image', None)
-                    if custom_target and Path(custom_target).exists():
+                    if custom_target == "none":
+                        # Target explicitly disabled - prompt-driven animation
+                        target_image = None
+                        logger.info(f"Scene {scene.index}: Target disabled - using prompt-driven animation")
+                    elif custom_target and Path(custom_target).exists():
                         target_image = Path(custom_target)
                         logger.info(f"Scene {scene.index}: Using custom target image: {target_image.name}")
-                    elif scene.image_path and Path(scene.image_path).exists():
-                        # Default: use scene's own image as target (for smooth transition)
-                        target_image = Path(scene.image_path)
-                        logger.info(f"Scene {scene.index}: Using scene image as target: {target_image.name}")
                     else:
-                        # No target available - generate scene image
-                        _generate_single_scene_image(scene, state.script, state)
-                        if scene.image_path and Path(scene.image_path).exists():
-                            target_image = Path(scene.image_path)
-                            logger.info(f"Scene {scene.index}: Generated scene image as target: {target_image.name}")
-                        else:
-                            target_image = None
-                            logger.warning(f"Scene {scene.index}: No target image available")
+                        # No target set - default to None (prompt-driven)
+                        target_image = None
+                        logger.info(f"Scene {scene.index}: No target set - using prompt-driven animation")
 
                     logger.info(f"Scene {scene.index}: Seedance Fast dual-image - start={start_image.name}, target={target_image.name if target_image else 'None'}")
 
@@ -10131,13 +10679,17 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
 
                 # Check for custom target image (user-selected from UI)
                 custom_target = getattr(scene, 'custom_target_image', None)
-                if custom_target and Path(custom_target).exists():
+                if custom_target == "none":
+                    # Target explicitly disabled - prompt-driven animation
+                    target_image = None
+                    logger.info(f"Scene {scene.index}: Target disabled - using prompt-driven animation")
+                elif custom_target and Path(custom_target).exists():
                     target_image = Path(custom_target)
                     logger.info(f"Scene {scene.index}: Using custom target image: {target_image.name}")
-                elif scene.image_path and Path(scene.image_path).exists():
-                    target_image = Path(scene.image_path)
                 else:
-                    target_image = start_image  # Fallback to start image
+                    # No target set - default to None (prompt-driven)
+                    target_image = None
+                    logger.info(f"Scene {scene.index}: No target set - using prompt-driven animation")
 
                 # Generate video with start and target images
                 logger.info(f"Scene {scene.index}: Seedance - start={start_image.name}, target={target_image.name if target_image else 'None'}")
@@ -10192,13 +10744,17 @@ def _generate_all_movie_scenes(state, config, use_char_refs: bool, use_scene_con
 
                 # Check for custom target image (user-selected from UI)
                 custom_target = getattr(scene, 'custom_target_image', None)
-                if custom_target and Path(custom_target).exists():
+                if custom_target == "none":
+                    # Target explicitly disabled - prompt-driven animation
+                    target_image = None
+                    logger.info(f"Scene {scene.index}: Target disabled - using prompt-driven animation")
+                elif custom_target and Path(custom_target).exists():
                     target_image = Path(custom_target)
                     logger.info(f"Scene {scene.index}: Using custom target image: {target_image.name}")
-                elif scene.image_path and Path(scene.image_path).exists():
-                    target_image = Path(scene.image_path)
                 else:
-                    target_image = start_image
+                    # No target set - default to None (prompt-driven)
+                    target_image = None
+                    logger.info(f"Scene {scene.index}: No target set - using prompt-driven animation")
 
                 # Generate video with start and target images
                 logger.info(f"Scene {scene.index}: Seedance Fast - start={start_image.name}, target={target_image.name if target_image else 'None'}")
@@ -10371,14 +10927,16 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
 
                     # Check for custom target image (user-selected from UI)
                     custom_target = getattr(scene, 'custom_target_image', None)
-                    if custom_target and Path(custom_target).exists():
+                    if custom_target == "none":
+                        # Target explicitly disabled - prompt-driven animation
+                        target_image = None
+                    elif custom_target and Path(custom_target).exists():
                         target_image = Path(custom_target)
-                    elif scene.image_path and Path(scene.image_path).exists():
-                        target_image = Path(scene.image_path)
                     else:
-                        target_image = start_image
+                        # No target set - default to None (prompt-driven)
+                        target_image = None
 
-                    logger.info(f"Scene {scene.index}: Seedance - start={start_image.name if start_image else 'None'}, target={target_image.name if target_image else 'None'}")
+                    logger.info(f"Scene {scene.index}: Seedance - start={start_image.name if start_image else 'None'}, target={target_image.name if target_image else 'None (prompt-driven)'}")
 
                     # Generate video first (without lip sync)
                     result = seedance_animator.animate_scene(
@@ -10426,12 +10984,16 @@ def _render_mixed_model_generation(state, config, use_char_refs: bool, use_scene
                     custom_start = getattr(scene, 'custom_start_image', None)
                     custom_target = getattr(scene, 'custom_target_image', None)
                     start_image = Path(custom_start) if custom_start and Path(custom_start).exists() else Path(scene.image_path)
-                    if custom_target and Path(custom_target).exists():
+                    if custom_target == "none":
+                        # Target explicitly disabled - prompt-driven animation
+                        target_image = None
+                    elif custom_target and Path(custom_target).exists():
                         target_image = Path(custom_target)
-                    elif scene.image_path and Path(scene.image_path).exists():
-                        target_image = Path(scene.image_path)
                     else:
-                        target_image = start_image
+                        # No target set - default to None (prompt-driven)
+                        target_image = None
+
+                    logger.info(f"Scene {scene.index}: Seedance Fast - start={start_image.name if start_image else 'None'}, target={target_image.name if target_image else 'None (prompt-driven)'}")
 
                     # Generate video first (without lip sync)
                     result = seedance_fast_animator.animate_scene(

@@ -781,6 +781,18 @@ def load_movie_state(filepath: Path) -> bool:
 
         state_dict = save_data.get("state", save_data)
 
+        # Clear all project-related session state keys so they get re-initialized from loaded project
+        # This prevents stale values from previous sessions conflicting with loaded project
+        prefixes_to_clear = ("setup_", "scene_", "scenes_", "script_", "visuals_", "selected_scene_")
+        exact_keys_to_clear = {"max_step_reached"}
+        keys_to_clear = [
+            k for k in list(st.session_state.keys())
+            if (k.startswith(prefixes_to_clear) or k in exact_keys_to_clear)
+            and k != "movie_mode"  # Preserve movie_mode flag
+        ]
+        for k in keys_to_clear:
+            del st.session_state[k]
+
         # Handle backward compatibility for old projects without project_dir
         if "project_dir" not in state_dict:
             state_dict["project_dir"] = None
@@ -1180,10 +1192,16 @@ def render_movie_project_sidebar() -> None:
             if "movie_state" in st.session_state:
                 del st.session_state["movie_state"]
             # Clear related session state keys (but preserve movie_mode to stay in movie mode!)
+            prefixes_to_clear = (
+                "movie_", "script_", "scene_", "scenes_", "dialogue_", "voice_",
+                "visual_", "visuals_", "char_", "setup_", "selected_scene_"
+            )
+            exact_keys_to_clear = {"max_step_reached"}
+            preserve_keys = {"movie_mode", "movie_new_project_btn", "movie_exit_to_song_btn"}
             keys_to_clear = [
-                k for k in st.session_state.keys()
-                if k.startswith(("movie_", "script_", "scene_", "dialogue_", "voice_", "visual_", "char_"))
-                and k not in ("movie_mode", "movie_new_project_btn", "movie_exit_to_song_btn")
+                k for k in list(st.session_state.keys())
+                if (k.startswith(prefixes_to_clear) or k in exact_keys_to_clear)
+                and k not in preserve_keys
             ]
             for k in keys_to_clear:
                 del st.session_state[k]

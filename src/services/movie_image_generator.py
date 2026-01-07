@@ -399,11 +399,11 @@ Centered composition, neutral background, professional headshot.
 
 AVOID: CGI, cartoon, anime, 3D render, digital art, stylized, artificial, plastic skin, airbrushed, smooth skin."""
                 elif is_anime:
-                    # Anime/manga portrait prompt
-                    prompt = f"""High-quality anime illustration of {character.description}.
+                    # Anime/manga/cartoon style portrait prompt
+                    prompt = f"""High-quality {effective_style} illustration of {character.description}.
 
 {effective_style} style, clean linework, vibrant colors.
-Professional anime character portrait, centered composition.
+Professional {effective_style} character portrait, centered composition.
 Detailed eyes, expressive face, polished illustration.
 Neutral background, studio lighting style.
 
