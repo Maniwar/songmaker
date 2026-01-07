@@ -2532,6 +2532,47 @@ def _generate_single_video_inline(state, scene, generation_method: str, config, 
         first_frame = Path(scene.image_path)
         logger.info(f"Using scene image as first frame: {first_frame.name}")
 
+    # Console log all video generation inputs
+    print(f"\n{'='*70}")
+    print(f"🎬 VIDEO GENERATION REQUEST - Scene {scene.index}")
+    print(f"{'='*70}")
+    print(f"MODEL: {scene_model} ({model_names.get(scene_model, scene_model)})")
+    print(f"DURATION: {duration}s")
+    print(f"RESOLUTION: {resolution}")
+    print(f"OUTPUT: {output_path}")
+    print(f"{'─'*70}")
+    print(f"📸 INPUT IMAGES:")
+    # Start frame
+    custom_start = getattr(scene, 'custom_start_image', None)
+    if custom_start and Path(custom_start).exists():
+        print(f"   Start Frame:  {Path(custom_start).name} (custom)")
+    elif scene.image_path and Path(scene.image_path).exists():
+        print(f"   Start Frame:  {Path(scene.image_path).name} (scene image)")
+    else:
+        print(f"   Start Frame:  None")
+    # Target frame (for Seedance)
+    custom_target = getattr(scene, 'custom_target_image', None)
+    if custom_target == "none":
+        print(f"   Target Frame: None (disabled - prompt-driven)")
+    elif custom_target and Path(custom_target).exists():
+        print(f"   Target Frame: {Path(custom_target).name} (custom)")
+    elif scene.image_path and Path(scene.image_path).exists():
+        print(f"   Target Frame: {Path(scene.image_path).name} (scene image)")
+    else:
+        print(f"   Target Frame: None")
+    # Previous video (for V2V)
+    if previous_video:
+        print(f"   Prev Video:   {previous_video.name} (V2V continuity)")
+    # Character portraits
+    if reference_images:
+        print(f"   Char Refs:    {len(reference_images)} portraits")
+        for i, ref in enumerate(reference_images[:3]):
+            print(f"      [{i+1}] {ref.name}")
+    print(f"{'─'*70}")
+    print(f"📝 PROMPT (full):")
+    print(f"   {prompt}")
+    print(f"{'='*70}\n")
+
     with st.status(f"Generating with {model_names.get(scene_model, scene_model)}...", expanded=True) as status:
         try:
             result = None
@@ -2555,12 +2596,15 @@ def _generate_single_video_inline(state, scene, generation_method: str, config, 
 
                 # Select appropriate model based on variant
                 is_t2v = "_t2v" in scene_model  # Text-to-video mode
-                has_image = scene.image_path and Path(scene.image_path).exists()
+                has_scene_image = scene.image_path and Path(scene.image_path).exists()
+                custom_start = getattr(scene, 'custom_start_image', None)
+                has_custom_start = custom_start and custom_start != "none" and Path(custom_start).exists()
+                has_image = has_scene_image or has_custom_start
 
                 # Check if we need an image but don't have one
                 if not is_t2v and not has_image:
                     status.update(label="Error: No image for I2V mode", state="error")
-                    st.error("Image-to-Video requires a scene image. Generate one first or use T2V mode.")
+                    st.error("Image-to-Video requires a scene image or custom start frame. Generate one first or use T2V mode.")
                     return
 
                 # Get visual style for conditional negative prompts
@@ -3496,9 +3540,23 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
             with btn_col3:
                 # Determine which scenes can have videos generated
                 scenes_needing_video = [s for s in script.scenes if not (s.video_path and Path(s.video_path).exists())]
-                # For I2V modes, filter to scenes with images
+                # For I2V modes, filter to scenes with start frames (image, custom, or prev frame)
                 if gen_method in ["wan26", "seedance15", "seedance_fast"]:
-                    scenes_needing_video = [s for s in scenes_needing_video if s.image_path and Path(s.image_path).exists()]
+                    def has_start_image(s):
+                        # Check scene image
+                        if s.image_path and Path(s.image_path).exists():
+                            return True
+                        # Check custom start image
+                        custom = getattr(s, 'custom_start_image', None)
+                        if custom and custom != "none" and Path(custom).exists():
+                            return True
+                        # Check if using previous scene's last frame
+                        if getattr(s, 'use_previous_last_frame', False) and s.index > 1:
+                            prev = next((ps for ps in script.scenes if ps.index == s.index - 1), None)
+                            if prev and prev.video_path and Path(prev.video_path).exists():
+                                return True
+                        return False
+                    scenes_needing_video = [s for s in scenes_needing_video if has_start_image(s)]
 
                 btn_label = f"🎬 Videos ({len(scenes_needing_video)})" if scenes_needing_video else "🎬 Done"
                 if st.button(btn_label, use_container_width=True,
@@ -3510,8 +3568,23 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
     # Batch video generation
     if st.session_state.get("generate_all_videos") and is_video_mode:
         scenes_needing_video = [s for s in script.scenes if not (s.video_path and Path(s.video_path).exists())]
+        # For I2V modes, filter to scenes with images (including custom start or prev frame)
         if gen_method in ["wan26", "seedance15", "seedance_fast"]:
-            scenes_needing_video = [s for s in scenes_needing_video if s.image_path and Path(s.image_path).exists()]
+            def has_start_frame(s):
+                # Check scene image
+                if s.image_path and Path(s.image_path).exists():
+                    return True
+                # Check custom start image
+                custom = getattr(s, 'custom_start_image', None)
+                if custom and custom != "none" and Path(custom).exists():
+                    return True
+                # Check if using previous scene's last frame
+                if getattr(s, 'use_previous_last_frame', False) and s.index > 1:
+                    prev = next((ps for ps in script.scenes if ps.index == s.index - 1), None)
+                    if prev and prev.video_path and Path(prev.video_path).exists():
+                        return True
+                return False
+            scenes_needing_video = [s for s in scenes_needing_video if has_start_frame(s)]
         if scenes_needing_video:
             _generate_all_videos_inline(state, scenes_needing_video, gen_method, state.config)
         st.session_state.generate_all_videos = False
@@ -3999,10 +4072,21 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                             # Get style reference - check custom first, then auto (previous scene)
                             custom_style_ref = getattr(scene, 'custom_style_ref', None)
                             auto_style_ref_path = None
+                            auto_style_ref_source = None
                             if scene.index > 1:
                                 prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
-                                if prev_scene and prev_scene.image_path and Path(prev_scene.image_path).exists():
-                                    auto_style_ref_path = prev_scene.image_path
+                                if prev_scene:
+                                    # Priority 1: Last frame from previous video (best for continuity)
+                                    if prev_scene.video_path and Path(prev_scene.video_path).exists():
+                                        cache_dir = get_project_dir() / "cache" / "frames"
+                                        extracted = extract_last_frame_from_video(Path(prev_scene.video_path), cache_dir)
+                                        if extracted and extracted.exists():
+                                            auto_style_ref_path = str(extracted)
+                                            auto_style_ref_source = "prev_video_frame"
+                                    # Priority 2: Previous scene's image
+                                    if not auto_style_ref_path and prev_scene.image_path and Path(prev_scene.image_path).exists():
+                                        auto_style_ref_path = prev_scene.image_path
+                                        auto_style_ref_source = "prev_image"
                             style_ref_path = custom_style_ref if (custom_style_ref and Path(custom_style_ref).exists()) else auto_style_ref_path
 
                             # === IMAGE GENERATION SECTION ===
@@ -4049,7 +4133,12 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
 
                             def get_img_opt_label(path):
                                 if path == "(auto)":
-                                    return "(auto)"
+                                    if auto_style_ref_source == "prev_video_frame":
+                                        return "🎬 (auto: prev video frame)"
+                                    elif auto_style_ref_source == "prev_image":
+                                        return "🖼️ (auto: prev scene image)"
+                                    else:
+                                        return "(auto: none)"
                                 p = Path(path)
                                 # Check if it's a character portrait
                                 for char_id, char_path in char_portrait_paths.items():
@@ -4200,8 +4289,10 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                             if st.button(gen_img_label, key=f"gen_scene_img_{scene.index}",
                                         use_container_width=True, type="primary"):
                                 print(f"\n🎯 Generate Image button clicked for Scene {scene.index}")
-                                _generate_single_scene_image(scene, script, state)
-                                st.rerun()
+                                success = _generate_single_scene_image(scene, script, state)
+                                if success:
+                                    st.rerun()
+                                # On failure, don't rerun - let the error message display
 
                             # === VIDEO GENERATION SECTION ===
                             st.markdown("---")
@@ -4216,8 +4307,10 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                             is_seedance_disp = "seedance" in str(scene_gen_model_disp).lower()
                             custom_start = getattr(scene, 'custom_start_image', None)
                             custom_target = getattr(scene, 'custom_target_image', None)
-                            has_custom_start = custom_start and Path(custom_start).exists()
-                            has_custom_target = custom_target and Path(custom_target).exists()
+                            has_custom_start = custom_start and custom_start != "none" and Path(custom_start).exists()
+                            # Check for explicit "no target" selection vs actual custom target
+                            target_disabled = custom_target == "none"
+                            has_custom_target = custom_target and custom_target != "none" and Path(custom_target).exists()
 
                             if is_seedance_disp:
                                 st.markdown("**Input Images (Seedance I2V - Start + Target):**")
@@ -4234,10 +4327,12 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                         st.warning("❌ Missing")
                                 with img_col2:
                                     st.caption("🎯 Target Frame")
-                                    if has_custom_target:
+                                    if target_disabled:
+                                        st.info("🚫 No target (prompt-driven)")
+                                    elif has_custom_target:
                                         st.image(custom_target, width=100)
                                         st.caption(f"✅ Custom: {Path(custom_target).stem[-15:]}")
-                                    elif has_scene_image:
+                                    elif has_scene_image and not target_disabled:
                                         st.image(scene.image_path, width=100)
                                         st.caption("✅ Scene image")
                                     else:
@@ -4486,8 +4581,9 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                     # Get custom image paths
                                     custom_start_path = getattr(scene, 'custom_start_image', None)
                                     custom_target_path = getattr(scene, 'custom_target_image', None)
-                                    has_custom_start = custom_start_path and Path(custom_start_path).exists()
-                                    has_custom_target = custom_target_path and Path(custom_target_path).exists()
+                                    has_custom_start = custom_start_path and custom_start_path != "none" and Path(custom_start_path).exists()
+                                    target_disabled_badge = custom_target_path == "none"
+                                    has_custom_target = custom_target_path and custom_target_path != "none" and Path(custom_target_path).exists()
 
                                     badge_col1, badge_col2, badge_col3 = st.columns(3)
                                     with badge_col1:
@@ -4502,7 +4598,9 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                             st.error("🎬 Start: Missing!")
                                     with badge_col2:
                                         if is_seedance:
-                                            if has_custom_target:
+                                            if target_disabled_badge:
+                                                st.info("🎯 Target: None (prompt)")
+                                            elif has_custom_target:
                                                 target_label = get_img_label(str(Path(custom_target_path).resolve())) if str(Path(custom_target_path).resolve()) in all_project_images else Path(custom_target_path).stem[-10:]
                                                 st.success(f"🎯 Target: {target_label}")
                                             elif has_scene_image:
@@ -4550,7 +4648,18 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                         if not use_prev_frame and sorted_images:
                                             # Default to current scene's image (or custom if already set)
                                             default_img = custom_start_path or (str(Path(scene.image_path).resolve()) if has_scene_image else "")
-                                            img_idx = sorted_images.index(default_img) if default_img in sorted_images else 0
+
+                                            # Find the correct index - prioritize current scene's images
+                                            if default_img in sorted_images:
+                                                img_idx = sorted_images.index(default_img)
+                                            else:
+                                                # Find first image from current scene as fallback
+                                                current_scene_imgs = [p for p in sorted_images if all_project_images.get(p, (0,))[0] == scene.index]
+                                                if current_scene_imgs:
+                                                    img_idx = sorted_images.index(current_scene_imgs[0])
+                                                else:
+                                                    img_idx = 0  # Last resort fallback
+
                                             new_start_img = st.selectbox(
                                                 "Select start image",
                                                 options=sorted_images,
@@ -4573,20 +4682,24 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
 
                                         # Show preview (use newly selected value if available)
                                         preview_start = None
-                                        if use_prev_frame and extracted_frame_path:
-                                            preview_start = str(extracted_frame_path)
-                                        elif not use_prev_frame and sorted_images:
-                                            # Use the value from dropdown
-                                            preview_start = new_start_img
-                                        elif custom_start_path and Path(custom_start_path).exists():
-                                            preview_start = custom_start_path
-                                        elif has_scene_image:
-                                            preview_start = str(scene.image_path)
-
-                                        if preview_start and Path(preview_start).exists():
-                                            st.image(preview_start, width="stretch")
-                                        else:
-                                            st.warning("No start frame")
+                                        if use_prev_frame:
+                                            # User selected "prev_frame" - show extracted frame or error
+                                            if extracted_frame_path and Path(extracted_frame_path).exists():
+                                                preview_start = str(extracted_frame_path)
+                                                st.image(preview_start, width="stretch")
+                                                st.caption("📸 Last frame from prev video")
+                                            else:
+                                                st.error("⚠️ Failed to extract last frame from previous video")
+                                                st.caption("Switch to 'Pick from images' or regenerate previous video")
+                                        elif sorted_images:
+                                            # User selected "pick_image" - use dropdown selection
+                                            preview_start = new_start_img if 'new_start_img' in dir() else (custom_start_path or (str(Path(scene.image_path).resolve()) if has_scene_image else None))
+                                            if preview_start and Path(preview_start).exists():
+                                                st.image(preview_start, width="stretch")
+                                            elif has_scene_image:
+                                                st.image(str(scene.image_path), width="stretch")
+                                            else:
+                                                st.warning("No start frame - generate scene image first")
 
                                     with frame_col2:
                                         if is_seedance:
@@ -4608,7 +4721,12 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                                 elif scene.image_path and str(Path(scene.image_path).resolve()) in sorted_images:
                                                     target_idx = sorted_images.index(str(Path(scene.image_path).resolve())) + 1
                                                 else:
-                                                    target_idx = 0
+                                                    # Find first image from current scene as fallback
+                                                    current_scene_imgs = [p for p in sorted_images if all_project_images.get(p, (0,))[0] == scene.index]
+                                                    if current_scene_imgs:
+                                                        target_idx = sorted_images.index(current_scene_imgs[0]) + 1  # +1 for "None" option
+                                                    else:
+                                                        target_idx = 0  # Default to "None" if no images for this scene
 
                                                 def get_target_label(x):
                                                     if x == "(No target frame)":
@@ -4689,8 +4807,9 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                                 custom_style_ref = None
                                                 if new_style_ref != "auto" and Path(new_style_ref).exists():
                                                     custom_style_ref = Path(new_style_ref)
-                                                _generate_single_scene_image(scene, script, state, custom_style_ref=custom_style_ref)
-                                                st.rerun()
+                                                success = _generate_single_scene_image(scene, script, state, custom_style_ref=custom_style_ref)
+                                                if success:
+                                                    st.rerun()
                                         else:
                                             st.markdown("**ℹ️ WAN: Single Input**")
                                             st.caption("WAN uses start frame only")
@@ -4783,7 +4902,10 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                                     st.caption(f"**{char_name}:** {d.text}")
 
                         # Action buttons - include video for video modes
-                        has_image = scene.image_path and Path(scene.image_path).exists()
+                        has_scene_image = scene.image_path and Path(scene.image_path).exists()
+                        custom_start_img = getattr(scene, 'custom_start_image', None)
+                        has_custom_start = custom_start_img and custom_start_img != "none" and Path(custom_start_img).exists()
+                        has_image = has_scene_image or has_custom_start
                         has_video = scene.video_path and Path(scene.video_path).exists()
 
                         # Note: Video preview and variants are shown in the Video tab above
@@ -4804,8 +4926,9 @@ def _render_storyboard_grid(script: Script, state: MovieModeState, is_video_mode
                             img_icon = "🔄" if has_image else "🎨"
                             if st.button(img_icon, key=f"img_{scene.index}", use_container_width=True,
                                         help="Generate image" if not has_image else "Regenerate image"):
-                                _generate_single_scene_image(scene, script, state)
-                                st.rerun()
+                                success = _generate_single_scene_image(scene, script, state)
+                                if success:
+                                    st.rerun()
 
                         if is_video_mode and btn3:
                             with btn3:
@@ -6558,7 +6681,7 @@ def _generate_all_scene_images(script: Script, state: MovieModeState) -> None:
     st.success(f"Generated {len(scenes_to_generate)} scene images!")
 
 
-def _generate_single_scene_image(scene, script: Script, state: MovieModeState, custom_style_ref: Optional[Path] = None) -> None:
+def _generate_single_scene_image(scene, script: Script, state: MovieModeState, custom_style_ref: Optional[Path] = None) -> bool:
     """Generate image for a single scene, storing as variant.
 
     Args:
@@ -6566,6 +6689,9 @@ def _generate_single_scene_image(scene, script: Script, state: MovieModeState, c
         script: Full script for character lookup
         state: MovieModeState
         custom_style_ref: Optional custom style reference image path (overrides auto prev-scene)
+
+    Returns:
+        True if image was generated successfully, False otherwise
     """
     from src.services.movie_image_generator import MovieImageGenerator
     import time
@@ -6607,13 +6733,22 @@ def _generate_single_scene_image(scene, script: Script, state: MovieModeState, c
         reference_image = Path(scene.custom_style_ref)
         style_ref_source = f"custom (scene): {reference_image.name}"
     elif use_prev_image and scene.index > 1:
-        # Auto: use previous scene's image
+        # Auto: use previous scene's last video frame OR image
         prev_scene = next((s for s in script.scenes if s.index == scene.index - 1), None)
         if prev_scene:
-            prev_img = prev_scene.get_selected_image()
-            if prev_img and prev_img.exists():
-                reference_image = prev_img
-                style_ref_source = f"auto (prev scene {scene.index - 1}): {prev_img.name}"
+            # Priority 1: Last frame from previous video (best for continuity)
+            if prev_scene.video_path and Path(prev_scene.video_path).exists():
+                cache_dir = get_project_dir() / "cache" / "frames"
+                extracted = extract_last_frame_from_video(Path(prev_scene.video_path), cache_dir)
+                if extracted and extracted.exists():
+                    reference_image = extracted
+                    style_ref_source = f"auto (prev video last frame): {extracted.name}"
+            # Priority 2: Previous scene's image
+            if not reference_image:
+                prev_img = prev_scene.get_selected_image()
+                if prev_img and prev_img.exists():
+                    reference_image = prev_img
+                    style_ref_source = f"auto (prev scene {scene.index - 1}): {prev_img.name}"
 
     # Collect ALL character portraits for visible characters
     character_portraits = []
@@ -6680,13 +6815,16 @@ def _generate_single_scene_image(scene, script: Script, state: MovieModeState, c
                 save_movie_state()
                 print(f"✅ Added as variant #{idx + 1}, set as custom_target_image: {result_path}")
                 st.toast(f"Generated image variant {variant_num} for Scene {scene.index}")
+                return True
             else:
                 print(f"❌ Generation returned None - check console for error details")
                 st.error(f"❌ Image generation failed for Scene {scene.index}. Check console/terminal for error details.")
+                return False
         except Exception as e:
             error_msg = str(e)
             print(f"❌ Generation failed: {error_msg}")
             st.error(f"❌ Image generation failed: {error_msg}")
+            return False
 
 
 def _render_scene_image_manager(scene, script: Script, state: MovieModeState, compact: bool = False) -> None:
@@ -6785,8 +6923,9 @@ def _render_scene_image_manager(scene, script: Script, state: MovieModeState, co
             icon = "🔄" if has_image else "🎨"
             if st.button(icon, key=f"img_gen_{scene.index}", use_container_width=True,
                         help="Generate new image variant"):
-                _generate_single_scene_image(scene, script, state)
-                st.rerun()
+                success = _generate_single_scene_image(scene, script, state)
+                if success:
+                    st.rerun()
         with btn_col2:
             if num_variants > 1:
                 if st.button("📂", key=f"img_browse_{scene.index}", use_container_width=True,
@@ -7023,8 +7162,9 @@ def _render_scene_image_manager(scene, script: Script, state: MovieModeState, co
         with gen_col1:
             if st.button("🎨 Generate New Variant", key=f"gen_new_var_{scene.index}",
                         type="primary", use_container_width=True):
-                _generate_single_scene_image(scene, script, state)
-                st.rerun()
+                success = _generate_single_scene_image(scene, script, state)
+                if success:
+                    st.rerun()
         with gen_col2:
             if num_variants > 0:
                 st.metric("Variants", num_variants)
@@ -8820,8 +8960,9 @@ def _render_scene_editor_form(script: Script, state: MovieModeState, visual_styl
     img_col1, img_col2 = st.columns([1, 2])
     with img_col1:
         if st.button("🎨 Generate New Image", key=f"genimg_{scene.index}", use_container_width=True):
-            _generate_single_scene_image(scene, script, state)
-            st.rerun()
+            success = _generate_single_scene_image(scene, script, state)
+            if success:
+                st.rerun()
 
         if num_scene_variants > 1:
             if st.button(f"📂 Browse {num_scene_variants} Variants", key=f"browse_editor_{scene.index}", use_container_width=True):
@@ -9834,8 +9975,9 @@ def _render_movie_scene_card(state, scene, generation_method: str, model_info: d
     with btn_col1:
         icon = "🔄" if has_image else "🎨"
         if st.button(f"{icon} Image", key=f"gen_img_{scene.index}", use_container_width=True):
-            _generate_single_scene_image(scene, state.script, state)
-            st.rerun()
+            success = _generate_single_scene_image(scene, state.script, state)
+            if success:
+                st.rerun()
     with btn_col2:
         if num_img_variants > 1:
             if st.button("📂 Browse", key=f"browse_vars_{scene.index}", use_container_width=True):
@@ -10298,6 +10440,44 @@ def _generate_single_scene_video(state, scene, generation_method: str, defaults:
                 if extracted_frame:
                     first_frame_override = extracted_frame
                     logger.info(f"Scene {scene.index}: Using extracted last frame for continuity")
+
+    # Console log all video generation inputs
+    custom_start = getattr(scene, 'custom_start_image', None)
+    custom_target = getattr(scene, 'custom_target_image', None)
+    print(f"\n{'='*70}")
+    print(f"🎬 VIDEO GENERATION REQUEST - Scene {scene.index}")
+    print(f"{'='*70}")
+    print(f"MODEL: {scene_model}")
+    print(f"DURATION: {duration}s")
+    print(f"RESOLUTION: {resolution}")
+    print(f"OUTPUT: {output_path}")
+    print(f"{'─'*70}")
+    print(f"📸 INPUT IMAGES:")
+    # Start frame
+    if first_frame_override and first_frame_override.exists():
+        print(f"   Start Frame:  {first_frame_override.name} (prev video last frame)")
+    elif custom_start and custom_start != "none" and Path(custom_start).exists():
+        print(f"   Start Frame:  {Path(custom_start).name} (custom)")
+    elif scene.image_path and Path(scene.image_path).exists():
+        print(f"   Start Frame:  {Path(scene.image_path).name} (scene image)")
+    else:
+        print(f"   Start Frame:  None")
+    # Target frame (for Seedance)
+    if custom_target == "none":
+        print(f"   Target Frame: None (disabled - prompt-driven)")
+    elif custom_target and Path(custom_target).exists():
+        print(f"   Target Frame: {Path(custom_target).name} (custom)")
+    elif scene.image_path and Path(scene.image_path).exists():
+        print(f"   Target Frame: {Path(scene.image_path).name} (scene image default)")
+    else:
+        print(f"   Target Frame: None")
+    # Previous video (for V2V)
+    if previous_video:
+        print(f"   Prev Video:   {previous_video.name} (V2V continuity)")
+    print(f"{'─'*70}")
+    print(f"📝 PROMPT (full):")
+    print(f"   {prompt}")
+    print(f"{'='*70}\n")
 
     with st.status(f"Generating scene {scene.index} with {scene_model}...", expanded=True) as status:
         try:
