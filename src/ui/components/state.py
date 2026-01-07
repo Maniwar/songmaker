@@ -1179,8 +1179,12 @@ def render_movie_project_sidebar() -> None:
             # Clear all movie state
             if "movie_state" in st.session_state:
                 del st.session_state["movie_state"]
-            # Clear related session state keys
-            keys_to_clear = [k for k in st.session_state.keys() if k.startswith(("movie_", "script_", "scene_", "dialogue_", "voice_", "visual_", "char_"))]
+            # Clear related session state keys (but preserve movie_mode to stay in movie mode!)
+            keys_to_clear = [
+                k for k in st.session_state.keys()
+                if k.startswith(("movie_", "script_", "scene_", "dialogue_", "voice_", "visual_", "char_"))
+                and k not in ("movie_mode", "movie_new_project_btn", "movie_exit_to_song_btn")
+            ]
             for k in keys_to_clear:
                 del st.session_state[k]
             st.success("Started new project!")

@@ -1422,3 +1422,154 @@ class VideoGenerator:
                 progress_callback("Slideshow complete!", 1.0)
 
             return output_path
+
+
+def apply_music_tail(
+    video_path: Path,
+    output_path: Path,
+    tail_duration: float,
+    swell_factor: float = 1.0,
+    fade_out_duration: float = 2.0,
+    video_fade_duration: float = 1.0,
+) -> Path:
+    """Apply music tail effect: fade video to black while music continues.
+
+    This creates a cinematic ending where:
+    1. Video fades to black over video_fade_duration
+    2. Music volume optionally increases (swell) during the fade
+    3. Black screen continues for tail_duration with looped audio
+    4. Music fades out at the end
+
+    Args:
+        video_path: Path to the input video (with audio)
+        output_path: Path to save the output video
+        tail_duration: Duration of black screen after video (seconds)
+        swell_factor: Volume multiplier during fade (1.0 = no change, 2.0 = double)
+        fade_out_duration: Duration of final audio fade out (seconds)
+        video_fade_duration: Duration of video fade to black (seconds)
+
+    Returns:
+        Path to the output video with music tail
+    """
+    import json
+    import shutil
+
+    # Get video info (duration, dimensions, fps)
+    probe_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate",
+        "-show_entries", "format=duration",
+        "-of", "json",
+        str(video_path)
+    ]
+    result = subprocess.run(probe_cmd, capture_output=True, text=True)
+
+    try:
+        probe_data = json.loads(result.stdout)
+        stream = probe_data.get("streams", [{}])[0]
+        width = stream.get("width", 1920)
+        height = stream.get("height", 1080)
+        fps_str = stream.get("r_frame_rate", "30/1")
+        # Parse fps (e.g., "30000/1001" or "30/1")
+        if "/" in fps_str:
+            num, den = fps_str.split("/")
+            fps = float(num) / float(den)
+        else:
+            fps = float(fps_str)
+        video_duration = float(probe_data.get("format", {}).get("duration", 0))
+    except (json.JSONDecodeError, ValueError, KeyError, ZeroDivisionError):
+        # Fallback
+        video_duration = 0
+        width, height, fps = 1920, 1080, 30
+
+    if video_duration <= 0:
+        shutil.copy(video_path, output_path)
+        return output_path
+
+    # Check if video has audio stream
+    audio_check_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_type",
+        "-of", "csv=p=0",
+        str(video_path)
+    ]
+    audio_result = subprocess.run(audio_check_cmd, capture_output=True, text=True)
+    has_audio = bool(audio_result.stdout.strip())
+
+    if not has_audio:
+        logger.warning("Video has no audio - music tail requires audio")
+        shutil.copy(video_path, output_path)
+        return output_path
+
+    # Calculate timing
+    fade_start = max(0, video_duration - video_fade_duration)
+    total_duration = video_duration + tail_duration
+    fade_out_start = total_duration - fade_out_duration
+
+    # Build the filter_complex
+    filter_parts = []
+
+    # Video chain: fade to black, then add black frames
+    filter_parts.append(
+        f"[0:v]fade=t=out:st={fade_start}:d={video_fade_duration}:color=black[vfaded]"
+    )
+    filter_parts.append(
+        f"color=c=black:s={width}x{height}:d={tail_duration}:r={fps}[vblack]"
+    )
+    filter_parts.append(
+        f"[vfaded][vblack]concat=n=2:v=1:a=0[vout]"
+    )
+
+    # Audio chain: loop audio to extend, apply swell and fade out
+    loops_needed = int((tail_duration / video_duration) + 2)  # Extra for safety
+
+    if swell_factor > 1.0:
+        # Volume expression: ramp up during video fade, stay high, then fade out
+        vol_expr = (
+            f"if(lt(t,{fade_start}),1,"
+            f"if(lt(t,{video_duration}),1+({swell_factor}-1)*(t-{fade_start})/{video_fade_duration},"
+            f"if(lt(t,{fade_out_start}),{swell_factor},"
+            f"{swell_factor}*(1-(t-{fade_out_start})/{fade_out_duration}))))"
+        )
+        filter_parts.append(
+            f"[0:a]aloop=loop={loops_needed}:size=2147483647,"
+            f"atrim=0:{total_duration},"
+            f"volume='{vol_expr}':eval=frame[aout]"
+        )
+    else:
+        # No swell, just loop, trim, and fade out at end
+        filter_parts.append(
+            f"[0:a]aloop=loop={loops_needed}:size=2147483647,"
+            f"atrim=0:{total_duration},"
+            f"afade=t=out:st={fade_out_start}:d={fade_out_duration}[aout]"
+        )
+
+    filter_complex = ";".join(filter_parts)
+
+    # Run FFmpeg with filter_complex
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-t", str(total_duration),
+        str(output_path)
+    ]
+
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        logger.info(f"Music tail applied: fade at {fade_start:.1f}s, tail {tail_duration:.1f}s, total {total_duration:.1f}s")
+        return output_path
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Music tail FFmpeg error: {e.stderr}")
+        # Fallback - just copy the original
+        shutil.copy(video_path, output_path)
+        return output_path

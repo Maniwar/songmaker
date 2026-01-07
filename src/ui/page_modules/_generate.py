@@ -3043,12 +3043,16 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                 "Static (Ken Burns only)": AnimationType.NONE,
                 "Wan S2V Lip Sync (FREE, HF)": AnimationType.LIP_SYNC,
                 "Wan TI2V Motion (FREE, HF)": AnimationType.PROMPT,
-                "Wan 2.5 I2V (AtlasCloud)": AnimationType.ATLASCLOUD,
-                "Seedance 1.5 (AtlasCloud)": AnimationType.SEEDANCE,
+                "Wan 2.6 I2V (AtlasCloud)": AnimationType.ATLASCLOUD,
+                "Wan 2.6 Fast (AtlasCloud)": AnimationType.ATLASCLOUD_FAST,
+                "Seedance 1.5 Pro (AtlasCloud)": AnimationType.SEEDANCE,
+                "Seedance 1.5 Fast (AtlasCloud)": AnimationType.SEEDANCE_FAST,
                 "Veo 3.1 (Google)": AnimationType.VEO,
                 "Kling Lip Sync (fal.ai)": AnimationType.KLING,
                 "Wan S2V Lip (fal.ai)": AnimationType.WAN_S2V,
                 "Seedance+Kling (Atlas+fal)": AnimationType.SEEDANCE_LIPSYNC,
+                "ByteDance Lipsync (AtlasCloud)": AnimationType.ATLASCLOUD_LIPSYNC,
+                "Kling Lipsync (AtlasCloud)": AnimationType.KLING_LIPSYNC,
             }
             selected_animation = st.selectbox(
                 "Animation Type",
@@ -3069,11 +3073,15 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                     AnimationType.LIP_SYNC: "Wan S2V Lip (FREE, HF)",
                     AnimationType.PROMPT: "Wan TI2V (FREE, HF)",
                     AnimationType.VEO: "Veo 3.1 (Google)",
-                    AnimationType.ATLASCLOUD: "Wan 2.5 I2V (AtlasCloud)",
-                    AnimationType.SEEDANCE: "Seedance 1.5 (AtlasCloud)",
+                    AnimationType.ATLASCLOUD: "Wan 2.6 I2V (AtlasCloud)",
+                    AnimationType.ATLASCLOUD_FAST: "Wan 2.6 Fast (AtlasCloud)",
+                    AnimationType.SEEDANCE: "Seedance 1.5 Pro (AtlasCloud)",
+                    AnimationType.SEEDANCE_FAST: "Seedance 1.5 Fast (AtlasCloud)",
                     AnimationType.KLING: "Kling Lip (fal.ai)",
                     AnimationType.WAN_S2V: "Wan S2V (fal.ai)",
                     AnimationType.SEEDANCE_LIPSYNC: "Seedance+Kling (Atlas+fal)",
+                    AnimationType.ATLASCLOUD_LIPSYNC: "ByteDance Lipsync (AtlasCloud)",
+                    AnimationType.KLING_LIPSYNC: "Kling Lipsync (AtlasCloud)",
                 }
                 new_label = anim_type_to_label.get(new_anim_type, "Static")
 
@@ -3090,6 +3098,10 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
                 st.success(f"Applied '{selected_animation}' to all {len(scenes)} scenes!")
                 st.rerun()
 
+    # Visual Workshop - Keyframe planning for smooth transitions
+    with st.expander("🎨 Visual Workshop - Keyframe Transitions", expanded=False):
+        render_visual_workshop(state)
+
     # Display storyboard grid
     render_storyboard_grid(state)
 
@@ -3104,12 +3116,16 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
             type_labels = {
                 AnimationType.LIP_SYNC: "Wan S2V Lip (FREE, HF)",
                 AnimationType.PROMPT: "Wan TI2V (FREE, HF)",
-                AnimationType.ATLASCLOUD: "Wan 2.5 I2V (AtlasCloud)",
+                AnimationType.ATLASCLOUD: "Wan 2.6 I2V (AtlasCloud)",
+                AnimationType.ATLASCLOUD_FAST: "Wan 2.6 Fast (AtlasCloud)",
                 AnimationType.VEO: "Veo 3.1 (Google)",
-                AnimationType.SEEDANCE: "Seedance 1.5 (AtlasCloud)",
+                AnimationType.SEEDANCE: "Seedance 1.5 Pro (AtlasCloud)",
+                AnimationType.SEEDANCE_FAST: "Seedance 1.5 Fast (AtlasCloud)",
                 AnimationType.KLING: "Kling Lip (fal.ai)",
                 AnimationType.WAN_S2V: "Wan S2V (fal.ai)",
                 AnimationType.SEEDANCE_LIPSYNC: "Seedance+Kling (Atlas+fal)",
+                AnimationType.ATLASCLOUD_LIPSYNC: "ByteDance Lipsync (AtlasCloud)",
+                AnimationType.KLING_LIPSYNC: "Kling Lipsync (AtlasCloud)",
             }
             pending_parts = []
             for anim_type, count in pending_by_type.items():
@@ -3253,6 +3269,63 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
             if new_show_lyrics != current_show_lyrics:
                 update_state(show_lyrics=new_show_lyrics)
 
+    # Music Tail Settings (fade to black with music continuing)
+    with st.expander("Music Tail (Fade to Black)", expanded=False):
+        st.caption("Fade video to black while music continues playing, then fade out audio.")
+        mt_col1, mt_col2, mt_col3, mt_col4 = st.columns(4)
+        with mt_col1:
+            current_music_tail_enabled = getattr(state, 'music_tail_enabled', False)
+            new_music_tail_enabled = st.checkbox(
+                "Enable Music Tail",
+                value=current_music_tail_enabled,
+                help="Add a fade to black with music continuing at the end",
+                key="music_tail_enabled_storyboard",
+            )
+            if new_music_tail_enabled != current_music_tail_enabled:
+                update_state(music_tail_enabled=new_music_tail_enabled)
+        with mt_col2:
+            current_tail_duration = getattr(state, 'music_tail_duration', 5.0)
+            new_tail_duration = st.slider(
+                "Tail Duration (sec)",
+                min_value=2.0,
+                max_value=15.0,
+                value=current_tail_duration,
+                step=1.0,
+                help="How long music plays over black screen",
+                key="music_tail_duration_storyboard",
+                disabled=not new_music_tail_enabled,
+            )
+            if new_tail_duration != current_tail_duration:
+                update_state(music_tail_duration=new_tail_duration)
+        with mt_col3:
+            current_swell_factor = getattr(state, 'music_tail_swell', 1.0)
+            new_swell_factor = st.slider(
+                "Volume Swell",
+                min_value=1.0,
+                max_value=2.0,
+                value=current_swell_factor,
+                step=0.1,
+                help="Increase volume during fade (1.0 = no change, 2.0 = double)",
+                key="music_tail_swell_storyboard",
+                disabled=not new_music_tail_enabled,
+            )
+            if new_swell_factor != current_swell_factor:
+                update_state(music_tail_swell=new_swell_factor)
+        with mt_col4:
+            current_fade_out = getattr(state, 'music_tail_fade_out', 2.0)
+            new_fade_out = st.slider(
+                "Fade Out (sec)",
+                min_value=1.0,
+                max_value=5.0,
+                value=current_fade_out,
+                step=0.5,
+                help="Duration of final audio fade out",
+                key="music_tail_fade_out_storyboard",
+                disabled=not new_music_tail_enabled,
+            )
+            if new_fade_out != current_fade_out:
+                update_state(music_tail_fade_out=new_fade_out)
+
     # Action buttons
     if missing_count > 0:
         col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -3385,6 +3458,319 @@ def render_storyboard_view(state, is_demo_mode: bool) -> None:
         st.rerun()
 
 
+def render_visual_workshop(state) -> None:
+    """Visual Workshop for planning keyframe-based animations with smooth transitions.
+
+    This allows users to plan first_frame → motion → last_frame sequences
+    where each scene's last_frame can become the next scene's first_frame.
+    """
+    st.markdown("""
+    **Plan smooth transitions between scenes using keyframes.**
+
+    For Seedance animations, you can specify first and last frames to control
+    exactly how each scene starts and ends. Link scenes together for seamless transitions.
+    """)
+
+    scenes = state.scenes
+    if not scenes:
+        st.info("No scenes available. Generate scenes first.")
+        return
+
+    project_dir = getattr(state, 'project_dir', None)
+    if not project_dir:
+        st.warning("No project directory found.")
+        return
+
+    # Create keyframes directory
+    keyframes_dir = Path(project_dir) / "keyframes"
+    keyframes_dir.mkdir(parents=True, exist_ok=True)
+
+    # Quick controls
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1, 1, 1])
+    with ctrl_col1:
+        if st.button("🔗 Link All Scenes", help="Use each scene's last frame as the next scene's first frame"):
+            scenes_list = list(scenes)
+            for i, scene in enumerate(scenes_list):
+                if i > 0:
+                    scene.link_to_previous = True
+            state.scenes = scenes_list
+            st.success("All scenes linked for smooth transitions!")
+            st.rerun()
+
+    with ctrl_col2:
+        if st.button("🔓 Unlink All", help="Make each scene independent"):
+            scenes_list = list(scenes)
+            for scene in scenes_list:
+                scene.link_to_previous = False
+            state.scenes = scenes_list
+            st.success("All scenes unlinked.")
+            st.rerun()
+
+    with ctrl_col3:
+        if st.button("🎯 Auto-Generate Prompts", help="Generate first/last frame prompts based on visual prompts"):
+            scenes_list = list(scenes)
+            for i, scene in enumerate(scenes_list):
+                # First frame prompt: scene starting state
+                if not scene.first_frame_prompt:
+                    scene.first_frame_prompt = f"Starting pose: {scene.visual_prompt}"
+                # Last frame prompt: scene ending state (transition to next)
+                if not scene.last_frame_prompt:
+                    if i < len(scenes_list) - 1:
+                        next_scene = scenes_list[i + 1]
+                        scene.last_frame_prompt = f"Ending pose transitioning to: {next_scene.visual_prompt[:100]}"
+                    else:
+                        scene.last_frame_prompt = f"Final pose: {scene.visual_prompt}"
+            state.scenes = scenes_list
+            st.success("Generated keyframe prompts for all scenes!")
+            st.rerun()
+
+    st.markdown("---")
+
+    # Display each scene's keyframe plan
+    for i, scene in enumerate(scenes):
+        has_image = scene.image_path and Path(scene.image_path).exists()
+        has_first = scene.first_frame_path and Path(scene.first_frame_path).exists()
+        has_last = scene.last_frame_path and Path(scene.last_frame_path).exists()
+
+        # Scene header with link indicator
+        link_icon = "🔗" if scene.link_to_previous and i > 0 else "⬛"
+        st.markdown(f"### {link_icon} Scene {i + 1}: {scene.mood} ({scene.duration:.1f}s)")
+
+        # Three columns: First Frame | Motion | Last Frame
+        col1, col2, col3 = st.columns([1, 2, 1])
+
+        with col1:
+            st.markdown("**First Frame**")
+            if scene.link_to_previous and i > 0:
+                prev_scene = scenes[i - 1]
+                if prev_scene.last_frame_path and Path(prev_scene.last_frame_path).exists():
+                    st.image(str(prev_scene.last_frame_path), caption="(Linked from prev)", use_container_width=True)
+                    st.caption("Using previous scene's last frame")
+                elif prev_scene.image_path and Path(prev_scene.image_path).exists():
+                    st.image(str(prev_scene.image_path), caption="(Prev scene image)", use_container_width=True)
+                    st.caption("Fallback: previous scene's main image")
+                else:
+                    st.warning("Previous scene missing images")
+            elif has_first:
+                st.image(str(scene.first_frame_path), caption="First keyframe", use_container_width=True)
+            elif has_image:
+                st.image(str(scene.image_path), caption="(Main image)", use_container_width=True)
+                st.caption("Using main scene image as first frame")
+            else:
+                st.info("No first frame")
+
+            # First frame prompt
+            first_prompt = st.text_area(
+                "First Frame Prompt",
+                value=scene.first_frame_prompt or "",
+                key=f"first_prompt_{i}",
+                height=80,
+                placeholder="Describe the starting pose/composition..."
+            )
+            if first_prompt != (scene.first_frame_prompt or ""):
+                scenes_list = list(scenes)
+                scenes_list[i].first_frame_prompt = first_prompt if first_prompt else None
+                state.scenes = scenes_list
+
+            # Generate first frame button
+            if not scene.link_to_previous:
+                if st.button("Generate First", key=f"gen_first_{i}", disabled=not first_prompt):
+                    _generate_keyframe(state, i, "first", keyframes_dir)
+
+        with col2:
+            st.markdown("**Motion (Animation)**")
+            if has_image:
+                st.image(str(scene.image_path), caption="Main scene image", use_container_width=True)
+            else:
+                st.warning("Generate main image first")
+
+            # Motion prompt
+            motion_prompt = st.text_area(
+                "Motion Prompt",
+                value=scene.motion_prompt or "",
+                key=f"motion_prompt_ws_{i}",
+                height=80,
+                placeholder="Describe the motion between frames..."
+            )
+            if motion_prompt != (scene.motion_prompt or ""):
+                scenes_list = list(scenes)
+                scenes_list[i].motion_prompt = motion_prompt if motion_prompt else None
+                state.scenes = scenes_list
+
+            # Link toggle
+            if i > 0:
+                link_prev = st.checkbox(
+                    "Link to previous scene",
+                    value=scene.link_to_previous,
+                    key=f"link_{i}",
+                    help="Use previous scene's last frame as this scene's first frame"
+                )
+                if link_prev != scene.link_to_previous:
+                    scenes_list = list(scenes)
+                    scenes_list[i].link_to_previous = link_prev
+                    state.scenes = scenes_list
+                    st.rerun()
+
+        with col3:
+            st.markdown("**Last Frame**")
+            if has_last:
+                st.image(str(scene.last_frame_path), caption="Last keyframe", use_container_width=True)
+            elif has_image:
+                st.image(str(scene.image_path), caption="(Main image)", use_container_width=True)
+                st.caption("Will use main image if no last frame")
+            else:
+                st.info("No last frame")
+
+            # Last frame prompt
+            last_prompt = st.text_area(
+                "Last Frame Prompt",
+                value=scene.last_frame_prompt or "",
+                key=f"last_prompt_{i}",
+                height=80,
+                placeholder="Describe the ending pose/composition..."
+            )
+            if last_prompt != (scene.last_frame_prompt or ""):
+                scenes_list = list(scenes)
+                scenes_list[i].last_frame_prompt = last_prompt if last_prompt else None
+                state.scenes = scenes_list
+
+            # Generate last frame button
+            if st.button("Generate Last", key=f"gen_last_{i}", disabled=not last_prompt):
+                _generate_keyframe(state, i, "last", keyframes_dir)
+
+        st.markdown("---")
+
+    # Batch generation
+    st.markdown("### Batch Keyframe Generation")
+    batch_col1, batch_col2 = st.columns(2)
+    with batch_col1:
+        if st.button("🎬 Generate All First Frames", type="primary"):
+            _generate_all_keyframes(state, "first", keyframes_dir)
+    with batch_col2:
+        if st.button("🎬 Generate All Last Frames", type="primary"):
+            _generate_all_keyframes(state, "last", keyframes_dir)
+
+
+def _generate_keyframe(state, scene_index: int, frame_type: str, keyframes_dir: Path) -> None:
+    """Generate a single keyframe (first or last) for a scene."""
+    scenes = list(state.scenes)
+    scene = scenes[scene_index]
+
+    prompt = scene.first_frame_prompt if frame_type == "first" else scene.last_frame_prompt
+    if not prompt:
+        st.error(f"No {frame_type} frame prompt set for scene {scene_index + 1}")
+        return
+
+    output_path = keyframes_dir / f"scene_{scene_index:03d}_{frame_type}_frame.png"
+
+    with st.spinner(f"Generating {frame_type} frame for scene {scene_index + 1}..."):
+        try:
+            from src.services.image_generator import ImageGenerator
+            generator = ImageGenerator()
+
+            # Get reference image if available
+            reference = None
+            if scene.image_path and Path(scene.image_path).exists():
+                from PIL import Image
+                reference = Image.open(scene.image_path)
+
+            # Get concept for style consistency
+            concept = getattr(state, 'concept', None)
+            style_prefix = concept.visual_style if concept else None
+            character_desc = concept.character_description if concept else None
+            visual_world = concept.visual_world if concept and hasattr(concept, 'visual_world') else None
+
+            result = generator.generate_scene_image(
+                prompt=prompt,
+                style_prefix=style_prefix,
+                character_description=character_desc,
+                visual_world=visual_world,
+                reference_image=reference,
+                output_path=output_path,
+                show_character=scene.show_character,
+            )
+
+            if result and output_path.exists():
+                if frame_type == "first":
+                    scenes[scene_index].first_frame_path = output_path
+                else:
+                    scenes[scene_index].last_frame_path = output_path
+                state.scenes = scenes
+                st.success(f"Generated {frame_type} frame for scene {scene_index + 1}!")
+                st.rerun()
+            else:
+                st.error(f"Failed to generate {frame_type} frame")
+
+        except Exception as e:
+            st.error(f"Error generating keyframe: {str(e)[:100]}")
+
+
+def _generate_all_keyframes(state, frame_type: str, keyframes_dir: Path) -> None:
+    """Generate all keyframes of a type (first or last) for all scenes."""
+    scenes = list(state.scenes)
+    generated = 0
+    skipped = 0
+
+    progress = st.progress(0.0)
+    status = st.empty()
+
+    for i, scene in enumerate(scenes):
+        progress.progress((i + 1) / len(scenes))
+
+        # Skip linked scenes for first frames (they use previous scene's last frame)
+        if frame_type == "first" and scene.link_to_previous and i > 0:
+            skipped += 1
+            continue
+
+        prompt = scene.first_frame_prompt if frame_type == "first" else scene.last_frame_prompt
+        if not prompt:
+            skipped += 1
+            continue
+
+        output_path = keyframes_dir / f"scene_{i:03d}_{frame_type}_frame.png"
+        status.info(f"Generating {frame_type} frame for scene {i + 1}...")
+
+        try:
+            from src.services.image_generator import ImageGenerator
+            generator = ImageGenerator()
+
+            reference = None
+            if scene.image_path and Path(scene.image_path).exists():
+                from PIL import Image
+                reference = Image.open(scene.image_path)
+
+            concept = getattr(state, 'concept', None)
+            style_prefix = concept.visual_style if concept else None
+            character_desc = concept.character_description if concept else None
+            visual_world = concept.visual_world if concept and hasattr(concept, 'visual_world') else None
+
+            result = generator.generate_scene_image(
+                prompt=prompt,
+                style_prefix=style_prefix,
+                character_description=character_desc,
+                visual_world=visual_world,
+                reference_image=reference,
+                output_path=output_path,
+                show_character=scene.show_character,
+            )
+
+            if result and output_path.exists():
+                if frame_type == "first":
+                    scenes[i].first_frame_path = output_path
+                else:
+                    scenes[i].last_frame_path = output_path
+                generated += 1
+
+        except Exception as e:
+            st.warning(f"Scene {i + 1}: {str(e)[:50]}")
+
+    state.scenes = scenes
+    progress.empty()
+    status.empty()
+    st.success(f"Generated {generated} {frame_type} frames ({skipped} skipped)")
+    st.rerun()
+
+
 def render_storyboard_grid(state) -> None:
     """Render the storyboard as a grid of images with scene info."""
     scenes = state.scenes
@@ -3461,11 +3847,15 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
         AnimationType.LIP_SYNC: "Wan S2V Lip (HF)",
         AnimationType.PROMPT: "Wan TI2V (HF)",
         AnimationType.VEO: "Veo 3.1 (Google)",
-        AnimationType.ATLASCLOUD: "Wan 2.5 (AtlasCloud)",
-        AnimationType.SEEDANCE: "Seedance 1.5 (AtlasCloud)",
+        AnimationType.ATLASCLOUD: "Wan 2.6 (AtlasCloud)",
+        AnimationType.ATLASCLOUD_FAST: "Wan 2.6 Fast (AtlasCloud)",
+        AnimationType.SEEDANCE: "Seedance 1.5 Pro (AtlasCloud)",
+        AnimationType.SEEDANCE_FAST: "Seedance 1.5 Fast (AtlasCloud)",
         AnimationType.KLING: "Kling Lip (fal.ai)",
         AnimationType.WAN_S2V: "Wan S2V (fal.ai)",
         AnimationType.SEEDANCE_LIPSYNC: "Seedance+Kling (Atlas+fal)",
+        AnimationType.ATLASCLOUD_LIPSYNC: "ByteDance Lipsync (AtlasCloud)",
+        AnimationType.KLING_LIPSYNC: "Kling Lipsync (AtlasCloud)",
     }
     anim_type_label = anim_type_labels.get(animation_type, "animation")
     status_placeholder.info(f"Animating ({anim_type_label}) at {resolution}...")
@@ -3524,30 +3914,131 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
                 progress_callback=progress_callback,
             )
         elif animation_type == AnimationType.ATLASCLOUD:
-            # Use AtlasCloudAnimator for Wan 2.5 animation (PAID, no GPU limits)
-            animator = AtlasCloudAnimator()
+            # Use AtlasCloudAnimator for Wan 2.6 animation (PAID, no GPU limits)
+            # Note: Wan 2.6 generates its own audio, does NOT accept audio input for lip sync
+            # For lip sync to your song, use Wan S2V (fal.ai) or post-processing lipsync
+            from src.services.atlascloud_animator import WanModel
+            animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
             motion_prompt = _get_motion_prompt(scene)
-            result = animator.animate_scene(
-                image_path=Path(scene.image_path),
-                prompt=motion_prompt,
-                output_path=output_path,
-                duration_seconds=5 if scene.duration < 7.5 else 10,  # AtlasCloud supports 5 or 10 seconds
-                resolution=resolution.lower(),  # e.g., "720p" or "1080p"
-                progress_callback=progress_callback,
-            )
-        elif animation_type == AnimationType.SEEDANCE:
-            # Use SeedanceAnimator for Seedance Pro animation (PAID, up to 12s)
-            animator = SeedanceAnimator()
-            motion_prompt = _get_motion_prompt(scene)
-            # Seedance supports 2-12 second durations - use ceil to ensure animation covers full scene
-            # (avoids Ken Burns padding at the end due to truncation)
-            target_duration = min(12, max(2, math.ceil(scene.duration)))
+            target_duration = scene.get_animation_duration("wan26")
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
                 prompt=motion_prompt,
                 output_path=output_path,
                 duration_seconds=target_duration,
+                resolution=resolution.lower(),  # e.g., "720p" or "1080p"
+                progress_callback=progress_callback,
+            )
+        elif animation_type == AnimationType.ATLASCLOUD_FAST:
+            # Use AtlasCloudAnimator for Wan 2.6 FAST animation (PAID, cheaper & faster)
+            from src.services.atlascloud_animator import WanModel
+            animator = AtlasCloudAnimator(model=WanModel.WAN_25_FAST)
+            motion_prompt = _get_motion_prompt(scene)
+            target_duration = scene.get_animation_duration("wan26")
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=target_duration,
+                resolution=resolution.lower(),
+                progress_callback=progress_callback,
+            )
+        elif animation_type == AnimationType.SEEDANCE:
+            # Use SeedanceAnimator for Seedance Pro animation (PAID, up to 12s)
+            from src.services.atlascloud_animator import SeedanceModel
+            animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
+            motion_prompt = _get_motion_prompt(scene)
+            target_duration = scene.get_animation_duration("seedance")
+
+            # Visual Workshop: Get first frame (scene's own or linked from previous)
+            first_frame = None
+            if getattr(scene, 'link_to_previous', False) and scene.index > 0:
+                # Linked to previous scene - use its last frame as our first frame
+                prev_scene = scenes[scene.index - 1]
+                if prev_scene.last_frame_path and Path(prev_scene.last_frame_path).exists():
+                    first_frame = Path(prev_scene.last_frame_path)
+                    status_placeholder.info("Using previous scene's last keyframe for smooth transition...")
+                elif prev_scene.image_path and Path(prev_scene.image_path).exists():
+                    first_frame = Path(prev_scene.image_path)
+                    status_placeholder.info("Using previous scene's image for transition...")
+            elif scene.first_frame_path and Path(scene.first_frame_path).exists():
+                # Use dedicated first frame from Visual Workshop
+                first_frame = Path(scene.first_frame_path)
+                status_placeholder.info("Using custom first keyframe...")
+
+            # Visual Workshop: Get last frame (scene's own keyframe)
+            last_frame = None
+            if scene.last_frame_path and Path(scene.last_frame_path).exists():
+                last_frame = Path(scene.last_frame_path)
+                status_placeholder.info("Using custom last keyframe...")
+            # Legacy: Extract from previous video if no keyframe
+            elif getattr(scene, 'use_previous_last_frame', False) and scene.index > 0:
+                prev_scene = scenes[scene.index - 1]
+                if prev_scene.video_path and Path(prev_scene.video_path).exists():
+                    from src.ui.page_modules._movie import extract_last_frame_from_video
+                    cache_dir = output_path.parent / "cache"
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    last_frame = extract_last_frame_from_video(Path(prev_scene.video_path), cache_dir)
+                    if last_frame:
+                        status_placeholder.info("Using extracted frame from previous video...")
+
+            # Use first_frame as image_path if available (for seamless transitions)
+            image_to_animate = first_frame if first_frame else Path(scene.image_path)
+
+            result = animator.animate_scene(
+                image_path=image_to_animate,
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=target_duration,
                 resolution=resolution.lower(),  # e.g., "480p", "720p", or "1080p"
+                last_frame=last_frame,
+                progress_callback=progress_callback,
+            )
+        elif animation_type == AnimationType.SEEDANCE_FAST:
+            # Use AtlasCloudAnimator for Seedance FAST animation (PAID, cheaper & faster)
+            from src.services.atlascloud_animator import SeedanceModel
+            animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO_FAST)
+            motion_prompt = _get_motion_prompt(scene)
+            target_duration = scene.get_animation_duration("seedance")
+
+            # Visual Workshop: Get first frame (scene's own or linked from previous)
+            first_frame = None
+            if getattr(scene, 'link_to_previous', False) and scene.index > 0:
+                prev_scene = scenes[scene.index - 1]
+                if prev_scene.last_frame_path and Path(prev_scene.last_frame_path).exists():
+                    first_frame = Path(prev_scene.last_frame_path)
+                    status_placeholder.info("Using previous scene's last keyframe for smooth transition...")
+                elif prev_scene.image_path and Path(prev_scene.image_path).exists():
+                    first_frame = Path(prev_scene.image_path)
+                    status_placeholder.info("Using previous scene's image for transition...")
+            elif scene.first_frame_path and Path(scene.first_frame_path).exists():
+                first_frame = Path(scene.first_frame_path)
+                status_placeholder.info("Using custom first keyframe...")
+
+            # Visual Workshop: Get last frame
+            last_frame = None
+            if scene.last_frame_path and Path(scene.last_frame_path).exists():
+                last_frame = Path(scene.last_frame_path)
+                status_placeholder.info("Using custom last keyframe...")
+            elif getattr(scene, 'use_previous_last_frame', False) and scene.index > 0:
+                prev_scene = scenes[scene.index - 1]
+                if prev_scene.video_path and Path(prev_scene.video_path).exists():
+                    from src.ui.page_modules._movie import extract_last_frame_from_video
+                    cache_dir = output_path.parent / "cache"
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    last_frame = extract_last_frame_from_video(Path(prev_scene.video_path), cache_dir)
+                    if last_frame:
+                        status_placeholder.info("Using extracted frame from previous video...")
+
+            image_to_animate = first_frame if first_frame else Path(scene.image_path)
+
+            result = animator.animate_scene(
+                image_path=image_to_animate,
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=target_duration,
+                resolution=resolution.lower(),
+                last_frame=last_frame,
                 progress_callback=progress_callback,
             )
 
@@ -3636,17 +4127,174 @@ def _run_scene_animation_inline(state, scene_index: int, resolution: str) -> Non
                 status_placeholder.error("Motion generation failed")
                 result = None
 
+        elif animation_type == AnimationType.ATLASCLOUD_LIPSYNC:
+            # Two-step workflow: Wan 2.6 motion → ByteDance lip sync (AtlasCloud)
+            if not audio_path or audio_path == "demo_mode":
+                status_placeholder.error("Audio required for lip sync animation")
+                return
+
+            # Step 1: Generate motion video with Wan 2.6
+            status_placeholder.info("Step 1/2: Generating motion with Wan 2.6...")
+            from src.services.atlascloud_animator import WanModel
+            animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
+            motion_prompt = _get_motion_prompt(scene)
+            # Use get_animation_duration to respect custom clip_duration
+            target_duration = scene.get_animation_duration("wan26")
+
+            motion_output = output_path.with_suffix(".motion.mp4")
+            try:
+                motion_result = animator.animate_scene(
+                    image_path=Path(scene.image_path),
+                    prompt=motion_prompt,
+                    output_path=motion_output,
+                    duration_seconds=target_duration,
+                    resolution="720p",
+                    progress_callback=progress_callback,
+                )
+            except Exception as e:
+                print(f"ByteDance Lipsync Step 1 failed: {e}")
+                status_placeholder.error(f"Motion generation failed: {str(e)[:100]}")
+                result = None
+                motion_result = None
+
+            if motion_result and motion_result.exists():
+                # Step 2: Apply ByteDance lip sync
+                status_placeholder.info("Step 2/2: Applying lip sync with ByteDance...")
+
+                # Extract audio clip matching the VIDEO duration
+                from pydub import AudioSegment
+                import tempfile
+                try:
+                    audio_segment = AudioSegment.from_file(str(audio_path))
+                    start_ms = int(scene.start_time * 1000)
+                    end_ms = int((scene.start_time + target_duration) * 1000)
+                    end_ms = min(end_ms, len(audio_segment))
+                    clip = audio_segment[start_ms:end_ms]
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        clip.export(tmp.name, format="wav")
+                        audio_clip_path = Path(tmp.name)
+
+                    result = animator.apply_lipsync(
+                        video_path=motion_result,
+                        audio_path=audio_clip_path,
+                        output_path=output_path,
+                        progress_callback=progress_callback,
+                    )
+                    audio_clip_path.unlink(missing_ok=True)
+
+                except Exception as e:
+                    print(f"ByteDance Lipsync Step 2 failed: {e}")
+                    status_placeholder.warning(f"Lip sync failed: {str(e)[:50]}. Using motion video.")
+                    result = None
+
+                if result and result.exists():
+                    motion_output.unlink(missing_ok=True)
+                else:
+                    status_placeholder.warning("Lip sync failed, using motion video as fallback")
+                    # Move motion video to output path as fallback
+                    try:
+                        import shutil
+                        shutil.move(str(motion_output), str(output_path))
+                        result = output_path
+                    except Exception as e:
+                        print(f"Fallback move failed: {e}")
+                        result = motion_output
+            else:
+                status_placeholder.error("Motion generation failed")
+                result = None
+
+        elif animation_type == AnimationType.KLING_LIPSYNC:
+            # Two-step workflow: Wan 2.6 motion → Kling lip sync (AtlasCloud)
+            if not audio_path or audio_path == "demo_mode":
+                status_placeholder.error("Audio required for lip sync animation")
+                return
+
+            # Step 1: Generate motion video with Wan 2.6
+            status_placeholder.info("Step 1/2: Generating motion with Wan 2.6...")
+            from src.services.atlascloud_animator import WanModel
+            animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
+            motion_prompt = _get_motion_prompt(scene)
+            target_duration = scene.get_animation_duration("wan26")
+
+            motion_output = output_path.with_suffix(".motion.mp4")
+            try:
+                motion_result = animator.animate_scene(
+                    image_path=Path(scene.image_path),
+                    prompt=motion_prompt,
+                    output_path=motion_output,
+                    duration_seconds=target_duration,
+                    resolution="720p",
+                    progress_callback=progress_callback,
+                )
+            except Exception as e:
+                print(f"Kling Lipsync Step 1 failed: {e}")
+                status_placeholder.error(f"Motion generation failed: {str(e)[:100]}")
+                result = None
+                motion_result = None
+
+            if motion_result and motion_result.exists():
+                # Step 2: Apply Kling lip sync
+                status_placeholder.info("Step 2/2: Applying lip sync with Kling (AtlasCloud)...")
+
+                try:
+                    from pydub import AudioSegment
+                    import tempfile
+                    audio_segment = AudioSegment.from_file(str(audio_path))
+                    start_ms = int(scene.start_time * 1000)
+                    end_ms = int((scene.start_time + target_duration) * 1000)
+                    end_ms = min(end_ms, len(audio_segment))
+                    clip = audio_segment[start_ms:end_ms]
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        clip.export(tmp.name, format="wav")
+                        audio_clip_path = Path(tmp.name)
+
+                    result = animator.apply_kling_lipsync(
+                        video_path=motion_result,
+                        audio_path=audio_clip_path,
+                        output_path=output_path,
+                        progress_callback=progress_callback,
+                    )
+                    audio_clip_path.unlink(missing_ok=True)
+
+                except Exception as e:
+                    print(f"Kling Lipsync Step 2 failed: {e}")
+                    status_placeholder.warning(f"Lip sync failed: {str(e)[:50]}. Using motion video.")
+                    result = None
+
+                if result and result.exists():
+                    motion_output.unlink(missing_ok=True)
+                else:
+                    status_placeholder.warning("Lip sync failed, using motion video as fallback")
+                    try:
+                        import shutil
+                        shutil.move(str(motion_output), str(output_path))
+                        result = output_path
+                    except Exception as e:
+                        print(f"Fallback move failed: {e}")
+                        result = motion_output
+            else:
+                status_placeholder.error("Motion generation failed")
+                result = None
+
         if result and result.exists():
+            # Update the scene in the state
             scenes[scene_index].video_path = result
             scenes[scene_index].animated = True
             scenes[scene_index].animation_type = animation_type
-            update_state(scenes=scenes)
+
+            # Force state update by creating a new list reference
+            # This ensures Streamlit detects the change
+            state.scenes = list(scenes)
+
             # Persist to scenes.json so animations are recognized after recovery
             save_scene_metadata(Path(project_dir), scenes)
+
+            print(f"✅ Animation complete: Scene {scene_index} -> {result.name}")
             status_placeholder.success("Animation complete!")
             # Rerun to show the video in the storyboard
             st.rerun()
         else:
+            print(f"❌ Animation failed for scene {scene_index}: result={result}")
             # Use captured error message if available, otherwise generic message
             if error_msg_holder["msg"]:
                 status_placeholder.error(error_msg_holder["msg"])
@@ -3684,9 +4332,26 @@ def render_scene_card(state, scene: Scene) -> None:
 
     # Check for animation: first from scene.video_path, then check disk for existing file
     animation_path = None
-    if getattr(scene, 'video_path', None) and Path(scene.video_path).exists():
-        animation_path = Path(scene.video_path)
-    elif has_image:
+    raw_video_path = getattr(scene, 'video_path', None)
+    if raw_video_path:
+        # Handle both Path objects and strings
+        if isinstance(raw_video_path, Path):
+            video_path_obj = raw_video_path
+        else:
+            # Convert string to Path - handle edge case where str(Path) was used
+            video_path_str = str(raw_video_path)
+            # Check for accidental repr() serialization like "PosixPath('/path')"
+            if video_path_str.startswith(("PosixPath(", "WindowsPath(")):
+                # Extract the actual path from the repr
+                import re
+                match = re.search(r"Path\('([^']+)'\)", video_path_str)
+                if match:
+                    video_path_str = match.group(1)
+            video_path_obj = Path(video_path_str)
+
+        if video_path_obj.exists():
+            animation_path = video_path_obj
+    if animation_path is None and has_image:
         # Try to find animation based on scene index - derive project dir from image path
         # Image is at: {project_dir}/images/scene_{idx:03d}.png
         # Animation at: {project_dir}/animations/animated_scene_{idx:03d}.mp4
@@ -3774,12 +4439,16 @@ def render_scene_card(state, scene: Scene) -> None:
             "Static": AnimationType.NONE,
             "Wan S2V Lip (FREE, HF)": AnimationType.LIP_SYNC,
             "Wan TI2V (FREE, HF)": AnimationType.PROMPT,
-            "Wan 2.5 I2V (AtlasCloud)": AnimationType.ATLASCLOUD,
-            "Seedance 1.5 (AtlasCloud)": AnimationType.SEEDANCE,
+            "Wan 2.6 I2V (AtlasCloud)": AnimationType.ATLASCLOUD,
+            "Wan 2.6 Fast (AtlasCloud)": AnimationType.ATLASCLOUD_FAST,
+            "Seedance 1.5 Pro (AtlasCloud)": AnimationType.SEEDANCE,
+            "Seedance 1.5 Fast (AtlasCloud)": AnimationType.SEEDANCE_FAST,
             "Veo 3.1 (Google)": AnimationType.VEO,
             "Kling Lip (fal.ai)": AnimationType.KLING,
             "Wan S2V (fal.ai)": AnimationType.WAN_S2V,
             "Seedance+Kling (Atlas+fal)": AnimationType.SEEDANCE_LIPSYNC,
+            "ByteDance Lipsync (AtlasCloud)": AnimationType.ATLASCLOUD_LIPSYNC,
+            "Kling Lipsync (AtlasCloud)": AnimationType.KLING_LIPSYNC,
         }
         anim_labels = list(anim_options.keys())
         current_idx = list(anim_options.values()).index(current_anim_type) if current_anim_type in anim_options.values() else 0
@@ -3795,7 +4464,7 @@ def render_scene_card(state, scene: Scene) -> None:
         new_anim_type = anim_options[selected_anim_label]
 
         # Show motion prompt input if prompt-based animation is selected
-        if new_anim_type in (AnimationType.PROMPT, AnimationType.VEO, AnimationType.ATLASCLOUD, AnimationType.SEEDANCE, AnimationType.WAN_S2V, AnimationType.SEEDANCE_LIPSYNC):
+        if new_anim_type in (AnimationType.PROMPT, AnimationType.VEO, AnimationType.ATLASCLOUD, AnimationType.ATLASCLOUD_FAST, AnimationType.SEEDANCE, AnimationType.SEEDANCE_FAST, AnimationType.WAN_S2V, AnimationType.SEEDANCE_LIPSYNC):
             widget_key = f"motion_prompt_{scene.index}"
             ai_result_key = f"_ai_motion_result_{scene.index}"
             scene_motion_prompt = getattr(scene, 'motion_prompt', None)
@@ -3857,7 +4526,7 @@ def render_scene_card(state, scene: Scene) -> None:
                 # Clear video path when disabling animation
                 scenes[scene.index].video_path = None
             # Auto-fill motion prompt with a short action description when switching to prompt-based animation
-            elif new_anim_type in (AnimationType.PROMPT, AnimationType.VEO, AnimationType.ATLASCLOUD, AnimationType.SEEDANCE, AnimationType.SEEDANCE_LIPSYNC):
+            elif new_anim_type in (AnimationType.PROMPT, AnimationType.VEO, AnimationType.ATLASCLOUD, AnimationType.ATLASCLOUD_FAST, AnimationType.SEEDANCE, AnimationType.SEEDANCE_FAST, AnimationType.SEEDANCE_LIPSYNC):
                 if not getattr(scenes[scene.index], 'motion_prompt', None):
                     short_motion = _get_motion_prompt(scene)
                     scenes[scene.index].motion_prompt = short_motion
@@ -3873,7 +4542,7 @@ def render_scene_card(state, scene: Scene) -> None:
             # Show expected animation duration based on type
             # Use ceil to show the actual duration that will be requested (avoids Ken Burns padding)
             scene_dur = scene.duration
-            if new_anim_type in (AnimationType.SEEDANCE, AnimationType.SEEDANCE_LIPSYNC):
+            if new_anim_type in (AnimationType.SEEDANCE, AnimationType.SEEDANCE_FAST, AnimationType.SEEDANCE_LIPSYNC):
                 anim_dur = min(12, max(2, math.ceil(scene_dur)))
                 st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, Seedance: 2-12s)")
             elif new_anim_type == AnimationType.KLING:
@@ -3886,9 +4555,16 @@ def render_scene_card(state, scene: Scene) -> None:
                     st.caption(f"Duration: {scene_dur:.1f}s ({num_segments} segments, chained)")
                 else:
                     st.caption(f"Duration: {scene_dur:.1f}s (Wan S2V @ 16fps)")
-            elif new_anim_type == AnimationType.ATLASCLOUD:
-                anim_dur = 5 if scene_dur < 7.5 else 10
-                st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, AtlasCloud: 5 or 10s)")
+            elif new_anim_type in (AnimationType.ATLASCLOUD, AnimationType.ATLASCLOUD_FAST):
+                custom_dur = getattr(scene, 'clip_duration', None)
+                anim_dur = custom_dur if custom_dur else (5 if scene_dur < 7.5 else 10)
+                fast_label = " Fast" if new_anim_type == AnimationType.ATLASCLOUD_FAST else ""
+                custom_label = " (custom)" if custom_dur else ""
+                st.caption(f"Duration: {anim_dur}s{custom_label} (scene is {scene_dur:.1f}s, Wan 2.6{fast_label}: 5/10/15s)")
+            elif new_anim_type in (AnimationType.SEEDANCE, AnimationType.SEEDANCE_FAST):
+                anim_dur = min(12, max(2, math.ceil(scene_dur)))
+                fast_label = " Fast" if new_anim_type == AnimationType.SEEDANCE_FAST else " Pro"
+                st.caption(f"Duration: {anim_dur}s (scene is {scene_dur:.1f}s, Seedance{fast_label}: 2-12s)")
             elif new_anim_type == AnimationType.VEO:
                 st.caption(f"Duration: {scene_dur:.1f}s (Veo chains segments for long scenes)")
             else:
@@ -3909,11 +4585,15 @@ def render_scene_card(state, scene: Scene) -> None:
                     AnimationType.LIP_SYNC: "Wan S2V Lip (HF)",
                     AnimationType.PROMPT: "Wan TI2V (HF)",
                     AnimationType.VEO: "Veo 3.1 (Google)",
-                    AnimationType.ATLASCLOUD: "Wan 2.5 (AtlasCloud)",
-                    AnimationType.SEEDANCE: "Seedance 1.5 (AtlasCloud)",
+                    AnimationType.ATLASCLOUD: "Wan 2.6 (AtlasCloud)",
+                    AnimationType.ATLASCLOUD_FAST: "Wan 2.6 Fast (AtlasCloud)",
+                    AnimationType.SEEDANCE: "Seedance 1.5 Pro (AtlasCloud)",
+                    AnimationType.SEEDANCE_FAST: "Seedance 1.5 Fast (AtlasCloud)",
                     AnimationType.KLING: "Kling Lip (fal.ai)",
                     AnimationType.WAN_S2V: "Wan S2V (fal.ai)",
                     AnimationType.SEEDANCE_LIPSYNC: "Seedance+Kling (Atlas+fal)",
+                    AnimationType.ATLASCLOUD_LIPSYNC: "ByteDance Lipsync (AtlasCloud)",
+                    AnimationType.KLING_LIPSYNC: "Kling Lipsync (AtlasCloud)",
                 }
                 anim_type_name = anim_type_names.get(new_anim_type, "Animation")
                 if st.button(button_label, key=f"animate_{scene.index}", help=f"Generate {anim_type_name} animation"):
@@ -3955,6 +4635,51 @@ def render_scene_card(state, scene: Scene) -> None:
                 _adjust_scene_timing(state, scene.index, new_start_time, new_end_time)
                 st.success(f"Timing updated: {new_start_time:.1f}s - {new_end_time:.1f}s")
                 st.rerun()
+
+        st.markdown("---")
+
+        # Animation duration override and continuity settings
+        st.markdown("**Animation Settings**")
+        anim_settings_cols = st.columns(2)
+        with anim_settings_cols[0]:
+            current_clip_dur = getattr(scene, 'clip_duration', None)
+            new_clip_dur = st.number_input(
+                "Animation Duration (s)",
+                min_value=0,
+                max_value=15,
+                value=current_clip_dur or 0,
+                step=1,
+                key=f"clip_duration_{scene.index}",
+                help="Override animation duration (0 = auto based on scene duration)"
+            )
+            # Store 0 as None
+            new_clip_dur = None if new_clip_dur == 0 else new_clip_dur
+            if new_clip_dur != current_clip_dur:
+                scenes = state.scenes
+                scenes[scene.index].clip_duration = new_clip_dur
+                update_state(scenes=scenes)
+
+        with anim_settings_cols[1]:
+            # Only show last frame option if there's a previous scene with video
+            can_use_last_frame = scene.index > 0
+            if can_use_last_frame:
+                prev_scene = state.scenes[scene.index - 1]
+                has_prev_video = prev_scene.video_path and Path(prev_scene.video_path).exists()
+            else:
+                has_prev_video = False
+
+            current_use_last_frame = getattr(scene, 'use_previous_last_frame', False)
+            new_use_last_frame = st.checkbox(
+                "Use prev. last frame",
+                value=current_use_last_frame,
+                key=f"use_last_frame_{scene.index}",
+                disabled=not has_prev_video,
+                help="Use last frame from previous scene's animation for smooth transitions (Seedance only)"
+            )
+            if new_use_last_frame != current_use_last_frame:
+                scenes = state.scenes
+                scenes[scene.index].use_previous_last_frame = new_use_last_frame
+                update_state(scenes=scenes)
 
         st.markdown("---")
 
@@ -4849,7 +5574,9 @@ def _animate_single_scene_worker(
         AnimationType.PROMPT: "Wan TI2V (HF)",
         AnimationType.VEO: "Veo 3.1 (Google)",
         AnimationType.ATLASCLOUD: "Wan 2.5 (AtlasCloud)",
-        AnimationType.SEEDANCE: "Seedance 1.5 (AtlasCloud)",
+        AnimationType.ATLASCLOUD_FAST: "Wan 2.5 Fast (AtlasCloud)",
+        AnimationType.SEEDANCE: "Seedance 1.5 Pro (AtlasCloud)",
+        AnimationType.SEEDANCE_FAST: "Seedance 1.5 Fast (AtlasCloud)",
         AnimationType.KLING: "Kling Lip (fal.ai)",
         AnimationType.WAN_S2V: "Wan S2V (fal.ai)",
         AnimationType.SEEDANCE_LIPSYNC: "Seedance+Kling (Atlas+fal)",
@@ -4913,8 +5640,23 @@ def _animate_single_scene_worker(
             )
 
         elif anim_type == AnimationType.ATLASCLOUD:
+            from src.services.atlascloud_animator import WanModel
             messages.append(f"Using AtlasCloud Wan 2.5 (PAID)")
-            animator = AtlasCloudAnimator()
+            animator = AtlasCloudAnimator(model=WanModel.IMAGE_TO_VIDEO)
+            motion_prompt = _get_motion_prompt(scene)
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=5 if scene.duration < 7.5 else 10,
+                resolution="720p",
+                progress_callback=progress_callback,
+            )
+
+        elif anim_type == AnimationType.ATLASCLOUD_FAST:
+            from src.services.atlascloud_animator import WanModel
+            messages.append(f"Using AtlasCloud Wan 2.5 Fast (PAID, cheaper)")
+            animator = AtlasCloudAnimator(model=WanModel.WAN_25_FAST)
             motion_prompt = _get_motion_prompt(scene)
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
@@ -4926,10 +5668,26 @@ def _animate_single_scene_worker(
             )
 
         elif anim_type == AnimationType.SEEDANCE:
+            from src.services.atlascloud_animator import SeedanceModel
             messages.append(f"Using Seedance Pro (PAID)")
-            animator = SeedanceAnimator()
+            animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO)
             motion_prompt = _get_motion_prompt(scene)
             # Use ceil to ensure animation covers full scene (avoids Ken Burns padding)
+            target_duration = min(12, max(2, math.ceil(scene.duration)))
+            result = animator.animate_scene(
+                image_path=Path(scene.image_path),
+                prompt=motion_prompt,
+                output_path=output_path,
+                duration_seconds=target_duration,
+                resolution="720p",
+                progress_callback=progress_callback,
+            )
+
+        elif anim_type == AnimationType.SEEDANCE_FAST:
+            from src.services.atlascloud_animator import SeedanceModel
+            messages.append(f"Using Seedance Fast (PAID, cheaper)")
+            animator = AtlasCloudAnimator(model=SeedanceModel.IMAGE_TO_VIDEO_FAST)
+            motion_prompt = _get_motion_prompt(scene)
             target_duration = min(12, max(2, math.ceil(scene.duration)))
             result = animator.animate_scene(
                 image_path=Path(scene.image_path),
@@ -5249,7 +6007,9 @@ def generate_animations(state, resolution: str = "480P", is_demo_mode: bool = Fa
                     AnimationType.PROMPT: "Wan TI2V (HF)",
                     AnimationType.VEO: "Veo 3.1 (Google)",
                     AnimationType.ATLASCLOUD: "Wan 2.5 (AtlasCloud)",
-                    AnimationType.SEEDANCE: "Seedance 1.5 (AtlasCloud)",
+                    AnimationType.ATLASCLOUD_FAST: "Wan 2.5 Fast (AtlasCloud)",
+                    AnimationType.SEEDANCE: "Seedance 1.5 Pro (AtlasCloud)",
+                    AnimationType.SEEDANCE_FAST: "Seedance 1.5 Fast (AtlasCloud)",
                     AnimationType.KLING: "Kling Lip (fal.ai)",
                     AnimationType.WAN_S2V: "Wan S2V (fal.ai)",
                     AnimationType.SEEDANCE_LIPSYNC: "Seedance+Kling (Atlas+fal)",
@@ -5470,6 +6230,34 @@ def generate_video_from_storyboard(state, crossfade: float, is_demo_mode: bool) 
                 fps=fps,
                 extension_mode=ext_mode,
             )
+
+            # Step 3: Apply music tail if enabled (fade to black with music continuing)
+            music_tail_enabled = getattr(state, 'music_tail_enabled', False)
+            if music_tail_enabled and output_path.exists():
+                st.write("Applying music tail (fade to black with music)...")
+                from src.services.video_generator import apply_music_tail
+
+                tail_duration = getattr(state, 'music_tail_duration', 5.0)
+                swell_factor = getattr(state, 'music_tail_swell', 1.0)
+                fade_out = getattr(state, 'music_tail_fade_out', 2.0)
+
+                # Create temp output, then replace original
+                tail_output = project_dir / f"{project_name}_tail.mp4"
+                apply_music_tail(
+                    video_path=output_path,
+                    output_path=tail_output,
+                    tail_duration=tail_duration,
+                    swell_factor=swell_factor,
+                    fade_out_duration=fade_out,
+                    video_fade_duration=1.0,
+                )
+
+                # Replace original with tailed version
+                if tail_output.exists():
+                    import shutil
+                    output_path.unlink()
+                    shutil.move(str(tail_output), str(output_path))
+                    st.write(f"   Music tail added: {tail_duration:.1f}s fade to black")
 
         update_state(final_video_path=str(output_path))
         status.update(label="Video complete!", state="complete")

@@ -34,11 +34,12 @@ logger = logging.getLogger(__name__)
 
 class WanModel(str, Enum):
     """Available WAN 2.6 models on AtlasCloud."""
-    TEXT_TO_VIDEO = "alibaba/wan-2.6/text-to-video"
-    IMAGE_TO_VIDEO = "alibaba/wan-2.6/image-to-video"
-    VIDEO_TO_VIDEO = "alibaba/wan-2.6/video-to-video"
+    # Wan 2.6 (latest - with native audio generation and lip sync)
+    TEXT_TO_VIDEO = "alibaba/wan-2.6/text-to-video"  # $0.075/s
+    IMAGE_TO_VIDEO = "alibaba/wan-2.6/image-to-video"  # $0.075/s - supports audio param for lip sync
+    VIDEO_TO_VIDEO = "alibaba/wan-2.6/video-to-video"  # $0.075/s
     # Legacy models for backwards compatibility
-    WAN_25_FAST = "alibaba/wan-2.5/image-to-video-fast"
+    WAN_25_FAST = "alibaba/wan-2.5/image-to-video-fast"  # Faster, cheaper
 
 
 class AtlasCloudTimeoutError(Exception):
@@ -58,6 +59,18 @@ class SeedanceModel(str, Enum):
     IMAGE_TO_VIDEO_FAST = "bytedance/seedance-v1-pro-fast/image-to-video"
     # Lip Sync (post-processing: syncs lips in video to audio)
     LIPSYNC = "bytedance/lipsync/audio-to-video"
+
+
+class KlingModel(str, Enum):
+    """Available Kling models on AtlasCloud."""
+    # Kling 2.6 Pro - latest with native audio generation
+    KLING_26_PRO_T2V = "kwaivgi/kling-2.6-pro/text-to-video"
+    KLING_26_PRO_I2V = "kwaivgi/kling-2.6-pro/image-to-video"
+    # Kling v2.5 Turbo Pro - faster
+    KLING_25_TURBO_I2V = "kwaivgi/kling-2.5-turbo-pro/image-to-video"
+    # Kling Lip Sync models
+    LIPSYNC_AUDIO = "kwaivgi/kling-lipsync/audio-to-video"  # Syncs lips to audio ($0.15/s)
+    LIPSYNC_TEXT = "kwaivgi/kling-lipsync/text-to-video"  # Animates lips from text ($0.028/s)
 
 
 def format_wan_prompt(prompt: str, camera_hint: str = None, multi_shot: bool = True) -> str:
@@ -464,11 +477,11 @@ class AtlasCloudAnimator:
                         payload["negative_prompt"] = "photorealistic, real photo, live action, 2D, flat"
                     # else: no negative prompt for other styles
 
-                # Note: audio parameter for Seedance lip sync is not in official API docs
-                # It may be an undocumented feature - keeping for experimental use
-                if audio_path and audio_path.exists() and is_seedance:
-                    payload["audio"] = self._encode_file(audio_path)
-                    logger.warning("Using undocumented 'audio' param for Seedance - may not work")
+                # Note: Wan 2.6 and Seedance use generate_audio=True for OUTPUT generation
+                # They do NOT accept external audio input for lip sync
+                # For audio-driven lip sync, use:
+                #   - Wan S2V via fal.ai (WanS2VAnimator)
+                #   - ByteDance/Kling lipsync post-processing (apply_lipsync methods)
 
                 # Seed handling for WAN (Seedance seed already set above)
                 if not is_seedance:
@@ -873,6 +886,15 @@ class AtlasCloudAnimator:
             video_data = self._encode_file(video_path)
             audio_data = self._encode_file(audio_path)
 
+            # Log what we're sending
+            print(f"\n{'='*70}")
+            print(f"🎤 BYTEDANCE LIPSYNC API REQUEST")
+            print(f"{'='*70}")
+            print(f"MODEL: {SeedanceModel.LIPSYNC.value}")
+            print(f"VIDEO: {video_path.name} ({len(video_data)} bytes base64)")
+            print(f"AUDIO: {audio_path.name} ({len(audio_data)} bytes base64)")
+            print(f"{'='*70}\n")
+
             payload = {
                 "model": SeedanceModel.LIPSYNC.value,
                 "video": video_data,
@@ -1049,6 +1071,133 @@ class AtlasCloudAnimator:
             pass
 
         return result
+
+    def apply_kling_lipsync(
+        self,
+        video_path: Path,
+        audio_path: Path,
+        output_path: Path,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+        poll_interval: float = 5.0,
+        max_wait_time: float = 300.0,
+    ) -> Optional[Path]:
+        """Apply Kling lip sync to an existing video.
+
+        Uses Kling's lipsync/audio-to-video model to synchronize
+        lip movements with the provided audio.
+
+        Args:
+            video_path: Path to the input video
+            audio_path: Path to the audio file (speech/singing)
+            output_path: Path to save the lip-synced video
+            progress_callback: Optional progress callback
+            poll_interval: Seconds between status polls
+            max_wait_time: Maximum wait time in seconds
+
+        Returns:
+            Path to the lip-synced video, or None if failed
+        """
+        if progress_callback:
+            progress_callback("Preparing Kling lip sync...", 0.1)
+
+        try:
+            # Encode video and audio as base64
+            video_data = self._encode_file(video_path)
+            audio_data = self._encode_file(audio_path)
+
+            payload = {
+                "model": KlingModel.LIPSYNC_AUDIO.value,
+                "video": video_data,
+                "audio": audio_data,
+            }
+
+            if progress_callback:
+                progress_callback("Submitting to Kling lip sync...", 0.2)
+
+            # Submit generation request
+            response = requests.post(
+                f"{self.BASE_URL}/generateVideo",
+                headers=self._get_headers(),
+                json=payload,
+                timeout=180,
+            )
+
+            if response.status_code != 200:
+                logger.error(f"Kling lip sync request failed: {response.status_code} - {response.text}")
+                return None
+
+            result = response.json()
+            if result.get("code") != 200:
+                logger.error(f"Kling lip sync API error: {result}")
+                return None
+
+            request_id = result.get("data", {}).get("id")
+            if not request_id:
+                logger.error("No request ID in Kling lip sync response")
+                return None
+
+            if progress_callback:
+                progress_callback("Processing Kling lip sync...", 0.3)
+
+            # Poll for completion
+            start_time = time.time()
+            while time.time() - start_time < max_wait_time:
+                status_response = requests.get(
+                    f"{self.BASE_URL}/result/{request_id}",
+                    headers=self._get_headers(),
+                    timeout=30,
+                )
+
+                if status_response.status_code != 200:
+                    time.sleep(poll_interval)
+                    continue
+
+                status_result = status_response.json()
+                data = status_result.get("data", {})
+                status = data.get("status", "").lower()
+
+                if status in ("completed", "succeeded"):
+                    outputs = data.get("outputs", [])
+                    if outputs:
+                        video_url = outputs[0]
+                        if progress_callback:
+                            progress_callback("Downloading Kling lip-synced video...", 0.9)
+
+                        # Download the video
+                        video_response = requests.get(video_url, timeout=120)
+                        if video_response.status_code == 200:
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+                            with open(output_path, "wb") as f:
+                                f.write(video_response.content)
+
+                            if progress_callback:
+                                progress_callback("Kling lip sync complete!", 1.0)
+
+                            logger.info(f"Kling lip-synced video saved to: {output_path}")
+                            return output_path
+
+                    logger.error("No outputs in Kling lip sync response")
+                    return None
+
+                elif status == "failed":
+                    error = data.get("error", "Unknown error")
+                    logger.error(f"Kling lip sync failed: {error}")
+                    return None
+
+                # Update progress
+                elapsed = time.time() - start_time
+                progress = 0.3 + (0.6 * min(elapsed / max_wait_time, 1.0))
+                if progress_callback:
+                    progress_callback(f"Kling lip sync processing... ({int(elapsed)}s)", progress)
+
+                time.sleep(poll_interval)
+
+            logger.error("Kling lip sync timed out")
+            return None
+
+        except Exception as e:
+            logger.error(f"Kling lip sync error: {e}", exc_info=True)
+            return None
 
 
 def check_atlascloud_available() -> bool:

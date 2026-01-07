@@ -2765,7 +2765,14 @@ IMPORTANT:
 - If combining/merging scenes, put merged content in one scene_update and add other scene(s) to scenes_to_delete
 - Always include visual_prompt and video_prompt when updating scenes
 - Only include sections that have actual changes
-- Return empty object {{}} if no clear changes to apply.""",
+- Return empty object {{}} if no clear changes to apply
+
+JSON FORMATTING RULES (CRITICAL):
+- NO trailing commas after the last item in arrays or objects
+- ALL strings must be properly escaped (use \\n for newlines, \\" for quotes)
+- Use double quotes for all strings, never single quotes
+- Ensure all brackets and braces are properly balanced
+- Keep the JSON compact and valid""",
                                     messages=[{"role": "user", "content": f"Extract changes from:\n\n{last_response}"}]
                                 )
 
@@ -2774,7 +2781,28 @@ IMPORTANT:
                                 # Try to extract JSON from response
                                 json_match = re.search(r'\{[\s\S]*\}', json_text)
                                 if json_match:
-                                    changes = json.loads(json_match.group())
+                                    raw_json = json_match.group()
+                                    # Try to fix common JSON issues from LLM output
+                                    try:
+                                        changes = json.loads(raw_json)
+                                    except json.JSONDecodeError as e:
+                                        # Attempt to repair common issues
+                                        fixed_json = raw_json
+                                        # Remove trailing commas before } or ]
+                                        fixed_json = re.sub(r',\s*}', '}', fixed_json)
+                                        fixed_json = re.sub(r',\s*]', ']', fixed_json)
+                                        # Fix unescaped newlines in strings
+                                        fixed_json = re.sub(r'(?<!\\)\n', '\\n', fixed_json)
+                                        # Try parsing again
+                                        try:
+                                            changes = json.loads(fixed_json)
+                                        except json.JSONDecodeError:
+                                            # Last resort: try to parse with ast.literal_eval for Python-like syntax
+                                            st.warning(f"JSON had issues at position {e.pos}: {e.msg}. Attempting repair...")
+                                            # Show a snippet around the error
+                                            error_context = raw_json[max(0, e.pos-50):e.pos+50]
+                                            st.code(f"...{error_context}...", language="json")
+                                            raise
                                 else:
                                     changes = {}
 
