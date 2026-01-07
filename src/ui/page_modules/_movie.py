@@ -1134,46 +1134,70 @@ def render_setup_page() -> None:
             selected_seedance_resolution = getattr(current_config, 'seedance_resolution', '720p')
             selected_seedance_lip_sync = getattr(current_config, 'seedance_lip_sync', True)
 
-        # Visual style with custom option - photorealistic first for realistic output
-        visual_styles = [
-            "photorealistic, cinematic lighting, 8K quality",
-            "cinematic film, natural lighting",
-            "animated digital art",
-            "3D animated, Pixar style",
-            "anime style",
-            "watercolor illustration",
-            "comic book style",
-            "✏️ Custom...",
-        ]
+        # Visual style with buttons like Tone section
+        st.markdown("##### 🎨 Visual Style")
 
-        # Check if current style is custom (not in presets)
-        preset_styles = visual_styles[:-1]  # All except "Custom..."
-        is_custom_style = current_config.visual_style not in preset_styles
+        # Define visual styles with labels and descriptions
+        visual_style_options = {
+            "photorealistic, cinematic lighting, 8K quality": ("📷 Photorealistic", "Cinema-quality realistic visuals"),
+            "cinematic film, natural lighting": ("🎬 Cinematic", "Natural film look"),
+            "animated digital art": ("🎨 Digital Art", "Stylized digital art"),
+            "3D animated, Pixar style": ("🧊 3D/Pixar", "3D animated style"),
+            "anime style": ("🌸 Anime", "Japanese anime style"),
+            "watercolor illustration": ("🖌️ Watercolor", "Painted watercolor look"),
+            "comic book style": ("💥 Comic", "Comic book style"),
+        }
 
-        style_col1, style_col2 = st.columns([2, 3])
+        # Initialize session state for visual style
+        if "setup_selected_visual_style" not in st.session_state:
+            st.session_state.setup_selected_visual_style = current_config.visual_style
+        if "setup_custom_visual_style_enabled" not in st.session_state:
+            # Check if current style is custom
+            st.session_state.setup_custom_visual_style_enabled = current_config.visual_style not in visual_style_options
+        if "setup_custom_visual_style_text" not in st.session_state:
+            st.session_state.setup_custom_visual_style_text = current_config.visual_style if current_config.visual_style not in visual_style_options else ""
 
-        with style_col1:
-            selected_style_option = st.selectbox(
-                "Visual Style",
-                options=visual_styles,
-                index=len(visual_styles) - 1 if is_custom_style else visual_styles.index(current_config.visual_style),
-                key="setup_visual_style",
+        # Create button columns for visual styles
+        style_cols = st.columns(len(visual_style_options) + 1)  # +1 for Custom
+
+        for i, (style_key, (label, desc)) in enumerate(visual_style_options.items()):
+            with style_cols[i]:
+                is_selected = st.session_state.setup_selected_visual_style == style_key and not st.session_state.setup_custom_visual_style_enabled
+                if st.button(
+                    label,
+                    key=f"vstyle_{i}",
+                    use_container_width=True,
+                    type="primary" if is_selected else "secondary",
+                    help=desc,
+                ):
+                    st.session_state.setup_selected_visual_style = style_key
+                    st.session_state.setup_custom_visual_style_enabled = False
+                    st.rerun()
+
+        # Custom style button
+        with style_cols[-1]:
+            if st.button(
+                "✏️ Custom",
+                key="vstyle_custom",
+                use_container_width=True,
+                type="primary" if st.session_state.setup_custom_visual_style_enabled else "secondary",
+                help="Enter your own style description",
+            ):
+                st.session_state.setup_custom_visual_style_enabled = True
+                st.rerun()
+
+        # Custom style text input
+        if st.session_state.setup_custom_visual_style_enabled:
+            custom_style_value = st.text_input(
+                "Describe your visual style",
+                value=st.session_state.setup_custom_visual_style_text,
+                placeholder="e.g., Oil painting, cyberpunk neon, hand-drawn sketch...",
+                key="setup_custom_visual_style_input",
             )
-
-        with style_col2:
-            if selected_style_option == "✏️ Custom...":
-                custom_style_value = current_config.visual_style if is_custom_style else ""
-                selected_style = st.text_input(
-                    "Custom style description",
-                    value=custom_style_value,
-                    placeholder="e.g., Oil painting, cyberpunk neon, hand-drawn sketch...",
-                    key="setup_custom_visual_style",
-                )
-                if not selected_style:
-                    selected_style = "animated digital art"  # Fallback
-            else:
-                selected_style = selected_style_option
-                st.markdown("")  # Empty space for alignment
+            st.session_state.setup_custom_visual_style_text = custom_style_value
+            selected_style = custom_style_value if custom_style_value else "animated digital art"
+        else:
+            selected_style = st.session_state.setup_selected_visual_style
 
         # Show WAN 2.6 negative prompt preview based on style
         style_lower = (selected_style or "").lower()
@@ -2686,11 +2710,23 @@ def render_scenes_page() -> None:
             if "scene_assistant_messages" not in st.session_state:
                 st.session_state.scene_assistant_messages = []
 
+            # Initialize image attachments
+            if "scene_assistant_images" not in st.session_state:
+                st.session_state.scene_assistant_images = []
+
             # Display chat history with styled bubbles
             for msg_idx, msg in enumerate(st.session_state.scene_assistant_messages[-6:]):
                 # Show which model was used for this message
                 msg_model = msg.get("model", selected_ai_model) if msg["role"] == "assistant" else None
                 model_display = "haiku" if msg_model and "haiku" in msg_model else "sonnet" if msg_model else None
+
+                # Display attached images for user messages
+                if msg["role"] == "user" and msg.get("images"):
+                    cols = st.columns(min(len(msg["images"]), 4))
+                    for img_idx, img_data in enumerate(msg["images"][:4]):
+                        with cols[img_idx]:
+                            st.image(img_data, width=100, caption=f"Image {img_idx + 1}")
+
                 render_chat_message(
                     content=msg["content"],
                     role=msg["role"],
@@ -2987,12 +3023,63 @@ JSON FORMATTING RULES (CRITICAL):
                 with apply_col2:
                     if st.button("🗑️ Clear Chat", key="clear_scene_chat"):
                         st.session_state.scene_assistant_messages = []
+                        st.session_state.scene_assistant_images = []
                         st.rerun()
+
+            # Image upload section
+            img_col1, img_col2 = st.columns([3, 1])
+            with img_col1:
+                uploaded_images = st.file_uploader(
+                    "📎 Attach images (optional)",
+                    type=["png", "jpg", "jpeg", "gif", "webp"],
+                    accept_multiple_files=True,
+                    key="scene_assistant_img_upload",
+                    help="Upload images to show the AI what you're referring to"
+                )
+            with img_col2:
+                if uploaded_images:
+                    st.caption(f"{len(uploaded_images)} image(s) attached")
+                    # Preview thumbnails
+                    for img in uploaded_images[:2]:
+                        st.image(img, width=50)
 
             # Chat input
             user_input = st.chat_input("e.g., 'Add more tension to scene 2' or 'Rewrite the dialogue to be funnier'")
             if user_input:
-                st.session_state.scene_assistant_messages.append({"role": "user", "content": user_input})
+                import base64
+
+                # Process uploaded images - read bytes first before file streams are consumed
+                image_data_list = []
+                image_bytes_for_display = []
+                if uploaded_images:
+                    for img_file in uploaded_images[:4]:  # Max 4 images
+                        img_bytes = img_file.getvalue()  # Use getvalue() to get all bytes
+                        image_bytes_for_display.append(img_bytes)
+                        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+                        # Determine media type
+                        if img_file.name.lower().endswith(".png"):
+                            media_type = "image/png"
+                        elif img_file.name.lower().endswith(".gif"):
+                            media_type = "image/gif"
+                        elif img_file.name.lower().endswith(".webp"):
+                            media_type = "image/webp"
+                        else:
+                            media_type = "image/jpeg"
+                        image_data_list.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": img_b64
+                            }
+                        })
+
+                # Store message with images for display
+                st.session_state.scene_assistant_messages.append({
+                    "role": "user",
+                    "content": user_input,
+                    "images": image_bytes_for_display if image_bytes_for_display else None
+                })
 
                 # Build context about current scenes
                 scene_context = "Current scenes:\n"
@@ -3016,10 +3103,27 @@ JSON FORMATTING RULES (CRITICAL):
                         from src.config import config
 
                         client = Anthropic(api_key=config.anthropic_api_key)
+
+                        # Build messages with vision support
+                        api_messages = []
+                        for m in st.session_state.scene_assistant_messages:
+                            if m["role"] == "user":
+                                # Check if this message has images (it's the current message)
+                                if m.get("images") and m == st.session_state.scene_assistant_messages[-1]:
+                                    # Build content array with images + text
+                                    content_parts = list(image_data_list)  # Images first
+                                    content_parts.append({"type": "text", "text": m["content"]})
+                                    api_messages.append({"role": "user", "content": content_parts})
+                                else:
+                                    api_messages.append({"role": "user", "content": m["content"]})
+                            else:
+                                api_messages.append({"role": "assistant", "content": m["content"]})
+
                         response = client.messages.create(
                             model=ai_model,
                             max_tokens=ai_max_tokens,
                             system=f"""You are a helpful screenplay assistant. Help the user edit their movie scenes.
+You can analyze any images the user shares to understand what they're referring to.
 
 {scene_context}
 
@@ -3028,7 +3132,7 @@ Characters: {', '.join(c.name for c in script.characters)}
 When suggesting changes, be specific about which scene and what to change.
 Format dialogue suggestions as: CHARACTER: "dialogue text"
 Keep responses concise and actionable.""",
-                            messages=[{"role": m["role"], "content": m["content"]} for m in st.session_state.scene_assistant_messages]
+                            messages=api_messages
                         )
                         assistant_response = response.content[0].text
                         # Store which model was used for this response
@@ -4478,6 +4582,140 @@ def _render_prompt_generator_modal(script: Script, state: MovieModeState) -> Non
 
         visual_style = (state.config.visual_style if state.config else None) or (script.visual_style if script else None) or ""
         project_method = state.config.generation_method if state.config else "tts_images"
+
+        # Visual Style section - editable
+        st.markdown("#### 🎨 Visual Style")
+        visual_styles_preset = [
+            "photorealistic, cinematic lighting, 8K quality",
+            "cinematic film, natural lighting",
+            "animated digital art",
+            "3D animated, Pixar style",
+            "anime style",
+            "watercolor illustration",
+            "comic book style",
+            "✏️ Custom...",
+        ]
+        preset_only = visual_styles_preset[:-1]
+        is_custom = visual_style not in preset_only
+
+        style_col1, style_col2 = st.columns([2, 3])
+        with style_col1:
+            selected_style_opt = st.selectbox(
+                "Style Preset",
+                options=visual_styles_preset,
+                index=len(visual_styles_preset) - 1 if is_custom else visual_styles_preset.index(visual_style),
+                key="ai_setup_visual_style_preset",
+            )
+        with style_col2:
+            if selected_style_opt == "✏️ Custom...":
+                custom_val = visual_style if is_custom else ""
+                new_visual_style = st.text_input(
+                    "Custom Style",
+                    value=custom_val,
+                    placeholder="e.g., Oil painting, cyberpunk neon...",
+                    key="ai_setup_custom_visual_style",
+                )
+                if not new_visual_style:
+                    new_visual_style = "animated digital art"
+            else:
+                new_visual_style = selected_style_opt
+
+        # Show apply options if style changed
+        style_changed = new_visual_style != visual_style
+        if style_changed:
+            st.info(f"🎨 Style will change from **{visual_style or 'none'}** → **{new_visual_style}**")
+
+        apply_col1, apply_col2, apply_col3 = st.columns([1, 1, 1])
+        with apply_col1:
+            regenerate_prompts = st.checkbox(
+                "🔄 Regenerate prompts with AI",
+                value=False,
+                key="ai_setup_regen_prompts",
+                help="Use AI to regenerate all scene prompts with the new style. Takes longer but produces better results."
+            )
+        with apply_col2:
+            if regenerate_prompts:
+                regen_image_prompts = st.checkbox("Image prompts", value=True, key="ai_setup_regen_img")
+                regen_video_prompts = st.checkbox("Video prompts", value=True, key="ai_setup_regen_vid")
+            else:
+                regen_image_prompts = False
+                regen_video_prompts = False
+        with apply_col3:
+            apply_disabled = not style_changed and not regenerate_prompts
+            if st.button("Apply Style", key="ai_setup_apply_style", type="primary" if style_changed else "secondary", disabled=apply_disabled):
+                old_style = visual_style
+                # Update config and script with new visual style
+                if state.config:
+                    state.config.visual_style = new_visual_style
+                if script:
+                    script.visual_style = new_visual_style
+                visual_style = new_visual_style
+
+                if regenerate_prompts and script and script.scenes:
+                    # AI-powered prompt regeneration
+                    with st.spinner(f"🤖 Regenerating prompts with AI using '{new_visual_style}' style..."):
+                        regen_count = 0
+                        total = len(script.scenes)
+                        progress_bar = st.progress(0, text="Starting...")
+
+                        for i, scene in enumerate(script.scenes):
+                            progress_bar.progress((i + 1) / total, text=f"Scene {i + 1}/{total}")
+
+                            # Regenerate image prompt
+                            if regen_image_prompts:
+                                new_prompt = _regenerate_scene_prompt(
+                                    scene, script, state,
+                                    prompt_type="visual",
+                                    use_image_context=bool(scene.image_path)
+                                )
+                                if new_prompt:
+                                    scene.visual_prompt = new_prompt
+                                    regen_count += 1
+
+                            # Regenerate video prompt
+                            if regen_video_prompts:
+                                new_prompt = _regenerate_scene_prompt(
+                                    scene, script, state,
+                                    prompt_type="video",
+                                    use_image_context=bool(scene.image_path)
+                                )
+                                if new_prompt:
+                                    scene.video_prompt = new_prompt
+                                    regen_count += 1
+
+                        progress_bar.empty()
+                        st.success(f"✓ Style updated! Regenerated {regen_count} prompts with AI.")
+                else:
+                    # Simple text replacement for existing prompts
+                    updated_count = 0
+                    if script and script.scenes:
+                        for scene in script.scenes:
+                            # Update visual_prompt (image prompt)
+                            if scene.visual_prompt:
+                                if old_style and old_style in scene.visual_prompt:
+                                    scene.visual_prompt = scene.visual_prompt.replace(old_style, new_visual_style)
+                                    updated_count += 1
+                                elif not scene.visual_prompt.lower().startswith(new_visual_style.lower().split(',')[0].lower()):
+                                    scene.visual_prompt = f"{new_visual_style}. {scene.visual_prompt}"
+                                    updated_count += 1
+
+                            # Update video_prompt
+                            if scene.video_prompt:
+                                if old_style and old_style in scene.video_prompt:
+                                    scene.video_prompt = scene.video_prompt.replace(old_style, new_visual_style)
+                                elif "VISUAL STYLE:" in scene.video_prompt:
+                                    import re
+                                    scene.video_prompt = re.sub(
+                                        r'VISUAL STYLE:[^\n.]+[.\n]?',
+                                        f'VISUAL STYLE: {new_visual_style}. ',
+                                        scene.video_prompt
+                                    )
+
+                    if updated_count > 0:
+                        st.success(f"✓ Style updated! Updated {updated_count} scene prompts.")
+                    else:
+                        st.success(f"✓ Style updated to: {new_visual_style}")
+                st.rerun()
 
         # Image model selector with clear Fast vs Pro distinction
         st.markdown("#### 🖼️ Image Generation Settings")
